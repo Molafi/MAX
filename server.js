@@ -60,6 +60,10 @@ const CONFIG = {
   rateLimitPerMin: parseInt(process.env.RATE_LIMIT_PER_MIN || "60", 10),
   upstreamTimeoutMs: parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10),
   trustProxy: (process.env.TRUST_PROXY || "false").toLowerCase() === "true",
+  // AgentRouter is a drop-in Claude Code gateway: it only accepts traffic that
+  // looks like the Claude CLI. A matching User-Agent is REQUIRED or requests are
+  // rejected/dropped ("fetch failed" or 401). Override only if your gateway differs.
+  upstreamUserAgent: process.env.UPSTREAM_USER_AGENT || "claude-cli/2.0.0 (external, cli)",
 };
 
 // Models allowed by the AgentRouter token configuration shown by the user.
@@ -303,7 +307,10 @@ async function handleChat(req, res) {
         "x-api-key": apiKey,
         Authorization: `Bearer ${apiKey}`,
         "anthropic-version": "2023-06-01",
-        "User-Agent": "MAX/1.1 (+https://agentrouter.org)",
+        "anthropic-beta": "claude-code-20250219",
+        // REQUIRED by AgentRouter — must match the Claude CLI wire image.
+        "User-Agent": CONFIG.upstreamUserAgent,
+        "x-app": "cli",
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -312,12 +319,14 @@ async function handleChat(req, res) {
     clearTimeout(timeout);
     res.off("close", abortOnDisconnect);
     if (controller.signal.aborted && !timedOut) return; // client left
+    const cause = err?.cause?.code || err?.cause?.message || err?.code || err?.message || "unknown error";
+    console.error(`[MAX] Upstream fetch failed (${upstreamUrl}):`, cause);
     return sendJson(res, timedOut ? 504 : 502, {
       error: {
         type: timedOut ? "timeout" : "network",
         message: timedOut
           ? "The AI provider took too long to respond. Please try again."
-          : "Could not reach the AI provider. Check your connection or AGENTROUTER_BASE_URL. (" + err.message + ")",
+          : `Could not reach the AI provider at ${upstreamUrl} (${cause}). Check your internet connection and AGENTROUTER_BASE_URL.`,
       },
     });
   }

@@ -134,6 +134,12 @@ Browser (public/)  ──POST /api/chat──▶  server.js  ──/v1/messages�
 - **“No API key configured”** — Set `AGENTROUTER_API_KEY` in `.env` *or* enter a key in Settings.
 - **401 / auth error** — Your key is invalid or out of credits. Generate a new one at
   [agentrouter.org/console/token](https://agentrouter.org/console/token).
+- **"Could not reach the AI provider" / `fetch failed`** — AgentRouter only accepts
+  requests that look like the Claude CLI, so MAX sends
+  `User-Agent: claude-cli/2.0.0 (external, cli)` by default. If you changed
+  `UPSTREAM_USER_AGENT` or `AGENTROUTER_BASE_URL`, revert them. Also confirm the
+  machine running the server has outbound internet access; the exact cause (e.g.
+  `ENOTFOUND`, `ECONNREFUSED`) is now printed in the server console.
 - **Model not found** — Pick a different model in Settings, or type a valid custom model id.
 - **Port already in use** — Change `PORT` in `.env` (e.g. `PORT=3000`).
 - **Code blocks / markdown not styled** — Those libraries load from a CDN; make sure you
