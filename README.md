@@ -1,0 +1,168 @@
+# MAX — Premium AI Chat
+
+<p align="center">
+  <img src="public/favicon.svg" width="88" alt="MAX logo" />
+</p>
+
+**MAX** is a polished, premium chat interface for talking to AI models through
+[AgentRouter](https://agentrouter.org) (an Anthropic‑compatible gateway that gives you
+access to Claude, GPT, DeepSeek, GLM and more behind one key).
+
+It ships as a **zero‑dependency Node server** (no `npm install` needed) plus a fast,
+hand‑built vanilla frontend. Your API key stays on the server — the browser never has to
+hold it (though you *can* enter your own key in Settings if you prefer).
+
+---
+
+## ✨ Features
+
+**Chat core**
+- Streaming responses (word‑by‑word), typing indicator, and a **Stop** button
+- Full conversation history sent on every request (the model gets context)
+- Enter to send · Shift+Enter for a newline · live character counter
+
+**Conversations**
+- New chat, searchable history sidebar, **rename / delete / resume**
+- Everything stored locally in your browser (`localStorage`)
+
+**Rich rendering**
+- Markdown (bold, lists, tables, quotes, links)
+- Syntax‑highlighted code blocks with one‑click **Copy**
+- Copy any message, **regenerate** the last answer, **edit** a previous message & re‑run
+- Per‑message **token usage** (input / output)
+
+**Polish**
+- Premium UI with an animated **“L” logo** and a live motion‑graphics background
+- Dark / light theme toggle
+- Fully mobile‑responsive
+- Image upload (drag‑drop, paste, or picker) sent as base64 for vision models
+
+**Backend**
+- Small proxy that keeps your key secret + relays the streaming response
+- Per‑IP rate limiting (configurable)
+- Model switcher, system prompt, `max_tokens`, and `temperature` controls
+
+---
+
+## 🚀 Run it locally
+
+### 1. Prerequisites
+- **Node.js 18 or newer** (Node 20/22 recommended). Check with:
+  ```bash
+  node -v
+  ```
+  If you don't have Node, grab it from [nodejs.org](https://nodejs.org).
+
+### 2. Get the code
+If you cloned this repo, just `cd` into it:
+```bash
+cd MAX
+```
+
+### 3. Add your API key
+Get a key from **https://agentrouter.org/console/token** (it looks like `sk-...`).
+
+Copy the example env file and paste your key in:
+```bash
+cp .env.example .env
+```
+Then open `.env` and set:
+```env
+AGENTROUTER_API_KEY=sk-your-real-key-here
+```
+> Prefer not to use a `.env` file? You can skip this and instead paste your key into
+> **Settings** inside the app — it will be stored only in your browser.
+
+### 4. Start the server
+No dependencies to install. Just run:
+```bash
+npm start
+```
+or equivalently:
+```bash
+node server.js
+```
+
+You'll see:
+```
+┌────────────────────────────────────────────────────┐
+│  MAX is running
+│  ▶  http://localhost:8787
+└────────────────────────────────────────────────────┘
+```
+
+### 5. Open it
+Visit **http://localhost:8787** in your browser and start chatting. 🎉
+
+---
+
+## ⚙️ Configuration
+
+All settings live in `.env` (see `.env.example`):
+
+| Variable               | Default                     | Description                                             |
+|------------------------|-----------------------------|---------------------------------------------------------|
+| `AGENTROUTER_API_KEY`  | *(empty)*                   | Your AgentRouter key. Kept server‑side.                 |
+| `AGENTROUTER_BASE_URL` | `https://agentrouter.org`   | Upstream base. Server calls `${BASE_URL}/v1/messages`.  |
+| `DEFAULT_MODEL`        | `claude-sonnet-4-6`         | Model used when the UI doesn't pick one.                |
+| `PORT`                 | `8787`                      | Local port.                                             |
+| `ALLOW_CLIENT_KEY`     | `true`                      | Let users supply their own key in Settings.             |
+| `RATE_LIMIT_PER_MIN`   | `60`                        | Per‑IP request cap per minute (`0` disables).           |
+
+You can also change the **model, system prompt, temperature, and max tokens** at any time
+from the ⚙️ **Settings** panel in the app.
+
+---
+
+## 🧠 How it works
+
+```
+Browser (public/)  ──POST /api/chat──▶  server.js  ──/v1/messages──▶  AgentRouter
+      ▲                                    │                              │
+      └────────── SSE stream ◀─────────────┴──────── SSE stream ◀─────────┘
+```
+
+- The browser sends the conversation to the local server.
+- `server.js` attaches your secret key and forwards the request to AgentRouter's
+  Anthropic‑compatible `/v1/messages` endpoint.
+- The streaming response is piped straight back to the browser and rendered live.
+
+---
+
+## 🛠️ Troubleshooting
+
+- **“No API key configured”** — Set `AGENTROUTER_API_KEY` in `.env` *or* enter a key in Settings.
+- **401 / auth error** — Your key is invalid or out of credits. Generate a new one at
+  [agentrouter.org/console/token](https://agentrouter.org/console/token).
+- **Model not found** — Pick a different model in Settings, or type a valid custom model id.
+- **Port already in use** — Change `PORT` in `.env` (e.g. `PORT=3000`).
+- **Code blocks / markdown not styled** — Those libraries load from a CDN; make sure you
+  have internet access on first load.
+
+---
+
+## 📁 Project structure
+
+```
+MAX/
+├── server.js          # Zero-dependency Node proxy + static file server
+├── package.json
+├── .env.example       # Copy to .env and add your key
+└── public/
+    ├── index.html     # App markup
+    ├── styles.css     # Premium theming, animations, responsive layout
+    ├── app.js         # Chat logic, streaming, conversation management
+    ├── bg.js          # Animated constellation background
+    └── favicon.svg    # The "L" logo
+```
+
+---
+
+## 🔒 Security notes
+- Never commit your `.env` — it's already in `.gitignore`.
+- The proxy keeps your key off the client when you use the server key.
+- Rate limiting is a basic in‑memory guard; put a real reverse proxy in front for production.
+
+---
+
+Built with ❤️ — no frameworks, no build step, just fast web fundamentals.
