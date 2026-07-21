@@ -381,20 +381,21 @@ async function handleChat(req, res) {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (res.writableEnded || res.destroyed) break; // client went away
       // value is a Uint8Array chunk of the SSE stream
       res.write(Buffer.from(value));
     }
   } catch (err) {
-    if (!controller.signal.aborted) {
+    if (!controller.signal.aborted && !res.writableEnded && !res.destroyed) {
       // best-effort error event to the client stream
-      res.write(
-        `event: error\ndata: ${JSON.stringify({ message: err.message })}\n\n`
-      );
+      try {
+        res.write(`event: error\ndata: ${JSON.stringify({ message: err?.message || "stream error" })}\n\n`);
+      } catch {}
     }
   } finally {
     clearTimeout(timeout);
     res.off("close", abortOnDisconnect);
-    res.end();
+    if (!res.writableEnded) { try { res.end(); } catch {} }
   }
 }
 
@@ -434,6 +435,12 @@ function mapStatusType(status) {
 /*  Router                                                             */
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
+  // A client disconnecting mid-stream makes the socket emit an 'error' event
+  // (ECONNRESET/EPIPE). Without listeners these become uncaught exceptions that
+  // crash the whole server, making every later request fail with "Failed to fetch".
+  res.on("error", (err) => console.warn("[MAX] response stream error:", err?.code || err?.message));
+  req.on("error", (err) => console.warn("[MAX] request stream error:", err?.code || err?.message));
+
   applySecurityHeaders(res);
   const { pathname } = new URL(req.url, "http://x");
 
@@ -456,6 +463,21 @@ const server = http.createServer(async (req, res) => {
       try { res.end(); } catch {}
     }
   }
+});
+
+// Malformed HTTP from a client should not take the server down.
+server.on("clientError", (err, socket) => {
+  if (socket.writable && !socket.destroyed) {
+    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+  }
+});
+
+// Last-resort safety net: log and keep serving instead of crashing.
+process.on("uncaughtException", (err) => {
+  console.error("[MAX] uncaughtException (kept alive):", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[MAX] unhandledRejection (kept alive):", reason);
 });
 
 server.listen(CONFIG.port, CONFIG.host, () => {

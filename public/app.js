@@ -554,9 +554,13 @@
         stream.row.remove();
         renderMessages();
       } else {
+        const isNetwork = err instanceof TypeError || /failed to fetch|networkerror|load failed|connection/i.test(err.message || "");
+        const friendly = isNetwork
+          ? "Can't reach the MAX server. Make sure it's still running (node server.js) in your terminal, then reload this page and try again."
+          : err.message;
         stream.bubble.classList.remove("md");
-        stream.bubble.innerHTML = `<div style="color:#ff6b8a">⚠ ${esc(err.message)}</div>`;
-        toast(err.message, "error");
+        stream.bubble.innerHTML = `<div style="color:#ff6b8a">⚠ ${esc(friendly)}</div>`;
+        toast(friendly, "error");
       }
     } finally {
       state.streaming = false;
