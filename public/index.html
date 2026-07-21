@@ -63,7 +63,7 @@
             <span class="brand__tag">AI Assistant</span>
           </div>
         </div>
-        <button class="icon-btn sidebar__collapse" id="collapse-btn" title="Hide sidebar" aria-label="Hide sidebar">
+        <button class="icon-btn sidebar__collapse" id="collapse-btn" title="Hide sidebar" aria-label="Hide sidebar" aria-controls="sidebar">
           <svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>
         </button>
       </div>
@@ -96,13 +96,13 @@
     <!-- ---------- Main ---------- -->
     <main class="main" id="main">
       <header class="topbar">
-        <button class="icon-btn" id="menu-btn" title="Show sidebar" aria-label="Show sidebar">
+        <button class="icon-btn" id="menu-btn" title="Show sidebar" aria-label="Show sidebar" aria-controls="sidebar" aria-expanded="true">
           <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
         </button>
         <div class="topbar__center">
           <button class="model-pill" id="model-pill" title="Change model">
             <span class="model-pill__dot"></span>
-            <span id="model-pill-name">claude-sonnet-4-6</span>
+            <span id="model-pill-name">claude-opus-4-8</span>
             <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
           </button>
         </div>
@@ -169,7 +169,7 @@
           <button type="button" class="icon-btn composer__attach" id="attach-btn" title="Attach image">
             <svg viewBox="0 0 24 24"><path d="M21 12.5V7a4 4 0 00-8 0v9a2.5 2.5 0 005 0V8"/></svg>
           </button>
-          <input type="file" id="file-input" accept="image/*" multiple hidden />
+          <input type="file" id="file-input" accept="image/jpeg,image/png,image/gif,image/webp" multiple hidden />
           <textarea id="input" class="composer__input" rows="1"
             placeholder="Message MAX…" autocomplete="off" autofocus></textarea>
           <div class="composer__meta">
@@ -199,9 +199,9 @@
       <div class="modal__body">
 
         <div class="field" id="apikey-field">
-          <label for="set-apikey">API key <span class="field__opt">(stored only in this browser)</span></label>
+          <label for="set-apikey">API key <span class="field__opt">(kept for this browser session only)</span></label>
           <div class="input-icon">
-            <input type="password" id="set-apikey" placeholder="sk-…" autocomplete="off" />
+            <input type="password" id="set-apikey" placeholder="sk-…" autocomplete="new-password" spellcheck="false" />
             <button type="button" class="reveal-btn" id="reveal-key" title="Show/hide">👁</button>
           </div>
           <p class="field__help" id="apikey-help"></p>
@@ -210,7 +210,8 @@
         <div class="field">
           <label for="set-model">Model</label>
           <select id="set-model"></select>
-          <input type="text" id="set-model-custom" class="mt8" placeholder="…or type a custom model id" />
+          <p class="field__help">Includes the five model IDs allowed by your AgentRouter token restrictions.</p>
+          <input type="text" id="set-model-custom" class="mt8" placeholder="…or type a custom model id" spellcheck="false" />
         </div>
 
         <div class="field">

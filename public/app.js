@@ -8,7 +8,18 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  const SESSION_KEY = "max.apiKey.session.v1";
+  const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+  const DEFAULT_MODELS = [
+    { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
+    { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
+    { id: "claude-opus-4-8", label: "Claude Opus 4.8 — recommended" },
+    { id: "glm-5.2", label: "GLM 5.2" },
+    { id: "gpt-5.5", label: "GPT-5.5" },
+  ];
 
   const LS = {
     convos: "max.conversations.v1",
@@ -19,7 +30,7 @@
 
   /* ---------- state ---------- */
   const state = {
-    config: { defaultModel: "claude-sonnet-4-6", models: [], allowClientKey: true, hasServerKey: false },
+    config: { defaultModel: "claude-opus-4-8", models: DEFAULT_MODELS, allowClientKey: true, hasServerKey: false },
     settings: {
       apiKey: "",
       model: "",
@@ -36,17 +47,48 @@
   };
 
   /* ---------- persistence ---------- */
+  function safeStorageSet(storage, key, value, label) {
+    try {
+      storage.setItem(key, value);
+      return true;
+    } catch {
+      if (label) toast(`${label} could not be saved. Browser storage may be full.`, "error");
+      return false;
+    }
+  }
+
   function loadState() {
-    try { state.conversations = JSON.parse(localStorage.getItem(LS.convos)) || []; } catch { state.conversations = []; }
+    try {
+      const conversations = JSON.parse(localStorage.getItem(LS.convos));
+      state.conversations = Array.isArray(conversations) ? conversations : [];
+    } catch { state.conversations = []; }
     try {
       const s = JSON.parse(localStorage.getItem(LS.settings));
-      if (s && typeof s === "object") Object.assign(state.settings, s);
+      if (s && typeof s === "object") {
+        // Migrate keys saved by older versions out of persistent localStorage.
+        if (typeof s.apiKey === "string" && s.apiKey) {
+          safeStorageSet(sessionStorage, SESSION_KEY, s.apiKey);
+          delete s.apiKey;
+          safeStorageSet(localStorage, LS.settings, JSON.stringify(s));
+        }
+        Object.assign(state.settings, s);
+      }
+      state.settings.apiKey = sessionStorage.getItem(SESSION_KEY) || "";
     } catch {}
     state.activeId = localStorage.getItem(LS.active) || null;
   }
-  const saveConvos = () => localStorage.setItem(LS.convos, JSON.stringify(state.conversations));
-  const saveSettings = () => localStorage.setItem(LS.settings, JSON.stringify(state.settings));
-  const saveActive = () => state.activeId ? localStorage.setItem(LS.active, state.activeId) : localStorage.removeItem(LS.active);
+  const saveConvos = () => safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations), "Conversation history");
+  const saveSettings = () => {
+    const { apiKey, ...persistentSettings } = state.settings;
+    safeStorageSet(localStorage, LS.settings, JSON.stringify(persistentSettings), "Settings");
+    if (apiKey) safeStorageSet(sessionStorage, SESSION_KEY, apiKey, "API key");
+    else {
+      try { sessionStorage.removeItem(SESSION_KEY); } catch {}
+    }
+  };
+  const saveActive = () => state.activeId
+    ? safeStorageSet(localStorage, LS.active, state.activeId)
+    : localStorage.removeItem(LS.active);
 
   /* ---------- conversation model ---------- */
   const activeConvo = () => state.conversations.find((c) => c.id === state.activeId) || null;
@@ -135,14 +177,17 @@
 
   function renderMarkdown(text) {
     setupMarked();
-    let html;
+    const plain = `<p>${esc(text || "").replace(/\n/g, "<br>")}</p>`;
+    // Never render generated HTML without a sanitizer. If either CDN library is
+    // unavailable, degrade safely to escaped plain text.
+    if (!window.marked || !window.DOMPurify) return plain;
     try {
-      html = window.marked ? marked.parse(text || "") : `<p>${esc(text || "")}</p>`;
+      return DOMPurify.sanitize(marked.parse(text || ""), {
+        USE_PROFILES: { html: true },
+      });
     } catch {
-      html = `<p>${esc(text || "")}</p>`;
+      return plain;
     }
-    if (window.DOMPurify) html = DOMPurify.sanitize(html);
-    return html;
   }
 
   // Enhance rendered markdown: wrap code blocks with header + copy, run highlight.
@@ -305,6 +350,42 @@
     };
   }
 
+  /* ---------- robust SSE framing ---------- */
+  function takeSseRecords(input, flush = false) {
+    const records = [];
+    let rest = input;
+    let boundary;
+
+    while ((boundary = /\r?\n\r?\n/.exec(rest))) {
+      const block = rest.slice(0, boundary.index);
+      rest = rest.slice(boundary.index + boundary[0].length);
+      const record = parseSseRecord(block);
+      if (record) records.push(record);
+    }
+
+    if (flush && rest.trim()) {
+      const record = parseSseRecord(rest);
+      if (record) records.push(record);
+      rest = "";
+    }
+    return { records, rest };
+  }
+
+  function parseSseRecord(block) {
+    let event = "message";
+    const data = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (!line || line.startsWith(":")) continue;
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") event = value;
+      if (field === "data") data.push(value);
+    }
+    return data.length ? { event, data: data.join("\n") } : null;
+  }
+
   /* ============================================================
      Sending / streaming
      ============================================================ */
@@ -393,46 +474,65 @@
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let stopped = false;
 
-      readLoop: for (;;) {
+      const consumeRecord = (record) => {
+        if (!record?.data) return false;
+        if (record.data.trim() === "[DONE]") return true;
+
+        let evt;
+        try { evt = JSON.parse(record.data); } catch { return false; }
+        if (record.event === "error" || evt.type === "error") {
+          throw new Error(evt.error?.message || evt.message || "Stream error");
+        }
+
+        switch (evt.type) {
+          case "message_start":
+            if (evt.message?.usage) usage = { ...evt.message.usage };
+            break;
+          case "content_block_delta":
+            if (evt.delta?.type === "text_delta" && evt.delta.text) {
+              gotFirst = true;
+              acc += evt.delta.text;
+              stream.setText(acc, true);
+              scrollToBottomIfNear();
+            }
+            break;
+          case "message_delta":
+            if (evt.usage) usage = { ...(usage || {}), ...evt.usage };
+            break;
+          case "message_stop":
+            return true;
+          default:
+            break;
+        }
+        return false;
+      };
+
+      while (!stopped) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          const final = takeSseRecords(buffer, true);
+          for (const record of final.records) {
+            if (consumeRecord(record)) break;
+          }
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
-
-        // SSE events are separated by a blank line
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop(); // keep incomplete tail
-        for (const part of parts) {
-          const dataLine = part.split("\n").find((l) => l.startsWith("data:"));
-          if (!dataLine) continue;
-          const dataStr = dataLine.slice(5).trim();
-          if (!dataStr || dataStr === "[DONE]") continue;
-          let evt;
-          try { evt = JSON.parse(dataStr); } catch { continue; }
-
-          switch (evt.type) {
-            case "message_start":
-              if (evt.message?.usage) usage = { ...evt.message.usage };
-              break;
-            case "content_block_delta":
-              if (evt.delta?.type === "text_delta" && evt.delta.text) {
-                if (!gotFirst) { gotFirst = true; }
-                acc += evt.delta.text;
-                stream.setText(acc, true);
-                scrollToBottomIfNear();
-              }
-              break;
-            case "message_delta":
-              if (evt.usage) usage = { ...(usage || {}), ...evt.usage };
-              break;
-            case "error":
-              throw new Error(evt.error?.message || "Stream error");
-            case "message_stop":
-              break readLoop;
-            default:
-              break;
+        const parsed = takeSseRecords(buffer);
+        buffer = parsed.rest;
+        for (const record of parsed.records) {
+          if (consumeRecord(record)) {
+            stopped = true;
+            await reader.cancel().catch(() => {});
+            break;
           }
         }
+      }
+
+      if (!gotFirst || !acc.trim()) {
+        throw new Error("The model returned an empty response. Try another model or prompt.");
       }
 
       // finalize
@@ -547,7 +647,10 @@
 
   function handleFiles(files) {
     for (const file of files) {
-      if (!file.type.startsWith("image/")) { toast("Only image files are supported", "error"); continue; }
+      if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+        toast("Use a JPEG, PNG, GIF, or WebP image.", "error");
+        continue;
+      }
       if (file.size > 5 * 1024 * 1024) { toast("Image too large (max 5MB)", "error"); continue; }
       const reader = new FileReader();
       reader.onload = () => {
@@ -606,7 +709,9 @@
      ============================================================ */
   function applyTheme(theme) {
     document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem(LS.theme, theme);
+    try {
+      localStorage.setItem(LS.theme, theme);
+    } catch {}
     const hl = $("#hljs-theme");
     hl.href = theme === "light"
       ? "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github.min.css"
@@ -746,13 +851,19 @@
     toast("Conversation deleted");
   }
 
+  function setSidebarHidden(hidden) {
+    $("#app").classList.toggle("sidebar-hidden", hidden);
+    $("#menu-btn").setAttribute("aria-expanded", String(!hidden));
+    $("#sidebar").setAttribute("aria-hidden", String(hidden));
+  }
+
   function selectConversation(id) {
     if (state.streaming) return;
     state.activeId = id;
     saveActive();
     renderConversations();
     renderMessages();
-    if (window.innerWidth <= 820) $("#app").classList.add("sidebar-hidden");
+    if (window.innerWidth <= 820) setSidebarHidden(true);
   }
 
   /* ============================================================
@@ -779,7 +890,6 @@
     });
 
     $("#stop-btn").addEventListener("click", stopStreaming);
-    $("#send-btn").addEventListener("click", (e) => { e.preventDefault(); sendMessage(input.value); });
 
     // attachments
     $("#attach-btn").addEventListener("click", () => $("#file-input").click());
@@ -823,8 +933,13 @@
     });
 
     // sidebar toggles
-    $("#collapse-btn").addEventListener("click", () => $("#app").classList.add("sidebar-hidden"));
-    $("#menu-btn").addEventListener("click", () => $("#app").classList.toggle("sidebar-hidden"));
+    $("#collapse-btn").addEventListener("click", () => setSidebarHidden(true));
+    $("#menu-btn").addEventListener("click", () => setSidebarHidden(!$("#app").classList.contains("sidebar-hidden")));
+    $("#main").addEventListener("click", (e) => {
+      if (window.innerWidth <= 820 && e.target === $("#main") && !$("#app").classList.contains("sidebar-hidden")) {
+        setSidebarHidden(true);
+      }
+    });
 
     // theme
     $("#theme-btn").addEventListener("click", toggleTheme);
@@ -882,7 +997,14 @@
     // fetch server config
     try {
       const res = await fetch("/api/config");
-      if (res.ok) state.config = await res.json();
+      if (res.ok) {
+        const config = await res.json();
+        state.config = {
+          ...state.config,
+          ...config,
+          models: Array.isArray(config.models) && config.models.length ? config.models : DEFAULT_MODELS,
+        };
+      }
     } catch {
       toast("Could not reach the MAX server.", "error");
     }
@@ -890,7 +1012,7 @@
     bindEvents();
 
     // sidebar default state on mobile
-    if (window.innerWidth <= 820) $("#app").classList.add("sidebar-hidden");
+    if (window.innerWidth <= 820) setSidebarHidden(true);
 
     // ensure there is an active conversation reference (but don't force-create)
     if (state.activeId && !activeConvo()) state.activeId = state.conversations[0]?.id || null;

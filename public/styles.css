@@ -55,6 +55,10 @@
 }
 
 * { box-sizing: border-box; }
+/* The `hidden` attribute must always win over class-level `display` rules
+   (e.g. .modal-overlay/.send-btn/.stop-btn use display:grid, which otherwise
+   ties with the UA [hidden] rule on specificity and stays visible). */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -110,7 +114,17 @@ input, textarea, select { font-family: inherit; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .bg-orb, .logo-spark, .logo-l--draw { animation: none !important; }
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+}
+
+:where(button, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
 }
 
 /* ============================================================
@@ -179,7 +193,7 @@ input, textarea, select { font-family: inherit; }
 .conv__title { flex: 1; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conv__menu { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 7px; border: none; background: transparent; color: var(--text-faint); opacity: 0; transition: opacity .15s, background .15s; }
 .conv__menu svg { width: 16px; height: 16px; }
-.conv:hover .conv__menu, .conv.active .conv__menu { opacity: 1; }
+.conv:hover .conv__menu, .conv:focus-within .conv__menu, .conv.active .conv__menu { opacity: 1; }
 .conv__menu:hover { background: var(--border-strong); color: var(--text); }
 
 .empty-hint { color: var(--text-faint); font-size: 13px; text-align: center; padding: 24px 12px; }
@@ -257,7 +271,7 @@ input, textarea, select { font-family: inherit; }
 @keyframes msgIn { from { opacity: 0; transform: translateY(8px);} to { opacity: 1; transform: none;} }
 .msg__avatar { width: 34px; height: 34px; flex-shrink: 0; border-radius: 10px; display: grid; place-items: center; font-weight: 800; font-size: 14px; }
 .msg--user .msg__avatar { background: var(--surface-2); border: 1px solid var(--border-strong); color: var(--text); }
-.msg--ai .msg__avatar { background: var(--accent-grad); color: #fff; box-shadow: 0 6px 18px -6px var(--accent-1); }
+.msg--assistant .msg__avatar { background: var(--accent-grad); color: #fff; box-shadow: 0 6px 18px -6px var(--accent-1); }
 .msg__body { min-width: 0; flex: 1; }
 .msg__role { font-size: 12.5px; font-weight: 700; color: var(--text-dim); margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
 .msg__bubble {
@@ -265,7 +279,7 @@ input, textarea, select { font-family: inherit; }
   word-wrap: break-word; overflow-wrap: break-word;
 }
 .msg--user .msg__bubble { background: var(--bubble-user); color: #fff; box-shadow: 0 10px 26px -14px var(--accent-1); }
-.msg--ai .msg__bubble { background: var(--bubble-ai); border: 1px solid var(--border); }
+.msg--assistant .msg__bubble { background: var(--bubble-ai); border: 1px solid var(--border); }
 
 /* message content (markdown) */
 .md > *:first-child { margin-top: 0; }
@@ -297,7 +311,7 @@ input, textarea, select { font-family: inherit; }
 
 /* message actions */
 .msg__actions { display: flex; gap: 4px; margin-top: 8px; opacity: 0; transition: opacity .18s; }
-.msg:hover .msg__actions, .msg--last .msg__actions { opacity: 1; }
+    .msg:hover .msg__actions, .msg:focus-within .msg__actions, .msg--last .msg__actions { opacity: 1; }
 .msg-action { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-faint); background: transparent; border: 1px solid transparent; padding: 4px 8px; border-radius: 7px; transition: color .15s, background .15s, border-color .15s; }
 .msg-action svg { width: 14px; height: 14px; }
 .msg-action:hover { color: var(--text); background: var(--surface-2); border-color: var(--border); }

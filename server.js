@@ -51,23 +51,25 @@ function loadEnv() {
 loadEnv();
 
 const CONFIG = {
+  host: process.env.HOST || "127.0.0.1",
   port: parseInt(process.env.PORT || "8787", 10),
   apiKey: process.env.AGENTROUTER_API_KEY || "",
   baseUrl: (process.env.AGENTROUTER_BASE_URL || "https://agentrouter.org").replace(/\/+$/, ""),
-  defaultModel: process.env.DEFAULT_MODEL || "claude-sonnet-4-6",
+  defaultModel: process.env.DEFAULT_MODEL || "claude-opus-4-8",
   allowClientKey: (process.env.ALLOW_CLIENT_KEY || "true").toLowerCase() !== "false",
   rateLimitPerMin: parseInt(process.env.RATE_LIMIT_PER_MIN || "60", 10),
+  upstreamTimeoutMs: parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10),
+  trustProxy: (process.env.TRUST_PROXY || "false").toLowerCase() === "true",
 };
 
-// Curated model list shown in the UI. Users can also type a custom model.
+// Models allowed by the AgentRouter token configuration shown by the user.
+// Users can still enter a custom model ID in the UI if their token permits it.
 const MODELS = [
-  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 — balanced (recommended)" },
-  { id: "claude-opus-4-6", label: "Claude Opus 4.6 — most capable" },
-  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5 — fastest" },
-  { id: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5" },
-  { id: "gpt-5.5", label: "GPT-5.5 (OpenAI)" },
-  { id: "deepseek-v3", label: "DeepSeek V3" },
-  { id: "glm-5.1", label: "GLM 5.1" },
+  { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
+  { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
+  { id: "claude-opus-4-8", label: "Claude Opus 4.8 — recommended" },
+  { id: "glm-5.2", label: "GLM 5.2" },
+  { id: "gpt-5.5", label: "GPT-5.5" },
 ];
 
 /* ------------------------------------------------------------------ */
@@ -154,6 +156,20 @@ async function serveStatic(req, res) {
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
+function applySecurityHeaders(res) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; " +
+      "script-src 'self' https://cdn.jsdelivr.net; " +
+      "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; " +
+      "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'"
+  );
+}
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -182,8 +198,10 @@ function readBody(req, limitBytes = 25 * 1024 * 1024) {
 }
 
 function clientIp(req) {
-  const xff = req.headers["x-forwarded-for"];
-  if (typeof xff === "string" && xff.length) return xff.split(",")[0].trim();
+  if (CONFIG.trustProxy) {
+    const xff = req.headers["x-forwarded-for"];
+    if (typeof xff === "string" && xff.length) return xff.split(",")[0].trim();
+  }
   return req.socket.remoteAddress || "unknown";
 }
 
@@ -234,11 +252,24 @@ async function handleChat(req, res) {
     });
   }
 
-  // Build the Anthropic Messages request body.
+  // Build and validate the Anthropic Messages request body.
+  const model = typeof payload.model === "string" ? payload.model.trim() : CONFIG.defaultModel;
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  if (!model || model.length > 120) {
+    return sendJson(res, 400, {
+      error: { type: "bad_request", message: "A valid model ID is required." },
+    });
+  }
+  if (!messages.length || !messages.every(isValidMessage)) {
+    return sendJson(res, 400, {
+      error: { type: "bad_request", message: "messages must be a non-empty array of valid user/assistant messages." },
+    });
+  }
+
   const body = {
-    model: payload.model || CONFIG.defaultModel,
+    model,
     max_tokens: clampInt(payload.max_tokens, 1, 64000, 4096),
-    messages: Array.isArray(payload.messages) ? payload.messages : [],
+    messages,
     stream: payload.stream !== false,
   };
   if (payload.system) body.system = payload.system;
@@ -248,9 +279,18 @@ async function handleChat(req, res) {
 
   const upstreamUrl = `${CONFIG.baseUrl}/v1/messages`;
 
-  // Abort upstream if the client disconnects.
+  // Abort only when the response connection closes early, not when the request
+  // body finishes. The request `close` event can fire before fetch starts.
   const controller = new AbortController();
-  req.on("close", () => controller.abort());
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, Math.max(1_000, CONFIG.upstreamTimeoutMs));
+  const abortOnDisconnect = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.once("close", abortOnDisconnect);
 
   let upstream;
   try {
@@ -263,24 +303,29 @@ async function handleChat(req, res) {
         "x-api-key": apiKey,
         Authorization: `Bearer ${apiKey}`,
         "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-        "User-Agent": "MAX/1.0 (+https://agentrouter.org)",
+        "User-Agent": "MAX/1.1 (+https://agentrouter.org)",
       },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
   } catch (err) {
-    if (controller.signal.aborted) return; // client left
-    return sendJson(res, 502, {
+    clearTimeout(timeout);
+    res.off("close", abortOnDisconnect);
+    if (controller.signal.aborted && !timedOut) return; // client left
+    return sendJson(res, timedOut ? 504 : 502, {
       error: {
-        type: "network",
-        message: "Could not reach the AI provider. Check your connection or AGENTROUTER_BASE_URL. (" + err.message + ")",
+        type: timedOut ? "timeout" : "network",
+        message: timedOut
+          ? "The AI provider took too long to respond. Please try again."
+          : "Could not reach the AI provider. Check your connection or AGENTROUTER_BASE_URL. (" + err.message + ")",
       },
     });
   }
 
   // Non-OK upstream: relay the error as JSON.
   if (!upstream.ok) {
+    clearTimeout(timeout);
+    res.off("close", abortOnDisconnect);
     let detail = "";
     try {
       detail = await upstream.text();
@@ -303,9 +348,14 @@ async function handleChat(req, res) {
 
   // Non-streaming path: relay JSON directly.
   if (!body.stream) {
-    const text = await upstream.text();
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(text);
+    try {
+      const text = await upstream.text();
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(text);
+    } finally {
+      clearTimeout(timeout);
+      res.off("close", abortOnDisconnect);
+    }
     return;
   }
 
@@ -333,8 +383,25 @@ async function handleChat(req, res) {
       );
     }
   } finally {
+    clearTimeout(timeout);
+    res.off("close", abortOnDisconnect);
     res.end();
   }
+}
+
+const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+function isValidMessage(message) {
+  if (!message || !["user", "assistant"].includes(message.role)) return false;
+  if (typeof message.content === "string") return message.content.length > 0;
+  if (!Array.isArray(message.content) || !message.content.length) return false;
+  return message.content.every((block) => {
+    if (!block || typeof block !== "object") return false;
+    if (block.type === "text") return typeof block.text === "string";
+    return block.type === "image" && block.source?.type === "base64" &&
+      ALLOWED_IMAGE_TYPES.has(block.source.media_type) && typeof block.source.data === "string" &&
+      block.source.data.length > 0;
+  });
 }
 
 function clampInt(v, min, max, dflt) {
@@ -358,6 +425,7 @@ function mapStatusType(status) {
 /*  Router                                                             */
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
+  applySecurityHeaders(res);
   const { pathname } = new URL(req.url, "http://x");
 
   try {
@@ -381,15 +449,16 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(CONFIG.port, () => {
+server.listen(CONFIG.port, CONFIG.host, () => {
   const line = "─".repeat(52);
   console.log(`\n┌${line}┐`);
   console.log(`│  MAX is running`);
-  console.log(`│  ▶  http://localhost:${CONFIG.port}`);
+  console.log(`│  ▶  http://${CONFIG.host}:${CONFIG.port}`);
   console.log(`│`);
   console.log(`│  Server API key : ${CONFIG.apiKey ? "loaded ✓" : "NOT set (use Settings in the UI, or .env)"}`);
   console.log(`│  Upstream       : ${CONFIG.baseUrl}/v1/messages`);
   console.log(`│  Default model  : ${CONFIG.defaultModel}`);
   console.log(`│  Rate limit     : ${CONFIG.rateLimitPerMin || "off"} req/min per IP`);
+  console.log(`│  Timeout        : ${CONFIG.upstreamTimeoutMs} ms`);
   console.log(`└${line}┘\n`);
 });
