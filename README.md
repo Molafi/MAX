@@ -43,8 +43,10 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 - Configurable step limit; finishes when the model emits its completion marker
 
 **GitHub integration**
-- Connect a GitHub token + repo in Settings and **push any conversation** to the
-  repository as a Markdown file (create or update), straight from the chat
+- **Pick a repository** from a searchable list of your repos (the chip next to the
+  composer) so MAX knows which project you're working in — that context is passed
+  to the model on every message
+- **Push any conversation** to the selected repo as a Markdown file (create or update)
 - **Test connection** button verifies the token, repo, and push permission
 - The token is proxied server‑side and never stored in `localStorage`
 
@@ -158,9 +160,11 @@ reaches the step limit, or when you press **Stop**. Adjust the step cap in Setti
 
 1. Create a token at **GitHub → Settings → Developer settings → Personal access tokens**
    with the **`repo`** scope (classic) or **Contents: Read and write** (fine‑grained).
-2. Open MAX **Settings → GitHub**, paste the token, and set **owner**, **repository**,
-   **branch**, and an optional **folder** (path prefix). Click **Test connection**.
-3. Push a conversation via the **GitHub icon** in the topbar, or a conversation's
+2. Open MAX **Settings → GitHub**, paste the token. Click **Test connection**.
+3. Click the **repository chip** beside the message box to open a searchable list of
+   your repos and pick the one MAX should work in (it becomes the push target and is
+   added to the model's context). You can also set owner/repo manually in Settings.
+4. Push a conversation via the **GitHub icon** in the topbar, or a conversation's
    **⋯ → Push to GitHub**. It's saved as `‹folder›/‹title›-‹id›.md` (created or updated).
 
 > Your token is sent to the local MAX server only to make the GitHub call; it is

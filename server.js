@@ -579,6 +579,42 @@ async function handleGithubTest(req, res) {
   }
 }
 
+async function handleGithubRepos(req, res) {
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided. Add one in Settings." } });
+
+  const q = String(payload.q || "").trim().toLowerCase();
+  const perPage = clampInt(payload.perPage, 1, 100, 100);
+  const page = clampInt(payload.page, 1, 100, 1);
+
+  try {
+    const r = await githubApi(
+      gh.token,
+      "GET",
+      `/user/repos?per_page=${perPage}&page=${page}&sort=updated&affiliation=owner,collaborator,organization_member`
+    );
+    if (!r.ok) return ghError(res, r, "Could not list repositories.");
+    const list = Array.isArray(r.json) ? r.json : [];
+    let repos = list.map((x) => ({
+      fullName: x.full_name,
+      owner: x.owner?.login || "",
+      name: x.name,
+      private: Boolean(x.private),
+      defaultBranch: x.default_branch || "main",
+      description: x.description || "",
+      updatedAt: x.updated_at || null,
+      canPush: x.permissions ? x.permissions.push !== false : true,
+    }));
+    if (q) repos = repos.filter((x) => x.fullName.toLowerCase().includes(q) || (x.description || "").toLowerCase().includes(q));
+    return sendJson(res, 200, { ok: true, repos, page, hasMore: list.length === perPage });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+  }
+}
+
 async function handleGithubPush(req, res) {
   let payload = {};
   try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
@@ -661,6 +697,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/api/github/test" && req.method === "POST") {
       return await handleGithubTest(req, res);
+    }
+    if (pathname === "/api/github/repos" && req.method === "POST") {
+      return await handleGithubRepos(req, res);
     }
     if (pathname === "/api/github/push" && req.method === "POST") {
       return await handleGithubPush(req, res);

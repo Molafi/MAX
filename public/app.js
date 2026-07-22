@@ -441,6 +441,10 @@
   // System prompt actually sent — augmented with agent instructions in autonomous mode.
   function effectiveSystem() {
     let sys = state.settings.system || "";
+    const repo = selectedRepoLabel();
+    if (repo) {
+      sys += `\n\n[Working repository] The user has selected the GitHub repository ${repo} (branch ${state.settings.github.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo}. You cannot browse it directly unless the user pastes code or files.`;
+    }
     if (state.settings.autonomous) {
       sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line.`;
     }
@@ -977,6 +981,164 @@
   }
 
   /* ============================================================
+     Repository picker — choose a repo for MAX to work in
+     ============================================================ */
+  function hasGithubToken() {
+    return Boolean(state.settings.github.token || state.config.github?.hasServerToken);
+  }
+
+  function selectedRepoLabel() {
+    const g = state.settings.github;
+    return g.owner && g.repo ? `${g.owner}/${g.repo}` : "";
+  }
+
+  function updateRepoChip() {
+    const label = selectedRepoLabel();
+    const chip = $("#repo-chip");
+    const lbl = $("#repo-chip-label");
+    const clear = $("#repo-chip-clear");
+    if (!chip) return;
+    if (label) {
+      lbl.textContent = label;
+      chip.classList.add("selected");
+      chip.title = `MAX is working in ${label} (branch ${state.settings.github.branch || "main"})`;
+      clear.hidden = false;
+    } else {
+      lbl.textContent = "Add repository";
+      chip.classList.remove("selected");
+      chip.title = "Choose a repository for MAX to work in";
+      clear.hidden = true;
+    }
+  }
+
+  function selectRepo(repo) {
+    state.settings.github.owner = repo.owner;
+    state.settings.github.repo = repo.name;
+    if (repo.defaultBranch) state.settings.github.branch = repo.defaultBranch;
+    saveSettings();
+    updateRepoChip();
+    toast(`MAX is now working in ${repo.fullName}`, "success");
+  }
+
+  function clearRepo() {
+    state.settings.github.owner = "";
+    state.settings.github.repo = "";
+    saveSettings();
+    updateRepoChip();
+    toast("Repository cleared");
+  }
+
+  async function fetchRepos(q) {
+    const res = await fetch("/api/github/repos", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: state.settings.github.token || undefined, q: q || undefined }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+    return data.repos || [];
+  }
+
+  let repoPickerEl = null;
+  function closeRepoPicker() {
+    if (repoPickerEl) { repoPickerEl.remove(); repoPickerEl = null; }
+  }
+
+  function openRepoPicker(anchorBtn) {
+    closeRepoPicker();
+    const pop = document.createElement("div");
+    pop.className = "repo-pop";
+    pop.setAttribute("role", "dialog");
+    pop.innerHTML = `
+      <div class="repo-pop__head">
+        <div class="repo-pop__title">Add repository</div>
+        <div class="repo-pop__tabs">
+          <button class="repo-tab active" data-tab="github" type="button">GitHub</button>
+          <button class="repo-tab" data-tab="gitlab" type="button" disabled title="GitLab is not supported yet">GitLab</button>
+        </div>
+      </div>
+      <div class="repo-pop__search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input type="text" id="repo-search" placeholder="Search" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="repo-pop__list" id="repo-list"></div>
+      <div class="repo-pop__foot">
+        <button class="repo-pop__manage" id="repo-manage" type="button">
+          <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>
+          Manage source control connection
+        </button>
+      </div>`;
+    document.body.appendChild(pop);
+    repoPickerEl = pop;
+
+    // Position above the chip, clamped to viewport.
+    const r = anchorBtn.getBoundingClientRect();
+    const width = pop.offsetWidth;
+    const left = Math.max(12, Math.min(r.left, window.innerWidth - width - 12));
+    pop.style.left = `${left}px`;
+    // prefer opening upward (chip sits near the bottom)
+    pop.style.bottom = `${Math.max(12, window.innerHeight - r.top + 8)}px`;
+
+    const listEl = pop.querySelector("#repo-list");
+    const searchEl = pop.querySelector("#repo-search");
+
+    pop.querySelector("#repo-manage").addEventListener("click", () => { closeRepoPicker(); openSettings(); });
+
+    if (!hasGithubToken()) {
+      listEl.innerHTML = `<div class="repo-pop__msg">Connect GitHub first — add a personal access token in Settings.</div>`;
+      searchEl.disabled = true;
+    } else {
+      loadRepoList(listEl, "");
+      let t;
+      searchEl.addEventListener("input", () => {
+        clearTimeout(t);
+        t = setTimeout(() => loadRepoList(listEl, searchEl.value.trim()), 250);
+      });
+      setTimeout(() => searchEl.focus(), 30);
+    }
+
+    setTimeout(() => {
+      const onDoc = (e) => {
+        if (repoPickerEl && !repoPickerEl.contains(e.target) && !anchorBtn.contains(e.target)) {
+          closeRepoPicker();
+          document.removeEventListener("mousedown", onDoc);
+        }
+      };
+      document.addEventListener("mousedown", onDoc);
+    }, 0);
+  }
+
+  async function loadRepoList(listEl, q) {
+    listEl.innerHTML = `<div class="repo-spinner"></div>`;
+    try {
+      const repos = await fetchRepos(q);
+      if (!repos.length) {
+        listEl.innerHTML = `<div class="repo-pop__msg">${q ? "No matching repositories." : "No repositories found for this token."}</div>`;
+        return;
+      }
+      const current = selectedRepoLabel();
+      const lock = `<svg class="repo-item__ico" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>`;
+      const open = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>`;
+      const check = `<svg class="repo-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>`;
+      listEl.innerHTML = repos.map((x) => `
+        <button class="repo-item${x.fullName === current ? " active" : ""}" type="button" data-full="${esc(x.fullName)}">
+          ${x.private ? lock : open}
+          <span class="repo-item__name">${esc(x.fullName)}</span>
+          ${x.fullName === current ? check : ""}
+        </button>`).join("");
+      listEl.querySelectorAll(".repo-item").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const repo = repos.find((r) => r.fullName === btn.dataset.full);
+          if (repo) { selectRepo(repo); closeRepoPicker(); }
+        });
+      });
+    } catch (err) {
+      const msg = err instanceof TypeError ? "Can't reach the MAX server." : err.message;
+      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(msg)}</div>`;
+    }
+  }
+
+  /* ============================================================
      Theme
      ============================================================ */
   function applyTheme(theme) {
@@ -1296,6 +1458,14 @@
       if (!c) { toast("Open a conversation first.", "error"); return; }
       pushConversationToGitHub(c.id);
     });
+
+    // composer: repository picker
+    $("#repo-chip").addEventListener("click", (e) => {
+      if (e.target.closest("#repo-chip-clear")) return; // handled below
+      if (repoPickerEl) closeRepoPicker();
+      else openRepoPicker($("#repo-chip"));
+    });
+    $("#repo-chip-clear").addEventListener("click", (e) => { e.stopPropagation(); clearRepo(); });
     $("#clear-current").addEventListener("click", () => {
       const c = activeConvo(); if (c) { c.messages = []; c.title = "New chat"; touchConvo(c); renderMessages(); renderConversations(); }
       closeSettings(); toast("Chat cleared");
@@ -1318,7 +1488,7 @@
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); }
+      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); $("#search-input").focus(); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }
     });
@@ -1359,6 +1529,7 @@
     updateModelPill();
     updateKeyStatus();
     updateAutoPill();
+    updateRepoChip();
     renderConversations();
     renderMessages();
     updateCharCount();
