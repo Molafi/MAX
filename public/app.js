@@ -12,7 +12,18 @@
 
   const SESSION_KEY = "max.apiKey.session.v1";
   const GH_SESSION_KEY = "max.ghToken.session.v1";
+  const GL_SESSION_KEY = "max.glToken.session.v1";
   const DONE_MARKER = "[[MAX_DONE]]";
+
+  // Rough per-model pricing (USD per 1M tokens) for the running cost estimate.
+  const PRICING = {
+    "claude-opus-4-8": { in: 15, out: 75 },
+    "claude-opus-4-7": { in: 15, out: 75 },
+    "claude-opus-4-6": { in: 15, out: 75 },
+    "glm-5.2": { in: 0.6, out: 2.2 },
+    "gpt-5.5": { in: 5, out: 15 },
+  };
+  const priceFor = (model) => PRICING[model] || { in: 5, out: 15 };
   const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
   const DEFAULT_MODELS = [
@@ -35,6 +46,7 @@
     config: {
       defaultModel: "claude-opus-4-8", models: DEFAULT_MODELS, allowClientKey: true, hasServerKey: false,
       github: { hasServerToken: false, allowClientToken: true, owner: "", repo: "", branch: "main" },
+      gitlab: { hasServerToken: false, allowClientToken: true },
     },
     settings: {
       apiKey: "",
@@ -44,7 +56,12 @@
       temperature: 1.0,
       autonomous: false,
       autoMaxSteps: 6,
+      autoPush: false,
+      provider: "github", // "github" | "gitlab"
       github: { token: "", owner: "", repo: "", branch: "main", pathPrefix: "max-chats" },
+      gitlab: { token: "", branch: "main" },
+      personas: [],
+      lastRepo: null,
     },
     conversations: [],
     activeId: null,
@@ -88,12 +105,21 @@
           delete s.github.token;
           safeStorageSet(localStorage, LS.settings, JSON.stringify(s));
         }
+        if (s.gitlab && typeof s.gitlab.token === "string" && s.gitlab.token) {
+          safeStorageSet(sessionStorage, GL_SESSION_KEY, s.gitlab.token);
+          delete s.gitlab.token;
+          safeStorageSet(localStorage, LS.settings, JSON.stringify(s));
+        }
         Object.assign(state.settings, s);
       }
-      // Always keep github object well-formed (older saves may lack it).
+      // Always keep provider objects well-formed (older saves may lack them).
       state.settings.github = Object.assign(githubDefaults(), state.settings.github || {});
+      state.settings.gitlab = Object.assign({ token: "", branch: "main" }, state.settings.gitlab || {});
+      if (!Array.isArray(state.settings.personas)) state.settings.personas = [];
+      if (state.settings.provider !== "gitlab") state.settings.provider = "github";
       state.settings.apiKey = sessionStorage.getItem(SESSION_KEY) || "";
       state.settings.github.token = sessionStorage.getItem(GH_SESSION_KEY) || "";
+      state.settings.gitlab.token = sessionStorage.getItem(GL_SESSION_KEY) || "";
     } catch {}
     state.activeId = localStorage.getItem(LS.active) || null;
   }
@@ -103,7 +129,9 @@
     const persistent = JSON.parse(JSON.stringify(state.settings));
     const apiKey = persistent.apiKey; delete persistent.apiKey;
     const ghToken = persistent.github ? persistent.github.token : "";
+    const glToken = persistent.gitlab ? persistent.gitlab.token : "";
     if (persistent.github) delete persistent.github.token;
+    if (persistent.gitlab) delete persistent.gitlab.token;
     safeStorageSet(localStorage, LS.settings, JSON.stringify(persistent), "Settings");
 
     const putSession = (key, val) => {
@@ -112,6 +140,7 @@
     };
     putSession(SESSION_KEY, apiKey);
     putSession(GH_SESSION_KEY, ghToken);
+    putSession(GL_SESSION_KEY, glToken);
   };
   const saveActive = () => state.activeId
     ? safeStorageSet(localStorage, LS.active, state.activeId)
@@ -162,7 +191,8 @@
   function renderConversations() {
     const list = $("#conversation-list");
     const q = $("#search-input").value.trim().toLowerCase();
-    let convos = [...state.conversations].sort((a, b) => b.updatedAt - a.updatedAt);
+    let convos = [...state.conversations].sort((a, b) =>
+      (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.updatedAt - a.updatedAt);
     if (q) {
       convos = convos.filter((c) =>
         c.title.toLowerCase().includes(q) ||
@@ -177,13 +207,21 @@
 
     let html = "";
     let lastGroup = "";
+    const anyPinned = convos.some((c) => c.pinned) && !q;
+    let pinnedHeaderDone = false;
     for (const c of convos) {
-      const g = groupLabel(c.updatedAt);
+      let g;
+      if (anyPinned && c.pinned) { g = "Pinned"; }
+      else { g = groupLabel(c.updatedAt); }
       if (g !== lastGroup) { html += `<div class="conv-group-label">${g}</div>`; lastGroup = g; }
       const active = c.id === state.activeId ? " active" : "";
+      const pin = c.pinned ? `<svg class="conv__pin" viewBox="0 0 24 24"><path d="M12 2l2.4 7.4H22l-6 4.6 2.3 7.4-6.3-4.6L5.7 21 8 14 2 9.4h7.6z"/></svg>` : "";
+      const repoTag = c.repo && c.repo.fullName ? `<span class="conv__repo" title="${esc(c.repo.fullName)}">${esc(c.repo.name || c.repo.fullName)}</span>` : "";
       html += `
         <div class="conv${active}" data-id="${c.id}" role="button" tabindex="0">
+          ${pin}
           <span class="conv__title">${esc(c.title)}</span>
+          ${repoTag}
           <button class="conv__menu" data-menu="${c.id}" title="Options" aria-label="Conversation options">
             <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
           </button>
@@ -338,10 +376,16 @@
       regenBtn.addEventListener("click", () => regenerate(m));
       actions.appendChild(regenBtn);
 
+      const modelBtn = actionBtn("model", `<path d="M6 9l6 6 6-6"/>`, "Model");
+      modelBtn.title = "Regenerate with a different model";
+      modelBtn.addEventListener("click", (e) => regenModelMenu(m, e.currentTarget));
+      actions.appendChild(modelBtn);
+
       if (m.usage) {
         const u = document.createElement("span");
         u.className = "msg__usage";
-        u.textContent = `${m.usage.input_tokens ?? "?"} in · ${m.usage.output_tokens ?? "?"} out`;
+        const modelTag = m.model ? `${m.model} · ` : "";
+        u.textContent = `${modelTag}${m.usage.input_tokens ?? "?"} in · ${m.usage.output_tokens ?? "?"} out`;
         actions.appendChild(u);
       }
     }
@@ -503,6 +547,10 @@
           last.content = last.content.replace(/\s*\[\[MAX_DONE\]\]\s*/g, "").trim();
           saveConvos();
           renderMessages();
+          if (state.settings.autoPush && activeRepo()) {
+            toast("Autonomous run complete — pushing to your repo…");
+            pushConversation(convo.id);
+          }
           break;
         }
         if (step < max) {
@@ -521,7 +569,7 @@
     }
   }
 
-  async function streamAssistant(convo) {
+  async function streamAssistant(convo, opts = {}) {
     state.streaming = true;
     toggleStreamingUI(true);
 
@@ -529,6 +577,7 @@
     let acc = "";
     let usage = null;
     let gotFirst = false;
+    const useModel = opts.model || currentModel();
 
     state.abort = new AbortController();
 
@@ -538,7 +587,7 @@
         headers: { "Content-Type": "application/json" },
         signal: state.abort.signal,
         body: JSON.stringify({
-          model: currentModel(),
+          model: useModel,
           system: effectiveSystem(),
           max_tokens: state.settings.maxTokens,
           temperature: state.settings.temperature,
@@ -620,11 +669,12 @@
 
       // finalize
       stream.setText(acc, false);
-      const aiMsg = { id: uid(), role: "assistant", content: acc, usage };
+      const aiMsg = { id: uid(), role: "assistant", content: acc, usage, model: useModel };
       convo.messages.push(aiMsg);
       touchConvo(convo);
       renderMessages();
       renderConversations();
+      updateUsagePill();
     } catch (err) {
       const aborted = err.name === "AbortError" || state.abort?.signal.aborted;
       if (aborted && acc) {
@@ -674,7 +724,7 @@
     $("#auto-toggle")?.classList.add("running");
   }
 
-  async function regenerate(aiMsg) {
+  async function regenerate(aiMsg, modelOverride) {
     if (state.streaming) return;
     const convo = activeConvo();
     if (!convo) return;
@@ -684,7 +734,35 @@
     convo.messages.splice(idx);
     touchConvo(convo);
     renderMessages();
-    await streamAssistant(convo);
+    await streamAssistant(convo, modelOverride ? { model: modelOverride } : {});
+  }
+
+  // Small menu to regenerate the last answer with a different model.
+  function regenModelMenu(aiMsg, anchorBtn) {
+    $$(".conv-pop").forEach((p) => p.remove());
+    const pop = document.createElement("div");
+    pop.className = "conv-pop";
+    Object.assign(pop.style, {
+      position: "fixed", zIndex: 60, background: "var(--surface-solid)",
+      border: "1px solid var(--border-strong)", borderRadius: "10px",
+      boxShadow: "var(--shadow)", padding: "5px", minWidth: "200px", fontSize: "13.5px", maxHeight: "260px", overflowY: "auto",
+    });
+    pop.innerHTML = `<div style="padding:6px 10px;color:var(--text-faint);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Regenerate with</div>` +
+      state.config.models.map((m) =>
+        `<button data-m="${esc(m.id)}" style="display:block;width:100%;padding:8px 10px;background:none;border:none;color:var(--text);border-radius:7px;text-align:left">${esc(m.label || m.id)}</button>`).join("");
+    document.body.appendChild(pop);
+    const r = anchorBtn.getBoundingClientRect();
+    pop.style.top = `${Math.min(r.bottom + 6, window.innerHeight - 270)}px`;
+    pop.style.left = `${Math.min(r.left, window.innerWidth - 220)}px`;
+    pop.querySelectorAll("button[data-m]").forEach((b) => {
+      b.addEventListener("mouseenter", () => (b.style.background = "var(--surface-2)"));
+      b.addEventListener("mouseleave", () => (b.style.background = "none"));
+      b.addEventListener("click", () => { pop.remove(); regenerate(aiMsg, b.dataset.m); });
+    });
+    setTimeout(() => {
+      const close = (e) => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener("click", close); } };
+      document.addEventListener("click", close);
+    }, 0);
   }
 
   function beginEdit(userMsg) {
@@ -856,52 +934,48 @@
     toast(`Exported as ${format === "json" ? "JSON" : "Markdown"}`, "success");
   }
 
-  function githubConfigured() {
-    const g = state.settings.github;
-    const hasToken = g.token || state.config.github?.hasServerToken;
-    const owner = g.owner || state.config.github?.owner;
-    const repo = g.repo || state.config.github?.repo;
-    return Boolean(hasToken && owner && repo);
-  }
+  async function pushConversationToGitHub(id) { return pushConversation(id); }
 
-  async function pushConversationToGitHub(id) {
+  // Provider-aware push: sends the chat as a Markdown file to the selected repo.
+  async function pushConversation(id) {
     const convo = state.conversations.find((c) => c.id === id) || activeConvo();
     if (!convo || !convo.messages.length) { toast("Nothing to push yet.", "error"); return; }
-    if (!githubConfigured()) {
-      toast("Connect GitHub first (token, owner, repo) in Settings.", "error");
-      openSettings();
-      return;
+    const repo = convo.repo && convo.repo.fullName ? convo.repo : activeRepo();
+    if (!repo || !repo.fullName) {
+      toast("Pick a repository first (the chip beside the message box).", "error");
+      openRepoPicker($("#repo-chip"));
+      return false;
     }
-    const g = state.settings.github;
-    const prefix = (g.pathPrefix || "max-chats").replace(/^\/+|\/+$/g, "");
+    if (!providerHasToken(repo.provider)) {
+      toast(`Connect ${repo.provider === "gitlab" ? "GitLab" : "GitHub"} first in Settings.`, "error");
+      openSettings();
+      return false;
+    }
+    const prefix = (state.settings.github.pathPrefix || "max-chats").replace(/^\/+|\/+$/g, "");
     const path = `${prefix ? prefix + "/" : ""}${slugify(convo.title)}-${convo.id}.md`;
+    const body = {
+      token: providerToken(repo.provider) || undefined,
+      branch: repo.branch || undefined,
+      path,
+      message: `${convo.title || "Chat"} — via MAX`,
+      content: conversationToMarkdown(convo),
+    };
+    if (repo.provider === "gitlab") body.projectId = repo.projectId ?? repo.fullName;
+    else { body.owner = repo.owner; body.repo = repo.name; }
 
-    toast("Pushing to GitHub…");
+    toast(`Pushing to ${repo.fullName}…`);
     try {
-      const res = await fetch("/api/github/push", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          token: g.token || undefined,
-          owner: g.owner || undefined,
-          repo: g.repo || undefined,
-          branch: g.branch || undefined,
-          path,
-          message: `${convo.title || "Chat"} — via MAX`,
-          content: conversationToMarkdown(convo),
-        }),
+      const res = await fetch(`/api/${repo.provider}/push`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error?.message || `Push failed (HTTP ${res.status})`);
-      if (data.htmlUrl) {
-        toast("Pushed to GitHub ✓", "success");
-        toastLink("View file on GitHub", data.htmlUrl);
-      } else {
-        toast(data.message || "Pushed to GitHub ✓", "success");
-      }
+      toast(data.message || "Pushed ✓", "success");
+      if (data.htmlUrl) toastLink("View file", data.htmlUrl);
+      return true;
     } catch (err) {
-      const isNetwork = err instanceof TypeError;
-      toast(isNetwork ? "Can't reach the MAX server (is it running?)." : err.message, "error");
+      toast(err instanceof TypeError ? "Can't reach the MAX server (is it running?)." : err.message, "error");
+      return false;
     }
   }
 
@@ -953,6 +1027,25 @@
     }
   }
 
+  async function testGitlabConnection(btn) {
+    setBtnBusy(btn, true);
+    const out = $("#gl-test-result");
+    out.textContent = "Checking…"; out.style.color = "";
+    try {
+      const res = await fetch("/api/gitlab/test", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: $("#set-gltoken").value.trim() || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      out.textContent = "✓ " + (data.message || "Connected.");
+      out.style.color = "#34d399";
+    } catch (err) {
+      out.textContent = "✗ " + (err instanceof TypeError ? "Can't reach the MAX server." : err.message);
+      out.style.color = "#ff6b8a";
+    } finally { setBtnBusy(btn, false); }
+  }
+
   function readGithubFields() {
     return {
       token: $("#set-ghtoken").value.trim(),
@@ -981,58 +1074,102 @@
   }
 
   /* ============================================================
-     Repository picker — choose a repo for MAX to work in
+     Repository picker + file reading (GitHub & GitLab)
      ============================================================ */
-  function hasGithubToken() {
+  function providerToken(provider) {
+    return provider === "gitlab" ? state.settings.gitlab.token : state.settings.github.token;
+  }
+  function providerHasToken(provider) {
+    if (provider === "gitlab") return Boolean(state.settings.gitlab.token || state.config.gitlab?.hasServerToken);
     return Boolean(state.settings.github.token || state.config.github?.hasServerToken);
   }
 
+  // The repo MAX is working in: bound to the active conversation, else the last one used.
+  function activeRepo() {
+    const c = activeConvo();
+    if (c && c.repo && c.repo.fullName) return c.repo;
+    return state.settings.lastRepo && state.settings.lastRepo.fullName ? state.settings.lastRepo : null;
+  }
   function selectedRepoLabel() {
-    const g = state.settings.github;
-    return g.owner && g.repo ? `${g.owner}/${g.repo}` : "";
+    const r = activeRepo();
+    return r ? r.fullName : "";
   }
 
   function updateRepoChip() {
-    const label = selectedRepoLabel();
+    const r = activeRepo();
     const chip = $("#repo-chip");
     const lbl = $("#repo-chip-label");
     const clear = $("#repo-chip-clear");
+    const filesBtn = $("#files-btn");
     if (!chip) return;
-    if (label) {
-      lbl.textContent = label;
+    if (r) {
+      lbl.textContent = r.fullName;
       chip.classList.add("selected");
-      chip.title = `MAX is working in ${label} (branch ${state.settings.github.branch || "main"})`;
+      chip.title = `MAX is working in ${r.fullName} (${r.provider}, branch ${r.branch || "main"})`;
       clear.hidden = false;
+      if (filesBtn) filesBtn.hidden = false;
     } else {
       lbl.textContent = "Add repository";
       chip.classList.remove("selected");
       chip.title = "Choose a repository for MAX to work in";
       clear.hidden = true;
+      if (filesBtn) filesBtn.hidden = true;
     }
   }
 
-  function selectRepo(repo) {
-    state.settings.github.owner = repo.owner;
-    state.settings.github.repo = repo.name;
-    if (repo.defaultBranch) state.settings.github.branch = repo.defaultBranch;
+  function selectRepo(repo, provider) {
+    const bind = {
+      provider,
+      fullName: repo.fullName,
+      owner: repo.owner || "",
+      name: repo.name || "",
+      projectId: repo.id ?? null,
+      branch: repo.defaultBranch || "main",
+    };
+    let c = activeConvo();
+    if (!c) { c = newConversation(); }
+    c.repo = bind;
+    touchConvo(c);
+    state.settings.lastRepo = bind;
+    if (provider === "github") {
+      state.settings.github.owner = repo.owner;
+      state.settings.github.repo = repo.name;
+      state.settings.github.branch = bind.branch;
+    }
     saveSettings();
     updateRepoChip();
+    renderConversations();
+    treeCache = null; // invalidate cached file tree
     toast(`MAX is now working in ${repo.fullName}`, "success");
   }
 
   function clearRepo() {
-    state.settings.github.owner = "";
-    state.settings.github.repo = "";
+    const c = activeConvo();
+    if (c) { delete c.repo; touchConvo(c); }
+    state.settings.lastRepo = null;
     saveSettings();
     updateRepoChip();
+    treeCache = null;
     toast("Repository cleared");
   }
 
-  async function fetchRepos(q) {
-    const res = await fetch("/api/github/repos", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: state.settings.github.token || undefined, q: q || undefined }),
+  async function providerFetch(path, extra) {
+    const r = activeRepo();
+    const body = { token: providerToken(r.provider) || undefined, branch: r.branch, ...extra };
+    if (r.provider === "gitlab") body.projectId = r.projectId ?? r.fullName;
+    else { body.owner = r.owner; body.repo = r.name; }
+    const res = await fetch(`/api/${r.provider}/${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+    return data;
+  }
+
+  async function fetchRepos(provider, q) {
+    const res = await fetch(`/api/${provider}/repos`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: providerToken(provider) || undefined, q: q || undefined }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
@@ -1040,12 +1177,11 @@
   }
 
   let repoPickerEl = null;
-  function closeRepoPicker() {
-    if (repoPickerEl) { repoPickerEl.remove(); repoPickerEl = null; }
-  }
+  function closeRepoPicker() { if (repoPickerEl) { repoPickerEl.remove(); repoPickerEl = null; } }
 
   function openRepoPicker(anchorBtn) {
     closeRepoPicker();
+    let provider = state.settings.provider || "github";
     const pop = document.createElement("div");
     pop.className = "repo-pop";
     pop.setAttribute("role", "dialog");
@@ -1053,8 +1189,8 @@
       <div class="repo-pop__head">
         <div class="repo-pop__title">Add repository</div>
         <div class="repo-pop__tabs">
-          <button class="repo-tab active" data-tab="github" type="button">GitHub</button>
-          <button class="repo-tab" data-tab="gitlab" type="button" disabled title="GitLab is not supported yet">GitLab</button>
+          <button class="repo-tab" data-tab="github" type="button">GitHub</button>
+          <button class="repo-tab" data-tab="gitlab" type="button">GitLab</button>
         </div>
       </div>
       <div class="repo-pop__search">
@@ -1071,47 +1207,51 @@
     document.body.appendChild(pop);
     repoPickerEl = pop;
 
-    // Position above the chip, clamped to viewport.
     const r = anchorBtn.getBoundingClientRect();
-    const width = pop.offsetWidth;
-    const left = Math.max(12, Math.min(r.left, window.innerWidth - width - 12));
-    pop.style.left = `${left}px`;
-    // prefer opening upward (chip sits near the bottom)
+    pop.style.left = `${Math.max(12, Math.min(r.left, window.innerWidth - pop.offsetWidth - 12))}px`;
     pop.style.bottom = `${Math.max(12, window.innerHeight - r.top + 8)}px`;
 
     const listEl = pop.querySelector("#repo-list");
     const searchEl = pop.querySelector("#repo-search");
+    let debounce;
 
+    const activateTab = (p) => {
+      provider = p;
+      state.settings.provider = p; saveSettings();
+      pop.querySelectorAll(".repo-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === p));
+      searchEl.value = "";
+      if (!providerHasToken(p)) {
+        searchEl.disabled = true;
+        listEl.innerHTML = `<div class="repo-pop__msg">Connect ${p === "gitlab" ? "GitLab" : "GitHub"} first — add a token in Settings.</div>`;
+      } else {
+        searchEl.disabled = false;
+        loadRepoList(listEl, provider, "");
+        setTimeout(() => searchEl.focus(), 20);
+      }
+    };
+
+    pop.querySelectorAll(".repo-tab").forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
     pop.querySelector("#repo-manage").addEventListener("click", () => { closeRepoPicker(); openSettings(); });
-
-    if (!hasGithubToken()) {
-      listEl.innerHTML = `<div class="repo-pop__msg">Connect GitHub first — add a personal access token in Settings.</div>`;
-      searchEl.disabled = true;
-    } else {
-      loadRepoList(listEl, "");
-      let t;
-      searchEl.addEventListener("input", () => {
-        clearTimeout(t);
-        t = setTimeout(() => loadRepoList(listEl, searchEl.value.trim()), 250);
-      });
-      setTimeout(() => searchEl.focus(), 30);
-    }
+    searchEl.addEventListener("input", () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => loadRepoList(listEl, provider, searchEl.value.trim()), 250);
+    });
+    activateTab(provider);
 
     setTimeout(() => {
       const onDoc = (e) => {
         if (repoPickerEl && !repoPickerEl.contains(e.target) && !anchorBtn.contains(e.target)) {
-          closeRepoPicker();
-          document.removeEventListener("mousedown", onDoc);
+          closeRepoPicker(); document.removeEventListener("mousedown", onDoc);
         }
       };
       document.addEventListener("mousedown", onDoc);
     }, 0);
   }
 
-  async function loadRepoList(listEl, q) {
+  async function loadRepoList(listEl, provider, q) {
     listEl.innerHTML = `<div class="repo-spinner"></div>`;
     try {
-      const repos = await fetchRepos(q);
+      const repos = await fetchRepos(provider, q);
       if (!repos.length) {
         listEl.innerHTML = `<div class="repo-pop__msg">${q ? "No matching repositories." : "No repositories found for this token."}</div>`;
         return;
@@ -1120,22 +1260,332 @@
       const lock = `<svg class="repo-item__ico" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>`;
       const open = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>`;
       const check = `<svg class="repo-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>`;
-      listEl.innerHTML = repos.map((x) => `
-        <button class="repo-item${x.fullName === current ? " active" : ""}" type="button" data-full="${esc(x.fullName)}">
+      listEl.innerHTML = repos.map((x, i) => `
+        <button class="repo-item${x.fullName === current ? " active" : ""}" type="button" data-i="${i}">
           ${x.private ? lock : open}
           <span class="repo-item__name">${esc(x.fullName)}</span>
           ${x.fullName === current ? check : ""}
         </button>`).join("");
       listEl.querySelectorAll(".repo-item").forEach((btn) => {
         btn.addEventListener("click", () => {
-          const repo = repos.find((r) => r.fullName === btn.dataset.full);
-          if (repo) { selectRepo(repo); closeRepoPicker(); }
+          const repo = repos[parseInt(btn.dataset.i, 10)];
+          if (repo) { selectRepo(repo, provider); closeRepoPicker(); }
         });
       });
     } catch (err) {
-      const msg = err instanceof TypeError ? "Can't reach the MAX server." : err.message;
-      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(msg)}</div>`;
+      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)}</div>`;
     }
+  }
+
+  /* ---------- file browser + @file mentions ---------- */
+  let treeCache = null; // { fullName, files: [{path,size}] }
+
+  async function getTree() {
+    const r = activeRepo();
+    if (!r) return [];
+    if (treeCache && treeCache.fullName === r.fullName) return treeCache.files;
+    const data = await providerFetch("tree", {});
+    treeCache = { fullName: r.fullName, files: data.files || [] };
+    return treeCache.files;
+  }
+
+  async function insertFileIntoChat(path) {
+    const r = activeRepo();
+    if (!r) return;
+    toast(`Loading ${path}…`);
+    try {
+      const data = await providerFetch("file", { path });
+      const input = $("#input");
+      const lang = (path.split(".").pop() || "").toLowerCase();
+      const block = `\n\nFile \`${path}\` from ${r.fullName}:\n\`\`\`${lang}\n${data.content}\n\`\`\`\n`;
+      input.value = (input.value + block).trimStart();
+      autoResize(input); updateCharCount(); updateSendState(); input.focus();
+      toast(`Inserted ${path} (${Math.round((data.size || data.content.length) / 1024) || 1} KB)`, "success");
+    } catch (err) {
+      toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error");
+    }
+  }
+
+  let filesPickerEl = null;
+  function closeFilesPicker() { if (filesPickerEl) { filesPickerEl.remove(); filesPickerEl = null; } }
+
+  async function openFilesPicker(anchorBtn) {
+    closeFilesPicker();
+    const r = activeRepo();
+    if (!r) { toast("Pick a repository first.", "error"); return; }
+    const pop = document.createElement("div");
+    pop.className = "repo-pop";
+    pop.innerHTML = `
+      <div class="repo-pop__head"><div class="repo-pop__title">Files · ${esc(r.fullName)}</div></div>
+      <div class="repo-pop__search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input type="text" id="file-search" placeholder="Filter files" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="repo-pop__list" id="file-list"><div class="repo-spinner"></div></div>`;
+    document.body.appendChild(pop);
+    filesPickerEl = pop;
+    const rect = anchorBtn.getBoundingClientRect();
+    pop.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - pop.offsetWidth - 12))}px`;
+    pop.style.bottom = `${Math.max(12, window.innerHeight - rect.top + 8)}px`;
+
+    const listEl = pop.querySelector("#file-list");
+    const searchEl = pop.querySelector("#file-search");
+    let files = [];
+    const render = (q) => {
+      const ql = q.toLowerCase();
+      const shown = (ql ? files.filter((f) => f.path.toLowerCase().includes(ql)) : files).slice(0, 300);
+      if (!shown.length) { listEl.innerHTML = `<div class="repo-pop__msg">No files.</div>`; return; }
+      const fileIco = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M14 3v5h5"/><path d="M6 2h9l5 5v13a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1z"/></svg>`;
+      listEl.innerHTML = shown.map((f, i) => `
+        <button class="repo-item" type="button" data-i="${i}" title="${esc(f.path)}">
+          ${fileIco}<span class="repo-item__name">${esc(f.path)}</span>
+        </button>`).join("");
+      listEl.querySelectorAll(".repo-item").forEach((btn) => btn.addEventListener("click", () => {
+        insertFileIntoChat(shown[parseInt(btn.dataset.i, 10)].path); closeFilesPicker();
+      }));
+    };
+    try {
+      files = await getTree();
+      render("");
+      searchEl.addEventListener("input", () => render(searchEl.value.trim()));
+      setTimeout(() => searchEl.focus(), 20);
+    } catch (err) {
+      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)}</div>`;
+    }
+    setTimeout(() => {
+      const onDoc = (e) => { if (filesPickerEl && !filesPickerEl.contains(e.target) && !anchorBtn.contains(e.target)) { closeFilesPicker(); document.removeEventListener("mousedown", onDoc); } };
+      document.addEventListener("mousedown", onDoc);
+    }, 0);
+  }
+
+  /* ---------- @file mention autocomplete ---------- */
+  let mentionEl = null;
+  let mentionMatches = [];
+  let mentionActive = 0;
+  let mentionStart = -1;
+
+  function closeMention() { if (mentionEl) { mentionEl.remove(); mentionEl = null; } mentionStart = -1; }
+  function moveMention(dir) {
+    if (!mentionEl) return;
+    const items = [...mentionEl.querySelectorAll(".repo-item")];
+    if (!items.length) return;
+    items[mentionActive]?.classList.remove("active");
+    mentionActive = (mentionActive + dir + items.length) % items.length;
+    items[mentionActive]?.classList.add("active");
+    items[mentionActive]?.scrollIntoView({ block: "nearest" });
+  }
+
+  async function maybeMention(input) {
+    const repo = activeRepo();
+    const pos = input.selectionStart;
+    const before = input.value.slice(0, pos);
+    const m = before.match(/(?:^|\s)@([\w./-]*)$/);
+    if (!repo || !m) { closeMention(); return; }
+    mentionStart = pos - m[1].length - 1; // index of '@'
+    const query = m[1].toLowerCase();
+    let files = [];
+    try { files = await getTree(); } catch { closeMention(); return; }
+    mentionMatches = files.filter((f) => f.path.toLowerCase().includes(query)).slice(0, 30);
+    if (!mentionMatches.length) { closeMention(); return; }
+    renderMention(input);
+  }
+
+  function renderMention(input) {
+    if (!mentionEl) {
+      mentionEl = document.createElement("div");
+      mentionEl.className = "repo-pop mention-pop";
+      document.body.appendChild(mentionEl);
+      const rect = $(".composer").getBoundingClientRect();
+      mentionEl.style.left = `${rect.left}px`;
+      mentionEl.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+      mentionEl.style.width = `${Math.min(rect.width, 420)}px`;
+    }
+    mentionActive = 0;
+    const fileIco = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M14 3v5h5"/><path d="M6 2h9l5 5v13a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1z"/></svg>`;
+    mentionEl.innerHTML = `<div class="repo-pop__list">` + mentionMatches.map((f, i) =>
+      `<button class="repo-item${i === 0 ? " active" : ""}" type="button" data-i="${i}">${fileIco}<span class="repo-item__name">${esc(f.path)}</span></button>`).join("") + `</div>`;
+    mentionEl.querySelectorAll(".repo-item").forEach((btn) => btn.addEventListener("click", () => {
+      const file = mentionMatches[parseInt(btn.dataset.i, 10)];
+      // remove the "@query" token, then insert the file content
+      if (mentionStart >= 0) {
+        input.value = input.value.slice(0, mentionStart) + input.value.slice(input.selectionStart);
+        autoResize(input); updateCharCount();
+      }
+      closeMention();
+      insertFileIntoChat(file.path);
+    }));
+  }
+
+  /* ============================================================
+     Import conversations (from exported .json)
+     ============================================================ */
+  function importFromFile(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        const list = Array.isArray(parsed) ? parsed : [parsed];
+        let added = 0;
+        for (const raw of list) {
+          if (!raw || !Array.isArray(raw.messages)) continue;
+          const convo = {
+            id: uid(),
+            title: raw.title || "Imported chat",
+            messages: raw.messages.filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+              .map((m) => ({ id: uid(), role: m.role, content: m.content, images: m.images || [], usage: m.usage, model: m.model, auto: m.auto })),
+            createdAt: raw.createdAt || Date.now(),
+            updatedAt: Date.now(),
+            repo: raw.repo || undefined,
+          };
+          if (convo.messages.length) { state.conversations.unshift(convo); added++; }
+        }
+        if (!added) { toast("No valid conversations found in that file.", "error"); return; }
+        saveConvos();
+        renderConversations();
+        toast(`Imported ${added} conversation${added > 1 ? "s" : ""}`, "success");
+      } catch {
+        toast("Could not parse that file as JSON.", "error");
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  /* ============================================================
+     Persona library (reusable system prompts)
+     ============================================================ */
+  function renderPersonas() {
+    const box = $("#persona-list");
+    if (!box) return;
+    const items = state.settings.personas || [];
+    if (!items.length) { box.innerHTML = `<p class="field__help">No saved personas yet. Write a system prompt above and save it.</p>`; return; }
+    box.innerHTML = items.map((p) => `
+      <div class="persona-row">
+        <button class="persona-apply" type="button" data-id="${esc(p.id)}" title="Use this persona">${esc(p.name)}</button>
+        <button class="persona-del" type="button" data-del="${esc(p.id)}" title="Delete" aria-label="Delete persona">
+          <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>`).join("");
+    box.querySelectorAll(".persona-apply").forEach((b) => b.addEventListener("click", () => {
+      const p = state.settings.personas.find((x) => x.id === b.dataset.id);
+      if (p) { $("#set-system").value = p.system; toast(`Applied "${p.name}"`); }
+    }));
+    box.querySelectorAll(".persona-del").forEach((b) => b.addEventListener("click", () => {
+      state.settings.personas = state.settings.personas.filter((x) => x.id !== b.dataset.del);
+      saveSettings(); renderPersonas();
+    }));
+  }
+  function saveCurrentPersona() {
+    const system = $("#set-system").value.trim();
+    if (!system) { toast("Write a system prompt first.", "error"); return; }
+    const name = (prompt("Name this persona:", "") || "").trim();
+    if (!name) return;
+    state.settings.personas.push({ id: uid(), name, system });
+    saveSettings();
+    renderPersonas();
+    toast(`Saved persona "${name}"`, "success");
+  }
+
+  /* ============================================================
+     In-conversation search
+     ============================================================ */
+  let findMatches = [];
+  let findIndex = 0;
+  function toggleFindBar(show) {
+    const bar = $("#find-bar");
+    if (!bar) return;
+    const doShow = show ?? bar.hidden;
+    bar.hidden = !doShow;
+    if (doShow) { $("#find-input").focus(); $("#find-input").select(); }
+    else { clearFindHighlights(); }
+  }
+  function clearFindHighlights() {
+    $$(".msg.find-hit").forEach((el) => el.classList.remove("find-hit", "find-current"));
+    findMatches = [];
+  }
+  function runFind() {
+    clearFindHighlights();
+    const q = $("#find-input").value.trim().toLowerCase();
+    const convo = activeConvo();
+    if (!q || !convo) { $("#find-count").textContent = ""; return; }
+    convo.messages.forEach((m) => {
+      if ((m.content || "").toLowerCase().includes(q)) {
+        const el = $(`.msg[data-id="${m.id}"]`);
+        if (el) { el.classList.add("find-hit"); findMatches.push(el); }
+      }
+    });
+    findIndex = 0;
+    $("#find-count").textContent = findMatches.length ? `1/${findMatches.length}` : "0";
+    if (findMatches.length) focusFind(0);
+  }
+  function focusFind(i) {
+    if (!findMatches.length) return;
+    findMatches.forEach((el) => el.classList.remove("find-current"));
+    findIndex = (i + findMatches.length) % findMatches.length;
+    const el = findMatches[findIndex];
+    el.classList.add("find-current");
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    $("#find-count").textContent = `${findIndex + 1}/${findMatches.length}`;
+  }
+
+  /* ============================================================
+     Command palette (Cmd/Ctrl+K)
+     ============================================================ */
+  let paletteEl = null;
+  function closePalette() { if (paletteEl) { paletteEl.remove(); paletteEl = null; } }
+  function paletteActions() {
+    return [
+      { label: "New chat", run: () => $("#new-chat-btn").click() },
+      { label: "Search conversations", run: () => { setSidebarHidden(false); $("#search-input").focus(); } },
+      { label: "Find in this conversation", run: () => toggleFindBar(true) },
+      { label: "Pick a repository", run: () => openRepoPicker($("#repo-chip")) },
+      { label: "Browse repository files", run: () => { if (activeRepo()) openFilesPicker($("#files-btn")); else toast("Pick a repository first.", "error"); } },
+      { label: "Push conversation to repo", run: () => { const c = activeConvo(); if (c) pushConversation(c.id); } },
+      { label: state.settings.autonomous ? "Turn OFF Autonomous mode" : "Turn ON Autonomous mode", run: () => $("#auto-toggle").click() },
+      { label: "Toggle theme (light/dark)", run: toggleTheme },
+      { label: "Import chat (.json)", run: () => $("#import-input").click() },
+      { label: "Export current chat (.md)", run: () => { const c = activeConvo(); if (c) exportConversation(c.id, "md"); } },
+      { label: "Open Settings", run: openSettings },
+    ];
+  }
+  function openPalette() {
+    closePalette();
+    const actions = paletteActions();
+    const el = document.createElement("div");
+    el.className = "modal-overlay palette-overlay";
+    el.innerHTML = `
+      <div class="palette" role="dialog" aria-modal="true">
+        <input type="text" id="palette-input" placeholder="Type a command…" autocomplete="off" spellcheck="false" />
+        <div class="palette-list" id="palette-list"></div>
+      </div>`;
+    document.body.appendChild(el);
+    paletteEl = el;
+    const input = el.querySelector("#palette-input");
+    const listEl = el.querySelector("#palette-list");
+    let active = 0;
+    let filtered = actions;
+    const render = () => {
+      listEl.innerHTML = filtered.map((a, i) =>
+        `<button class="palette-item${i === active ? " active" : ""}" type="button" data-i="${i}">${esc(a.label)}</button>`).join("")
+        || `<div class="repo-pop__msg">No commands</div>`;
+      listEl.querySelectorAll(".palette-item").forEach((b) => b.addEventListener("click", () => {
+        const a = filtered[parseInt(b.dataset.i, 10)]; closePalette(); a && a.run();
+      }));
+    };
+    const filter = () => {
+      const q = input.value.trim().toLowerCase();
+      filtered = q ? actions.filter((a) => a.label.toLowerCase().includes(q)) : actions;
+      active = 0; render();
+    };
+    input.addEventListener("input", filter);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); active = Math.min(active + 1, filtered.length - 1); render(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); active = Math.max(active - 1, 0); render(); }
+      else if (e.key === "Enter") { e.preventDefault(); const a = filtered[active]; closePalette(); a && a.run(); }
+    });
+    el.addEventListener("mousedown", (e) => { if (e.target === el) closePalette(); });
+    render();
+    setTimeout(() => input.focus(), 20);
   }
 
   /* ============================================================
@@ -1161,6 +1611,25 @@
      ============================================================ */
   function updateModelPill() {
     $("#model-pill-name").textContent = currentModel();
+  }
+
+  // Running token + cost total for the active conversation.
+  function updateUsagePill() {
+    const pill = $("#usage-pill");
+    if (!pill) return;
+    const convo = activeConvo();
+    let inTok = 0, outTok = 0;
+    if (convo) for (const m of convo.messages) {
+      if (m.usage) { inTok += m.usage.input_tokens || 0; outTok += m.usage.output_tokens || 0; }
+    }
+    if (!inTok && !outTok) { pill.hidden = true; return; }
+    const p = priceFor(currentModel());
+    const cost = (inTok / 1e6) * p.in + (outTok / 1e6) * p.out;
+    const tokens = inTok + outTok;
+    const tokLabel = tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
+    pill.hidden = false;
+    pill.textContent = `${tokLabel} tok · ~$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}`;
+    pill.title = `${inTok.toLocaleString()} input + ${outTok.toLocaleString()} output tokens · estimated $${cost.toFixed(4)} at current model pricing`;
   }
   function updateKeyStatus() {
     const el = $("#key-status");
@@ -1192,6 +1661,12 @@
     $("#set-autonomous").checked = !!s.autonomous;
     $("#set-autosteps").value = clampSteps(s.autoMaxSteps);
     $("#autosteps-val").textContent = clampSteps(s.autoMaxSteps);
+    $("#set-autopush").checked = !!s.autoPush;
+
+    // GitLab + personas
+    $("#set-gltoken").value = s.gitlab?.token || "";
+    $("#gl-test-result").textContent = "";
+    renderPersonas();
 
     // GitHub (fall back to server-provided defaults as placeholders/values)
     const g = s.github || githubDefaults();
@@ -1237,6 +1712,11 @@
 
     state.settings.autonomous = $("#set-autonomous").checked;
     state.settings.autoMaxSteps = clampSteps($("#set-autosteps").value);
+    state.settings.autoPush = $("#set-autopush").checked;
+    state.settings.gitlab = {
+      token: $("#set-gltoken").value.trim(),
+      branch: state.settings.gitlab?.branch || "main",
+    };
 
     state.settings.github = {
       token: $("#set-ghtoken").value.trim(),
@@ -1290,22 +1770,25 @@
     });
     const item = (a, label, color) =>
       `<button data-a="${a}" style="display:flex;gap:8px;width:100%;padding:8px 10px;background:none;border:none;color:${color || "var(--text)"};border-radius:7px;text-align:left">${label}</button>`;
+    const convo = state.conversations.find((c) => c.id === id);
     pop.innerHTML =
+      item("pin", convo?.pinned ? "Unpin" : "Pin") +
       item("rename", "Rename") +
-      item("push", "Push to GitHub") +
+      item("push", "Push to repo") +
       item("export-md", "Export .md") +
       item("export-json", "Export .json") +
       item("delete", "Delete", "#ff6b8a");
     document.body.appendChild(pop);
     const r = anchorBtn.getBoundingClientRect();
-    pop.style.top = `${Math.min(r.bottom + 6, window.innerHeight - 220)}px`;
+    pop.style.top = `${Math.min(r.bottom + 6, window.innerHeight - 260)}px`;
     pop.style.left = `${Math.min(r.left, window.innerWidth - 170)}px`;
     pop.querySelectorAll("button").forEach((b) => {
       b.addEventListener("mouseenter", () => (b.style.background = "var(--surface-2)"));
       b.addEventListener("mouseleave", () => (b.style.background = "none"));
     });
+    pop.querySelector('[data-a="pin"]').addEventListener("click", () => { pop.remove(); togglePin(id); });
     pop.querySelector('[data-a="rename"]').addEventListener("click", () => { pop.remove(); openRename(id); });
-    pop.querySelector('[data-a="push"]').addEventListener("click", () => { pop.remove(); pushConversationToGitHub(id); });
+    pop.querySelector('[data-a="push"]').addEventListener("click", () => { pop.remove(); pushConversation(id); });
     pop.querySelector('[data-a="export-md"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "md"); });
     pop.querySelector('[data-a="export-json"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "json"); });
     pop.querySelector('[data-a="delete"]').addEventListener("click", () => { pop.remove(); deleteConversation(id); });
@@ -1313,6 +1796,15 @@
       const close = (e) => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener("click", close); } };
       document.addEventListener("click", close);
     }, 0);
+  }
+
+  function togglePin(id) {
+    const c = state.conversations.find((x) => x.id === id);
+    if (!c) return;
+    c.pinned = !c.pinned;
+    saveConvos();
+    renderConversations();
+    toast(c.pinned ? "Pinned" : "Unpinned");
   }
 
   function deleteConversation(id) {
@@ -1340,8 +1832,11 @@
     if (state.streaming) return;
     state.activeId = id;
     saveActive();
+    treeCache = null; // repo may differ per conversation
     renderConversations();
     renderMessages();
+    updateRepoChip();
+    updateUsagePill();
     if (window.innerWidth <= 820) setSidebarHidden(true);
   }
 
@@ -1356,6 +1851,7 @@
 
     input.addEventListener("input", () => { autoResize(input); updateCharCount(); updateSendState(); });
     input.addEventListener("keydown", (e) => {
+      if (mentionEl) return; // let the mention handler own the keys
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         if (!state.streaming) sendMessage(input.value);
@@ -1466,6 +1962,18 @@
       else openRepoPicker($("#repo-chip"));
     });
     $("#repo-chip-clear").addEventListener("click", (e) => { e.stopPropagation(); clearRepo(); });
+    $("#files-btn").addEventListener("click", () => {
+      if (filesPickerEl) closeFilesPicker(); else openFilesPicker($("#files-btn"));
+    });
+    // @file mention autocomplete
+    input.addEventListener("input", () => maybeMention(input));
+    input.addEventListener("keydown", (e) => {
+      if (mentionEl) {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); moveMention(e.key === "ArrowDown" ? 1 : -1); }
+        else if (e.key === "Enter" && !e.shiftKey) { const a = mentionEl.querySelector(".repo-item.active"); if (a) { e.preventDefault(); a.click(); } }
+        else if (e.key === "Escape") { closeMention(); }
+      }
+    });
     $("#clear-current").addEventListener("click", () => {
       const c = activeConvo(); if (c) { c.messages = []; c.title = "New chat"; touchConvo(c); renderMessages(); renderConversations(); }
       closeSettings(); toast("Chat cleared");
@@ -1488,10 +1996,32 @@
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); $("#search-input").focus(); }
+      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closePalette(); }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") { e.preventDefault(); toggleFindBar(true); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }
     });
+
+    // find bar
+    $("#find-input").addEventListener("input", runFind);
+    $("#find-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); focusFind(findIndex + (e.shiftKey ? -1 : 1)); }
+      if (e.key === "Escape") toggleFindBar(false);
+    });
+    $("#find-next").addEventListener("click", () => focusFind(findIndex + 1));
+    $("#find-prev").addEventListener("click", () => focusFind(findIndex - 1));
+    $("#find-close").addEventListener("click", () => toggleFindBar(false));
+    $("#find-btn").addEventListener("click", () => toggleFindBar());
+
+    // import
+    $("#import-input").addEventListener("change", (e) => { importFromFile(e.target.files[0]); e.target.value = ""; });
+
+    // personas + autoPush + gitlab reveal
+    $("#persona-save").addEventListener("click", saveCurrentPersona);
+    $("#reveal-gltoken").addEventListener("click", () => {
+      const el = $("#set-gltoken"); el.type = el.type === "password" ? "text" : "password";
+    });
+    $("#gl-test").addEventListener("click", (e) => testGitlabConnection(e.currentTarget));
   }
 
   /* ============================================================
@@ -1534,6 +2064,12 @@
     renderMessages();
     updateCharCount();
     updateSendState();
+    updateUsagePill();
+
+    // Register the service worker for installability + offline shell.
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
 
     // first-run nudge if no key at all
     if (!state.config.hasServerKey && !state.settings.apiKey) {

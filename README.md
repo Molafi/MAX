@@ -42,13 +42,23 @@ hold it (though you *can* enter your own key in Settings if you prefer).
   multiple steps on its own, auto‑continuing until it's done (or you hit **Stop**)
 - Configurable step limit; finishes when the model emits its completion marker
 
-**GitHub integration**
+**GitHub & GitLab integration**
 - **Pick a repository** from a searchable list of your repos (the chip next to the
-  composer) so MAX knows which project you're working in — that context is passed
-  to the model on every message
+  composer) so MAX knows which project you're working in — passed to the model as context
+- **Read your code:** browse the repo file tree and insert any file into the chat, or type
+  `@` to fuzzy‑search files and pull one in
 - **Push any conversation** to the selected repo as a Markdown file (create or update)
-- **Test connection** button verifies the token, repo, and push permission
-- The token is proxied server‑side and never stored in `localStorage`
+- **Per‑conversation repo binding** — each chat remembers its own repository
+- Works with both **GitHub and GitLab**; tokens are proxied server‑side, never in `localStorage`
+
+**More**
+- **Persona library** — save reusable system prompts and apply them in one click
+- **Token + cost estimate** per conversation, shown live in the top bar
+- **Find in conversation** (Ctrl/⌘+F) with match highlighting and next/prev
+- **Pin** important chats; **import** exported `.json` chats; **regenerate** the last answer
+  with a different model
+- **Command palette** (Ctrl/⌘+K) for quick actions
+- **Installable PWA** with an offline app shell
 
 **Export**
 - Download any conversation as **Markdown** or **JSON** from its ⋯ menu
@@ -200,6 +210,8 @@ MAX/
     ├── styles.css     # Premium theming, animations, responsive layout
     ├── app.js         # Chat logic, streaming, conversation management
     ├── bg.js          # Animated constellation background
+    ├── sw.js          # Service worker (offline app shell)
+    ├── manifest.webmanifest  # PWA manifest
     └── favicon.svg    # The "L" logo
 ```
 

@@ -72,7 +72,16 @@ const CONFIG = {
     apiBase: (process.env.GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, ""),
     allowClientToken: (process.env.ALLOW_CLIENT_GITHUB_TOKEN || "true").toLowerCase() !== "false",
   },
+  gitlab: {
+    token: process.env.GITLAB_TOKEN || "",
+    apiBase: (process.env.GITLAB_API_BASE || "https://gitlab.com/api/v4").replace(/\/+$/, ""),
+    allowClientToken: (process.env.ALLOW_CLIENT_GITLAB_TOKEN || "true").toLowerCase() !== "false",
+  },
 };
+
+// Cap on how much of a repo file we return to the browser (protects memory + context).
+const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_BYTES || "524288", 10); // 512 KB
+const MAX_TREE_ENTRIES = 4000;
 
 const START_TIME = Date.now();
 
@@ -115,6 +124,7 @@ const MIME = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
   ".svg": "image/svg+xml",
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -234,6 +244,10 @@ function handleConfig(req, res) {
       owner: CONFIG.github.owner,
       repo: CONFIG.github.repo,
       branch: CONFIG.github.branch,
+    },
+    gitlab: {
+      hasServerToken: Boolean(CONFIG.gitlab.token),
+      allowClientToken: CONFIG.gitlab.allowClientToken,
     },
   });
 }
@@ -669,6 +683,209 @@ async function handleGithubPush(req, res) {
   }
 }
 
+function sanitizeRepoPath(p) {
+  return String(p || "").trim().replace(/^\/+/, "").split("/")
+    .filter((seg) => seg && seg !== "." && seg !== "..").join("/");
+}
+
+async function handleGithubTree(req, res) {
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
+  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
+
+  try {
+    const r = await githubApi(gh.token, "GET",
+      `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/git/trees/${encodeURIComponent(gh.branch)}?recursive=1`);
+    if (!r.ok) return ghError(res, r, "Could not read the repository tree.");
+    const files = (r.json?.tree || [])
+      .filter((t) => t.type === "blob")
+      .slice(0, MAX_TREE_ENTRIES)
+      .map((t) => ({ path: t.path, size: t.size || 0 }));
+    return sendJson(res, 200, { ok: true, branch: gh.branch, truncated: Boolean(r.json?.truncated), files });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+  }
+}
+
+async function handleGithubFile(req, res) {
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
+  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
+  const filePath = sanitizeRepoPath(payload.path);
+  if (!filePath) return sendJson(res, 400, { error: { type: "bad_request", message: "A file path is required." } });
+
+  const enc = filePath.split("/").map(encodeURIComponent).join("/");
+  try {
+    const r = await githubApi(gh.token, "GET",
+      `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/contents/${enc}?ref=${encodeURIComponent(gh.branch)}`);
+    if (!r.ok) return ghError(res, r, "Could not read the file.");
+    if (Array.isArray(r.json)) return sendJson(res, 400, { error: { type: "bad_request", message: "That path is a directory, not a file." } });
+    const size = r.json?.size || 0;
+    if (size > MAX_FILE_BYTES) return sendJson(res, 413, { error: { type: "too_large", message: `File is too large to load (${Math.round(size / 1024)} KB, limit ${Math.round(MAX_FILE_BYTES / 1024)} KB).` } });
+    if (r.json?.encoding !== "base64" || typeof r.json?.content !== "string") {
+      return sendJson(res, 415, { error: { type: "unsupported", message: "This file type can't be loaded as text." } });
+    }
+    const text = Buffer.from(r.json.content, "base64").toString("utf8");
+    return sendJson(res, 200, { ok: true, path: filePath, size, content: text });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  GitLab integration                                                 */
+/* ------------------------------------------------------------------ */
+function resolveGitlab(payload) {
+  const clientToken = CONFIG.gitlab.allowClientToken ? String(payload.token || "").trim() : "";
+  return {
+    token: clientToken || CONFIG.gitlab.token,
+    projectId: String(payload.projectId ?? payload.fullName ?? "").trim(),
+    branch: String(payload.branch || "main").trim() || "main",
+  };
+}
+
+async function gitlabApi(token, method, apiPath, body) {
+  const url = `${CONFIG.gitlab.apiBase}${apiPath}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25_000);
+  try {
+    const r = await fetch(url, {
+      method,
+      headers: {
+        "PRIVATE-TOKEN": token,
+        Accept: "application/json",
+        "User-Agent": "MAX-chat",
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+    const text = await r.text().catch(() => "");
+    let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+    return { status: r.status, ok: r.ok, json, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function glError(res, resp, fallback) {
+  const message = resp?.json?.message || resp?.json?.error || resp?.text || fallback || "GitLab request failed";
+  return sendJson(res, resp?.status || 502, { error: { type: mapStatusType(resp?.status || 502), status: resp?.status, message: typeof message === "string" ? message : fallback } });
+}
+const glProjectPath = (id) => encodeURIComponent(id);
+
+async function handleGitlabTest(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  try {
+    const who = await gitlabApi(gl.token, "GET", "/user");
+    if (!who.ok) return glError(res, who, "Token rejected by GitLab.");
+    return sendJson(res, 200, { ok: true, login: who.json?.username, message: `Connected to GitLab as ${who.json?.username}.` });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function handleGitlabRepos(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  const q = String(payload.q || "").trim();
+  try {
+    const r = await gitlabApi(gl.token, "GET",
+      `/projects?membership=true&simple=true&per_page=100&order_by=last_activity_at${q ? `&search=${encodeURIComponent(q)}` : ""}`);
+    if (!r.ok) return glError(res, r, "Could not list projects.");
+    const repos = (Array.isArray(r.json) ? r.json : []).map((p) => ({
+      id: p.id,
+      fullName: p.path_with_namespace,
+      owner: p.namespace?.full_path || p.namespace?.path || "",
+      name: p.path,
+      private: p.visibility !== "public",
+      defaultBranch: p.default_branch || "main",
+      description: p.description || "",
+    }));
+    return sendJson(res, 200, { ok: true, repos });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function handleGitlabTree(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
+  try {
+    const r = await gitlabApi(gl.token, "GET",
+      `/projects/${glProjectPath(gl.projectId)}/repository/tree?recursive=true&per_page=100&ref=${encodeURIComponent(gl.branch)}`);
+    if (!r.ok) return glError(res, r, "Could not read the repository tree.");
+    const files = (Array.isArray(r.json) ? r.json : [])
+      .filter((t) => t.type === "blob")
+      .slice(0, MAX_TREE_ENTRIES)
+      .map((t) => ({ path: t.path, size: 0 }));
+    return sendJson(res, 200, { ok: true, branch: gl.branch, files });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function handleGitlabFile(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
+  const filePath = sanitizeRepoPath(payload.path);
+  if (!filePath) return sendJson(res, 400, { error: { type: "bad_request", message: "A file path is required." } });
+  try {
+    const r = await gitlabApi(gl.token, "GET",
+      `/projects/${glProjectPath(gl.projectId)}/repository/files/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(gl.branch)}`);
+    if (!r.ok) return glError(res, r, "Could not read the file.");
+    const size = r.json?.size || 0;
+    if (size > MAX_FILE_BYTES) return sendJson(res, 413, { error: { type: "too_large", message: `File is too large to load (limit ${Math.round(MAX_FILE_BYTES / 1024)} KB).` } });
+    const text = Buffer.from(r.json?.content || "", "base64").toString("utf8");
+    return sendJson(res, 200, { ok: true, path: filePath, size, content: text });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function handleGitlabPush(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
+  }
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
+  const content = typeof payload.content === "string" ? payload.content : "";
+  if (!content) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to push (empty content)." } });
+  const filePath = sanitizeRepoPath(payload.path);
+  if (!filePath) return sendJson(res, 400, { error: { type: "bad_request", message: "A valid file path is required." } });
+  const message = String(payload.message || `Add ${filePath} via MAX`).slice(0, 500);
+  const fileApi = `/projects/${glProjectPath(gl.projectId)}/repository/files/${encodeURIComponent(filePath)}`;
+
+  try {
+    // Does the file already exist on this branch?
+    const head = await gitlabApi(gl.token, "GET", `${fileApi}?ref=${encodeURIComponent(gl.branch)}`);
+    const exists = head.ok;
+    const body = { branch: gl.branch, content, commit_message: message, encoding: "text" };
+    const write = await gitlabApi(gl.token, exists ? "PUT" : "POST", fileApi, body);
+    if (!write.ok) return glError(res, write, "Push failed.");
+    return sendJson(res, 200, {
+      ok: true, path: filePath, updated: exists,
+      message: `${exists ? "Updated" : "Created"} ${filePath} on ${gl.projectId}@${gl.branch}.`,
+    });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Router                                                             */
 /* ------------------------------------------------------------------ */
@@ -703,6 +920,27 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/api/github/push" && req.method === "POST") {
       return await handleGithubPush(req, res);
+    }
+    if (pathname === "/api/github/tree" && req.method === "POST") {
+      return await handleGithubTree(req, res);
+    }
+    if (pathname === "/api/github/file" && req.method === "POST") {
+      return await handleGithubFile(req, res);
+    }
+    if (pathname === "/api/gitlab/test" && req.method === "POST") {
+      return await handleGitlabTest(req, res);
+    }
+    if (pathname === "/api/gitlab/repos" && req.method === "POST") {
+      return await handleGitlabRepos(req, res);
+    }
+    if (pathname === "/api/gitlab/tree" && req.method === "POST") {
+      return await handleGitlabTree(req, res);
+    }
+    if (pathname === "/api/gitlab/file" && req.method === "POST") {
+      return await handleGitlabFile(req, res);
+    }
+    if (pathname === "/api/gitlab/push" && req.method === "POST") {
+      return await handleGitlabPush(req, res);
     }
     if (pathname.startsWith("/api/")) {
       return sendJson(res, 404, { error: { type: "not_found", message: "Unknown API route" } });

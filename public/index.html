@@ -8,6 +8,8 @@
   <meta name="description" content="MAX — a premium AI chat assistant." />
 
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="favicon.svg" />
   <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -111,12 +113,26 @@
           </button>
         </div>
         <div class="topbar__right">
-          <button class="icon-btn" id="push-btn" title="Push this chat to GitHub" aria-label="Push to GitHub">
+          <span class="usage-pill" id="usage-pill" title="Token usage / estimated cost" hidden></span>
+          <button class="icon-btn" id="find-btn" title="Find in conversation (Ctrl/⌘+F)" aria-label="Find in conversation">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          </button>
+          <button class="icon-btn" id="push-btn" title="Push this chat to the selected repo" aria-label="Push to repo">
             <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 00-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.5 9.5 0 015 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0012 2z"/></svg>
           </button>
           <span class="key-status" id="key-status" title="API key status"></span>
         </div>
       </header>
+
+      <!-- Find-in-conversation bar -->
+      <div class="find-bar" id="find-bar" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input type="text" id="find-input" placeholder="Find in this conversation" autocomplete="off" />
+        <span class="find-count" id="find-count"></span>
+        <button class="icon-btn" id="find-prev" title="Previous" aria-label="Previous match"><svg viewBox="0 0 24 24"><path d="M18 15l-6-6-6 6"/></svg></button>
+        <button class="icon-btn" id="find-next" title="Next" aria-label="Next match"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+        <button class="icon-btn" id="find-close" title="Close" aria-label="Close find"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+      </div>
 
       <!-- Chat scroll region -->
       <section class="chat" id="chat" aria-live="polite">
@@ -190,6 +206,9 @@
           </button>
         </form>
         <div class="composer-tools">
+          <button type="button" class="repo-tool" id="files-btn" title="Browse repository files" hidden aria-label="Browse files">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+          </button>
           <button type="button" class="repo-chip" id="repo-chip" title="Choose a repository for MAX to work in" aria-haspopup="listbox">
             <svg class="repo-chip__gh" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 00-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.5 9.5 0 015 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0012 2z"/></svg>
             <span id="repo-chip-label">Add repository</span>
@@ -261,6 +280,21 @@
           <label for="set-autosteps">Max autonomous steps <span class="field__val" id="autosteps-val">6</span></label>
           <input type="range" id="set-autosteps" min="2" max="15" step="1" />
         </div>
+        <div class="field">
+          <label class="switch-row" for="set-autopush">
+            <span>
+              <b>Auto-push when done</b>
+              <span class="field__help">When an autonomous run finishes, push the conversation to the selected repo.</span>
+            </span>
+            <input type="checkbox" id="set-autopush" class="switch" />
+          </label>
+        </div>
+
+        <div class="section-divider"><span>Personas</span></div>
+        <div class="field">
+          <div id="persona-list"></div>
+          <button class="btn btn--ghost mt8" id="persona-save" type="button">Save current system prompt as persona</button>
+        </div>
 
         <div class="section-divider"><span>GitHub</span></div>
 
@@ -300,6 +334,21 @@
           <p class="field__help" id="gh-test-result"></p>
         </div>
 
+        <div class="section-divider"><span>GitLab</span></div>
+
+        <div class="field" id="gltoken-field">
+          <label for="set-gltoken">GitLab token <span class="field__opt">(session only)</span></label>
+          <div class="input-icon">
+            <input type="password" id="set-gltoken" placeholder="glpat-…" autocomplete="new-password" spellcheck="false" />
+            <button type="button" class="reveal-btn" id="reveal-gltoken" title="Show/hide">👁</button>
+          </div>
+          <p class="field__help">Needs the <b>api</b> or <b>write_repository</b> scope to push. Pick a project with the repository chip.</p>
+          <div class="danger-row mt8">
+            <button class="btn btn--ghost" id="gl-test" type="button">Test GitLab connection</button>
+          </div>
+          <p class="field__help" id="gl-test-result"></p>
+        </div>
+
         <div class="section-divider"><span>Danger zone</span></div>
 
         <div class="field">
@@ -332,6 +381,9 @@
       </div>
     </div>
   </div>
+
+  <!-- Hidden import input -->
+  <input type="file" id="import-input" accept="application/json,.json" hidden />
 
   <!-- Toast host -->
   <div class="toast-host" id="toast-host" aria-live="assertive"></div>
