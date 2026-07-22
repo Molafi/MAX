@@ -192,6 +192,9 @@
           <button type="button" class="icon-btn composer__attach" id="attach-btn" title="Attach image">
             <svg viewBox="0 0 24 24"><path d="M21 12.5V7a4 4 0 00-8 0v9a2.5 2.5 0 005 0V8"/></svg>
           </button>
+          <button type="button" class="icon-btn composer__attach" id="mic-btn" title="Voice input" aria-label="Voice input">
+            <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>
+          </button>
           <input type="file" id="file-input" accept="image/jpeg,image/png,image/gif,image/webp" multiple hidden />
           <textarea id="input" class="composer__input" rows="1"
             placeholder="Message MAX…" autocomplete="off" autofocus></textarea>
@@ -208,6 +211,10 @@
         <div class="composer-tools">
           <button type="button" class="repo-tool" id="files-btn" title="Browse repository files" hidden aria-label="Browse files">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+          </button>
+          <button type="button" class="repo-tool basket-chip" id="basket-chip" title="Staged context files — click to clear" hidden aria-label="Context basket">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+            <span id="basket-count">0</span>
           </button>
           <button type="button" class="repo-chip" id="repo-chip" title="Choose a repository for MAX to work in" aria-haspopup="listbox">
             <svg class="repo-chip__gh" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 00-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.5 9.5 0 015 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0012 2z"/></svg>
@@ -288,6 +295,21 @@
             </span>
             <input type="checkbox" id="set-autopush" class="switch" />
           </label>
+        </div>
+        <div class="field">
+          <label class="switch-row" for="set-confirm-auto">
+            <span>
+              <b>Confirm before autonomous runs</b>
+              <span class="field__help">Show a cost/step warning before MAX starts working on its own.</span>
+            </span>
+            <input type="checkbox" id="set-confirm-auto" class="switch" />
+          </label>
+        </div>
+
+        <div class="section-divider"><span>API profiles</span></div>
+        <div class="field">
+          <div id="profile-list"></div>
+          <button class="btn btn--ghost mt8" id="profile-save" type="button">Save current key + model as a profile</button>
         </div>
 
         <div class="section-divider"><span>Personas</span></div>

@@ -62,6 +62,8 @@
       gitlab: { token: "", branch: "main" },
       personas: [],
       lastRepo: null,
+      confirmAutonomous: true,
+      profiles: [],
     },
     conversations: [],
     activeId: null,
@@ -71,6 +73,7 @@
     renameId: null,
     autoStop: false,
     autoRunning: false,
+    basket: [], // staged repo files: {path, content}
   };
 
   const githubDefaults = () => ({ token: "", owner: "", repo: "", branch: "main", pathPrefix: "max-chats" });
@@ -332,7 +335,10 @@
     bubble.className = "msg__bubble";
     if (m.role === "assistant") {
       bubble.classList.add("md");
-      bubble.innerHTML = renderMarkdown(m.content);
+      const think = m.thinking
+        ? `<details class="thinking-box"><summary>Thinking…</summary><div class="thinking-body">${esc(m.thinking)}</div></details>`
+        : "";
+      bubble.innerHTML = think + renderMarkdown(m.content);
       enhanceContent(bubble);
     } else {
       // user: show images + text (escaped, preserve newlines)
@@ -367,6 +373,11 @@
     copyBtn.addEventListener("click", () => { copyText(m.content); toast("Copied to clipboard", "success"); });
     actions.appendChild(copyBtn);
 
+    const branchBtn = actionBtn("branch", `<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M6 15c0-5 4-6 9.5-6.6"/>`, "Branch");
+    branchBtn.title = "Fork a new conversation from this point";
+    branchBtn.addEventListener("click", () => branchFrom(m));
+    actions.appendChild(branchBtn);
+
     if (m.role === "user") {
       const editBtn = actionBtn("edit", `<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/>`, "Edit");
       editBtn.addEventListener("click", () => beginEdit(m));
@@ -380,6 +391,18 @@
       modelBtn.title = "Regenerate with a different model";
       modelBtn.addEventListener("click", (e) => regenModelMenu(m, e.currentTarget));
       actions.appendChild(modelBtn);
+
+      const speakBtn = actionBtn("speak", `<path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 010 7"/>`, "Speak");
+      speakBtn.addEventListener("click", () => speak(m.content));
+      actions.appendChild(speakBtn);
+
+      const edits = parseEdits(m.content);
+      if (edits.length && activeRepo()) {
+        const reviewBtn = actionBtn("review", `<path d="M20 6L9 17l-5-5"/>`, `Review ${edits.length} change${edits.length > 1 ? "s" : ""}`);
+        reviewBtn.classList.add("msg-action--accent");
+        reviewBtn.addEventListener("click", () => openDiffModal(edits));
+        actions.appendChild(reviewBtn);
+      }
 
       if (m.usage) {
         const u = document.createElement("span");
@@ -412,11 +435,15 @@
       </div>`;
     messagesEl().appendChild(row);
     scrollToBottom(true);
+    const bubble = row.querySelector(".msg__bubble");
     return {
       row,
-      bubble: row.querySelector(".msg__bubble"),
-      setText(text, withCursor) {
-        this.bubble.innerHTML = renderMarkdown(text) + (withCursor ? '<span class="cursor-blink"></span>' : "");
+      bubble,
+      setText(text, withCursor, thinking) {
+        const think = thinking
+          ? `<details class="thinking-box" open><summary>Thinking…</summary><div class="thinking-body">${esc(thinking)}</div></details>`
+          : "";
+        this.bubble.innerHTML = think + renderMarkdown(text) + (withCursor ? '<span class="cursor-blink"></span>' : "");
         enhanceContent(this.bubble);
       },
     };
@@ -485,9 +512,10 @@
   // System prompt actually sent — augmented with agent instructions in autonomous mode.
   function effectiveSystem() {
     let sys = state.settings.system || "";
-    const repo = selectedRepoLabel();
+    const repo = activeRepo();
     if (repo) {
-      sys += `\n\n[Working repository] The user has selected the GitHub repository ${repo} (branch ${state.settings.github.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo}. You cannot browse it directly unless the user pastes code or files.`;
+      sys += `\n\n[Working repository] The user has selected the ${repo.provider} repository ${repo.fullName} (branch ${repo.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo.fullName}.`;
+      sys += `\n\n[Editing files] When you want to change or create files, output each file as a fenced code block whose opening fence includes a path attribute, exactly like:\n\`\`\`js path=src/example.js\n<the COMPLETE new contents of the file>\n\`\`\`\nAlways include the full file content (not a diff), one block per file. MAX shows the user a diff and lets them commit these to a branch and open a pull request. Only use this format for real file changes.`;
     }
     if (state.settings.autonomous) {
       sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line.`;
@@ -499,13 +527,17 @@
     if (state.streaming) return;
     text = text.trim();
     const imgs = state.attachments.slice();
-    if (!text && imgs.length === 0) return;
+    const staged = state.basket.slice();
+    if (!text && imgs.length === 0 && !staged.length) return;
 
     let convo = activeConvo();
     if (!convo) convo = newConversation();
 
+    const fullText = (basketPrefix() + text).trim();
+    if (staged.length) clearBasket();
+
     const userMsg = {
-      id: uid(), role: "user", content: text,
+      id: uid(), role: "user", content: fullText,
       images: imgs.map((a) => ({ media_type: a.media_type, dataUrl: a.dataUrl })),
     };
     convo.messages.push(userMsg);
@@ -529,6 +561,15 @@
 
   async function runAutonomousLoop(convo) {
     const max = clampSteps(state.settings.autoMaxSteps);
+    // Cost guardrail: warn before a potentially expensive multi-step run.
+    if (state.settings.confirmAutonomous !== false) {
+      const p = priceFor(currentModel());
+      const estMax = ((state.settings.maxTokens / 1e6) * p.out * max).toFixed(2);
+      if (!confirm(`Autonomous mode will run up to ${max} steps on its own and may use significant tokens (rough worst case ~$${estMax}). Continue?`)) {
+        toast("Autonomous run cancelled");
+        return;
+      }
+    }
     state.autoStop = false;
     state.autoRunning = true;
     updateAutoPill();
@@ -575,9 +616,11 @@
 
     const stream = appendStreamingAssistant();
     let acc = "";
+    let thinking = "";
     let usage = null;
     let gotFirst = false;
     const useModel = opts.model || currentModel();
+    const startedAt = Date.now();
 
     state.abort = new AbortController();
 
@@ -626,7 +669,11 @@
             if (evt.delta?.type === "text_delta" && evt.delta.text) {
               gotFirst = true;
               acc += evt.delta.text;
-              stream.setText(acc, true);
+              stream.setText(acc, true, thinking);
+              scrollToBottomIfNear();
+            } else if (evt.delta?.type === "thinking_delta" && evt.delta.thinking) {
+              thinking += evt.delta.thinking;
+              stream.setText(acc, true, thinking);
               scrollToBottomIfNear();
             }
             break;
@@ -668,13 +715,14 @@
       }
 
       // finalize
-      stream.setText(acc, false);
-      const aiMsg = { id: uid(), role: "assistant", content: acc, usage, model: useModel };
+      stream.setText(acc, false, thinking);
+      const aiMsg = { id: uid(), role: "assistant", content: acc, usage, model: useModel, thinking: thinking || undefined };
       convo.messages.push(aiMsg);
       touchConvo(convo);
       renderMessages();
       renderConversations();
       updateUsagePill();
+      logRequest({ model: useModel, ok: true, ms: Date.now() - startedAt, tokens: usage?.output_tokens });
     } catch (err) {
       const aborted = err.name === "AbortError" || state.abort?.signal.aborted;
       if (aborted && acc) {
@@ -691,8 +739,13 @@
         const friendly = isNetwork
           ? "Can't reach the MAX server. Make sure it's still running (node server.js) in your terminal, then reload this page and try again."
           : err.message;
+        logRequest({ model: useModel, ok: false, status: "error", ms: Date.now() - startedAt });
         stream.bubble.classList.remove("md");
         stream.bubble.innerHTML = `<div style="color:#ff6b8a">⚠ ${esc(friendly)}</div>`;
+        const retry = document.createElement("button");
+        retry.className = "btn btn--ghost"; retry.style.marginTop = "10px"; retry.textContent = "Retry";
+        retry.addEventListener("click", () => { stream.row.remove(); streamAssistant(convo, opts); });
+        stream.bubble.appendChild(retry);
         toast(friendly, "error");
       }
     } finally {
@@ -1337,15 +1390,21 @@
       if (!shown.length) { listEl.innerHTML = `<div class="repo-pop__msg">No files.</div>`; return; }
       const fileIco = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M14 3v5h5"/><path d="M6 2h9l5 5v13a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1z"/></svg>`;
       listEl.innerHTML = shown.map((f, i) => `
-        <button class="repo-item" type="button" data-i="${i}" title="${esc(f.path)}">
-          ${fileIco}<span class="repo-item__name">${esc(f.path)}</span>
-        </button>`).join("");
-      listEl.querySelectorAll(".repo-item").forEach((btn) => btn.addEventListener("click", () => {
+        <div class="file-row">
+          <button class="repo-item file-insert" type="button" data-i="${i}" title="Insert ${esc(f.path)} into the message">
+            ${fileIco}<span class="repo-item__name">${esc(f.path)}</span>
+          </button>
+          <button class="file-add" type="button" data-add="${i}" title="Add to context basket" aria-label="Add to context">+</button>
+        </div>`).join("");
+      listEl.querySelectorAll(".file-insert").forEach((btn) => btn.addEventListener("click", () => {
         insertFileIntoChat(shown[parseInt(btn.dataset.i, 10)].path); closeFilesPicker();
+      }));
+      listEl.querySelectorAll(".file-add").forEach((btn) => btn.addEventListener("click", (e) => {
+        e.stopPropagation(); addToBasket(shown[parseInt(btn.dataset.add, 10)].path);
       }));
     };
     try {
-      files = await getTree();
+      files = (await getTree()).filter((f) => !isBinaryPath(f.path));
       render("");
       searchEl.addEventListener("input", () => render(searchEl.value.trim()));
       setTimeout(() => searchEl.focus(), 20);
@@ -1385,7 +1444,7 @@
     const query = m[1].toLowerCase();
     let files = [];
     try { files = await getTree(); } catch { closeMention(); return; }
-    mentionMatches = files.filter((f) => f.path.toLowerCase().includes(query)).slice(0, 30);
+    mentionMatches = files.filter((f) => !isBinaryPath(f.path) && f.path.toLowerCase().includes(query)).slice(0, 30);
     if (!mentionMatches.length) { closeMention(); return; }
     renderMention(input);
   }
@@ -1414,6 +1473,355 @@
       closeMention();
       insertFileIntoChat(file.path);
     }));
+  }
+
+  /* ============================================================
+     Edit → commit → PR/MR
+     ============================================================ */
+  // Parse ```lang path=foo/bar.js  fenced blocks into proposed file edits.
+  function parseEdits(content) {
+    const edits = [];
+    const re = /```[^\n]*?\bpath\s*=\s*"?([^\s"`]+)"?[^\n]*\n([\s\S]*?)```/g;
+    let m;
+    while ((m = re.exec(content))) {
+      const path = m[1].trim().replace(/^\/+/, "");
+      if (path) edits.push({ path, content: m[2].replace(/\n$/, "") });
+    }
+    return edits;
+  }
+
+  // Minimal LCS-based line diff → array of {type:'ctx'|'add'|'del', text}.
+  function diffLines(oldStr, newStr) {
+    const a = (oldStr || "").split("\n");
+    const b = (newStr || "").split("\n");
+    const n = a.length, mm = b.length;
+    const dp = Array.from({ length: n + 1 }, () => new Int32Array(mm + 1));
+    for (let i = n - 1; i >= 0; i--)
+      for (let j = mm - 1; j >= 0; j--)
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    const out = [];
+    let i = 0, j = 0;
+    while (i < n && j < mm) {
+      if (a[i] === b[j]) { out.push({ type: "ctx", text: a[i] }); i++; j++; }
+      else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ type: "del", text: a[i] }); i++; }
+      else { out.push({ type: "add", text: b[j] }); j++; }
+    }
+    while (i < n) { out.push({ type: "del", text: a[i++] }); }
+    while (j < mm) { out.push({ type: "add", text: b[j++] }); }
+    return out;
+  }
+
+  async function openDiffModal(edits) {
+    const repo = activeRepo();
+    if (!repo) { toast("Pick a repository first.", "error"); return; }
+    if (!providerHasToken(repo.provider)) { toast(`Connect ${repo.provider} in Settings.`, "error"); openSettings(); return; }
+
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal modal--wide" role="dialog" aria-modal="true">
+        <div class="modal__head">
+          <h2>Review changes · ${esc(repo.fullName)}</h2>
+          <button class="icon-btn" data-x aria-label="Close"><svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+        </div>
+        <div class="modal__body" id="diff-body"><div class="repo-spinner"></div></div>
+        <div class="modal__foot">
+          <input type="text" id="commit-branch" placeholder="branch (e.g. max/edit)" style="flex:1;min-width:120px" />
+          <input type="text" id="commit-title" placeholder="PR title" style="flex:1;min-width:120px" />
+          <button class="btn btn--ghost" data-x>Cancel</button>
+          <button class="btn btn--primary" id="commit-go">Commit &amp; open ${repo.provider === "gitlab" ? "MR" : "PR"}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelectorAll("[data-x]").forEach((b) => b.addEventListener("click", close));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+    $("#commit-branch", overlay).value = `max/edit-${Date.now().toString(36).slice(-5)}`;
+    $("#commit-title", overlay).value = edits.length === 1 ? `Update ${edits[0].path}` : `Update ${edits.length} files`;
+
+    const body = $("#diff-body", overlay);
+    body.innerHTML = "";
+    for (const e of edits) {
+      const box = document.createElement("div");
+      box.className = "diff-file";
+      box.innerHTML = `<div class="diff-file__head">${esc(e.path)}</div><div class="diff-file__body">Loading…</div>`;
+      body.appendChild(box);
+      let current = "";
+      try { const data = await providerFetch("file", { path: e.path }); current = data.content || ""; }
+      catch { current = ""; /* new file */ }
+      const rows = diffLines(current, e.content);
+      const added = rows.filter((r) => r.type === "add").length;
+      const removed = rows.filter((r) => r.type === "del").length;
+      box.querySelector(".diff-file__head").innerHTML =
+        `${esc(e.path)} <span class="diff-stat"><span class="diff-add">+${added}</span> <span class="diff-del">−${removed}</span>${current ? "" : ' <span class="diff-new">new file</span>'}</span>`;
+      box.querySelector(".diff-file__body").innerHTML =
+        `<pre class="diff">${rows.map((r) =>
+          `<span class="diff-line diff-${r.type}">${r.type === "add" ? "+" : r.type === "del" ? "−" : " "} ${esc(r.text)}</span>`).join("\n")}</pre>`;
+    }
+
+    $("#commit-go", overlay).addEventListener("click", async () => {
+      const branch = $("#commit-branch", overlay).value.trim() || `max/edit-${Date.now().toString(36).slice(-5)}`;
+      const title = $("#commit-title", overlay).value.trim() || "MAX changes";
+      const btn = $("#commit-go", overlay); setBtnBusy(btn, true); btn.textContent = "Committing…";
+      const ok = await commitAndOpenRequest(repo, edits, branch, title);
+      setBtnBusy(btn, false);
+      if (ok) close();
+      else btn.textContent = `Commit & open ${repo.provider === "gitlab" ? "MR" : "PR"}`;
+    });
+  }
+
+  async function commitAndOpenRequest(repo, edits, branch, title) {
+    const token = providerToken(repo.provider) || undefined;
+    const commitBody = {
+      token, branch: repo.branch,
+      newBranch: branch, files: edits, message: title,
+    };
+    if (repo.provider === "gitlab") commitBody.projectId = repo.projectId ?? repo.fullName;
+    else { commitBody.owner = repo.owner; commitBody.repo = repo.name; }
+    try {
+      const cRes = await fetch(`/api/${repo.provider}/commit`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(commitBody),
+      });
+      const cData = await cRes.json().catch(() => ({}));
+      if (!cRes.ok) throw new Error(cData?.error?.message || `Commit failed (HTTP ${cRes.status})`);
+      toast(cData.message || "Committed", "success");
+
+      const prBody = { token, head: branch, base: repo.branch, title, body: "Proposed by MAX." };
+      if (repo.provider === "gitlab") prBody.projectId = repo.projectId ?? repo.fullName;
+      else { prBody.owner = repo.owner; prBody.repo = repo.name; }
+      const prRes = await fetch(`/api/${repo.provider}/${repo.provider === "gitlab" ? "mr" : "pr"}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(prBody),
+      });
+      const prData = await prRes.json().catch(() => ({}));
+      if (!prRes.ok) throw new Error(prData?.error?.message || `Could not open request (HTTP ${prRes.status})`);
+      toast(prData.message || "Opened request", "success");
+      if (prData.url) toastLink(repo.provider === "gitlab" ? "View merge request" : "View pull request", prData.url);
+      return true;
+    } catch (err) {
+      toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error");
+      return false;
+    }
+  }
+
+  /* ============================================================
+     Read-aloud (speech synthesis)
+     ============================================================ */
+  let speaking = false;
+  function speak(text) {
+    if (!("speechSynthesis" in window)) { toast("Speech is not supported in this browser.", "error"); return; }
+    if (speaking) { speechSynthesis.cancel(); speaking = false; return; }
+    const u = new SpeechSynthesisUtterance(String(text || "").replace(/```[\s\S]*?```/g, " (code block) ").slice(0, 6000));
+    u.onend = () => (speaking = false);
+    speaking = true;
+    speechSynthesis.speak(u);
+  }
+
+  /* ============================================================
+     Shareable read-only HTML export
+     ============================================================ */
+  function conversationToHtml(convo) {
+    const rows = convo.messages.filter((m) => m.role === "user" || m.role === "assistant").map((m) => {
+      const who = m.auto ? "Auto" : (m.role === "user" ? "You" : "MAX");
+      const html = window.marked && window.DOMPurify
+        ? DOMPurify.sanitize(marked.parse(m.content || "")) : `<pre>${esc(m.content)}</pre>`;
+      return `<div class="m ${m.role}"><div class="r">${who}</div><div class="c">${html}</div></div>`;
+    }).join("\n");
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(convo.title || "MAX chat")}</title>
+<style>body{font-family:system-ui,sans-serif;max-width:820px;margin:0 auto;padding:24px;background:#0b0b14;color:#ecedf5;line-height:1.6}
+h1{font-weight:800}.m{margin:18px 0;padding:14px 16px;border-radius:12px;border:1px solid #ffffff18}
+.m.user{background:#7c5cff22}.m.assistant{background:#ffffff08}.r{font-weight:700;font-size:12px;opacity:.7;margin-bottom:6px}
+pre{overflow:auto;background:#0d1117;padding:12px;border-radius:8px}code{font-family:ui-monospace,monospace}
+a{color:#22d3ee}</style></head>
+<body><h1>${esc(convo.title || "MAX chat")}</h1><p style="opacity:.6">Exported from MAX · ${new Date().toLocaleString()}</p>${rows}</body></html>`;
+  }
+  function shareConversation(id) {
+    const convo = state.conversations.find((c) => c.id === id) || activeConvo();
+    if (!convo || !convo.messages.length) { toast("Nothing to share yet.", "error"); return; }
+    download(`${slugify(convo.title)}-${convo.id}.html`, conversationToHtml(convo), "text/html");
+    toast("Exported a shareable HTML file", "success");
+  }
+
+  /* ============================================================
+     Request log
+     ============================================================ */
+  const requestLog = [];
+  function logRequest(entry) {
+    requestLog.unshift({ time: Date.now(), ...entry });
+    if (requestLog.length > 50) requestLog.pop();
+  }
+  function openRequestLog() {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    const rows = requestLog.length ? requestLog.map((e) => {
+      const when = new Date(e.time).toLocaleTimeString();
+      const status = e.ok ? `<span style="color:#34d399">ok</span>` : `<span style="color:#ff6b8a">${esc(e.status || "err")}</span>`;
+      return `<tr><td>${when}</td><td>${esc(e.model || "")}</td><td>${status}</td><td>${e.ms ? e.ms + "ms" : ""}</td><td>${e.tokens != null ? e.tokens : ""}</td></tr>`;
+    }).join("") : `<tr><td colspan="5" style="text-align:center;opacity:.6;padding:20px">No requests yet.</td></tr>`;
+    overlay.innerHTML = `<div class="modal" role="dialog" aria-modal="true">
+      <div class="modal__head"><h2>Request log</h2><button class="icon-btn" data-x aria-label="Close"><svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+      <div class="modal__body"><table class="log-table"><thead><tr><th>Time</th><th>Model</th><th>Status</th><th>Latency</th><th>Out tok</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelectorAll("[data-x]").forEach((b) => b.addEventListener("click", () => overlay.remove()));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
+  }
+
+  /* ============================================================
+     Voice input (Web Speech API)
+     ============================================================ */
+  let recognition = null;
+  function toggleVoice() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { toast("Voice input isn't supported in this browser.", "error"); return; }
+    if (recognition) { recognition.stop(); return; }
+    recognition = new SR();
+    recognition.lang = navigator.language || "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    const input = $("#input");
+    const btn = $("#mic-btn");
+    btn?.classList.add("recording");
+    let base = input.value ? input.value + " " : "";
+    recognition.onresult = (e) => {
+      let txt = "";
+      for (let i = 0; i < e.results.length; i++) txt += e.results[i][0].transcript;
+      input.value = base + txt;
+      autoResize(input); updateCharCount(); updateSendState();
+    };
+    recognition.onerror = () => toast("Voice input error.", "error");
+    recognition.onend = () => { recognition = null; btn?.classList.remove("recording"); input.focus(); };
+    recognition.start();
+  }
+
+  /* ============================================================
+     Context basket (stage multiple repo files)
+     ============================================================ */
+  async function addToBasket(path) {
+    if (state.basket.some((f) => f.path === path)) { toast("Already staged.", ""); return; }
+    try {
+      const data = await providerFetch("file", { path });
+      state.basket.push({ path, content: data.content || "" });
+      renderBasket();
+      toast(`Staged ${path}`, "success");
+    } catch (err) { toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error"); }
+  }
+  function clearBasket() { state.basket = []; renderBasket(); }
+  function renderBasket() {
+    const chip = $("#basket-chip");
+    if (!chip) return;
+    chip.hidden = state.basket.length === 0;
+    $("#basket-count").textContent = state.basket.length;
+  }
+  function basketPrefix() {
+    if (!state.basket.length) return "";
+    const repo = activeRepo();
+    const blocks = state.basket.map((f) => {
+      const lang = (f.path.split(".").pop() || "").toLowerCase();
+      return `File \`${f.path}\`${repo ? ` from ${repo.fullName}` : ""}:\n\`\`\`${lang}\n${f.content}\n\`\`\``;
+    });
+    return `Context files:\n\n${blocks.join("\n\n")}\n\n`;
+  }
+
+  /* ============================================================
+     Repo map / summarize
+     ============================================================ */
+  const BINARY_RE = /\.(png|jpe?g|gif|webp|ico|bmp|svg|pdf|zip|gz|tar|rar|7z|mp[34]|mov|avi|mkv|wav|ogg|woff2?|ttf|otf|eot|exe|dll|so|dylib|class|jar|wasm|bin|lock|min\.js|min\.css)$/i;
+  const isBinaryPath = (p) => BINARY_RE.test(p);
+
+  async function summarizeRepo() {
+    const repo = activeRepo();
+    if (!repo) { toast("Pick a repository first.", "error"); return; }
+    toast("Reading repository tree…");
+    try {
+      const files = (await getTree()).filter((f) => !isBinaryPath(f.path));
+      const map = files.slice(0, 300).map((f) => f.path).join("\n");
+      const input = $("#input");
+      input.value = `Here is the file tree of ${repo.fullName} (branch ${repo.branch}):\n\n\`\`\`\n${map}\n\`\`\`\n\nSummarize what this project is, its main components, and how it's organized. Point out where key logic likely lives.`;
+      autoResize(input); updateCharCount(); updateSendState(); input.focus();
+      toast(`Loaded ${files.length} paths — press Enter to summarize`, "success");
+    } catch (err) { toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error"); }
+  }
+
+  /* ============================================================
+     Slash commands
+     ============================================================ */
+  const SLASH = [
+    { cmd: "/summarize", desc: "Summarize the selected repository", run: () => { $("#input").value = ""; summarizeRepo(); } },
+    { cmd: "/files", desc: "Browse repository files", run: () => { $("#input").value = ""; if (activeRepo()) openFilesPicker($("#files-btn")); else toast("Pick a repository first.", "error"); } },
+    { cmd: "/repo", desc: "Pick a repository", run: () => { $("#input").value = ""; openRepoPicker($("#repo-chip")); } },
+    { cmd: "/explain", desc: "Explain the pasted code", run: () => { $("#input").value = "Explain the following code clearly:\n\n"; focusInputEnd(); } },
+    { cmd: "/test", desc: "Write tests for the pasted code", run: () => { $("#input").value = "Write thorough unit tests for the following code:\n\n"; focusInputEnd(); } },
+    { cmd: "/share", desc: "Export this chat as shareable HTML", run: () => { $("#input").value = ""; const c = activeConvo(); if (c) shareConversation(c.id); } },
+    { cmd: "/clear", desc: "Clear the current conversation", run: () => { $("#input").value = ""; const c = activeConvo(); if (c) { c.messages = []; c.title = "New chat"; touchConvo(c); renderMessages(); renderConversations(); } } },
+  ];
+  function focusInputEnd() { const i = $("#input"); autoResize(i); updateCharCount(); updateSendState(); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
+
+  let slashEl = null;
+  function closeSlash() { if (slashEl) { slashEl.remove(); slashEl = null; } }
+  function maybeSlash(input) {
+    const v = input.value;
+    if (!/^\/[a-z]*$/i.test(v.trim()) || v.includes("\n")) { closeSlash(); return; }
+    const q = v.trim().toLowerCase();
+    const matches = SLASH.filter((s) => s.cmd.startsWith(q));
+    if (!matches.length) { closeSlash(); return; }
+    if (!slashEl) {
+      slashEl = document.createElement("div");
+      slashEl.className = "repo-pop mention-pop";
+      document.body.appendChild(slashEl);
+      const rect = $(".composer").getBoundingClientRect();
+      slashEl.style.left = `${rect.left}px`;
+      slashEl.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+      slashEl.style.width = `${Math.min(rect.width, 460)}px`;
+    }
+    slashEl.innerHTML = `<div class="repo-pop__list">` + matches.map((s, i) =>
+      `<button class="repo-item${i === 0 ? " active" : ""}" type="button" data-i="${i}"><span class="repo-item__name"><b>${esc(s.cmd)}</b> — ${esc(s.desc)}</span></button>`).join("") + `</div>`;
+    slashEl.querySelectorAll(".repo-item").forEach((btn) => btn.addEventListener("click", () => {
+      const s = matches[parseInt(btn.dataset.i, 10)]; closeSlash(); s.run();
+    }));
+  }
+
+  /* ============================================================
+     API profiles
+     ============================================================ */
+  const profileKeyName = (id) => `max.profileKey.${id}.v1`;
+  function renderProfiles() {
+    const box = $("#profile-list");
+    if (!box) return;
+    const items = state.settings.profiles || [];
+    if (!items.length) { box.innerHTML = `<p class="field__help">No profiles yet. Save your current key + model as a profile to switch quickly.</p>`; return; }
+    box.innerHTML = items.map((p) => `
+      <div class="persona-row">
+        <button class="persona-apply" type="button" data-id="${esc(p.id)}">${esc(p.name)} <span style="opacity:.6">· ${esc(p.model || "")}</span></button>
+        <button class="persona-del" type="button" data-del="${esc(p.id)}" aria-label="Delete profile">
+          <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>`).join("");
+    box.querySelectorAll(".persona-apply").forEach((b) => b.addEventListener("click", () => applyProfile(b.dataset.id)));
+    box.querySelectorAll(".persona-del").forEach((b) => b.addEventListener("click", () => {
+      state.settings.profiles = state.settings.profiles.filter((x) => x.id !== b.dataset.del);
+      try { sessionStorage.removeItem(profileKeyName(b.dataset.del)); } catch {}
+      saveSettings(); renderProfiles();
+    }));
+  }
+  function applyProfile(id) {
+    const p = state.settings.profiles.find((x) => x.id === id);
+    if (!p) return;
+    if (p.model) { $("#set-model-custom").value = ""; const sel = $("#set-model"); if ([...sel.options].some((o) => o.value === p.model)) sel.value = p.model; else $("#set-model-custom").value = p.model; }
+    let key = "";
+    try { key = sessionStorage.getItem(profileKeyName(id)) || ""; } catch {}
+    if (key) $("#set-apikey").value = key;
+    toast(`Applied profile "${p.name}"`);
+  }
+  function saveCurrentProfile() {
+    const name = (prompt("Name this profile:", "") || "").trim();
+    if (!name) return;
+    const id = uid();
+    const model = $("#set-model-custom").value.trim() || $("#set-model").value;
+    state.settings.profiles.push({ id, name, model });
+    const key = $("#set-apikey").value.trim();
+    if (key) { try { sessionStorage.setItem(profileKeyName(id), key); } catch {} }
+    saveSettings(); renderProfiles();
+    toast(`Saved profile "${name}"`, "success");
   }
 
   /* ============================================================
@@ -1540,11 +1948,14 @@
       { label: "Find in this conversation", run: () => toggleFindBar(true) },
       { label: "Pick a repository", run: () => openRepoPicker($("#repo-chip")) },
       { label: "Browse repository files", run: () => { if (activeRepo()) openFilesPicker($("#files-btn")); else toast("Pick a repository first.", "error"); } },
+      { label: "Summarize the repository", run: summarizeRepo },
       { label: "Push conversation to repo", run: () => { const c = activeConvo(); if (c) pushConversation(c.id); } },
       { label: state.settings.autonomous ? "Turn OFF Autonomous mode" : "Turn ON Autonomous mode", run: () => $("#auto-toggle").click() },
       { label: "Toggle theme (light/dark)", run: toggleTheme },
       { label: "Import chat (.json)", run: () => $("#import-input").click() },
       { label: "Export current chat (.md)", run: () => { const c = activeConvo(); if (c) exportConversation(c.id, "md"); } },
+      { label: "Share current chat (.html)", run: () => { const c = activeConvo(); if (c) shareConversation(c.id); } },
+      { label: "View request log", run: openRequestLog },
       { label: "Open Settings", run: openSettings },
     ];
   }
@@ -1662,11 +2073,13 @@
     $("#set-autosteps").value = clampSteps(s.autoMaxSteps);
     $("#autosteps-val").textContent = clampSteps(s.autoMaxSteps);
     $("#set-autopush").checked = !!s.autoPush;
+    $("#set-confirm-auto").checked = s.confirmAutonomous !== false;
 
-    // GitLab + personas
+    // GitLab + personas + profiles
     $("#set-gltoken").value = s.gitlab?.token || "";
     $("#gl-test-result").textContent = "";
     renderPersonas();
+    renderProfiles();
 
     // GitHub (fall back to server-provided defaults as placeholders/values)
     const g = s.github || githubDefaults();
@@ -1713,6 +2126,7 @@
     state.settings.autonomous = $("#set-autonomous").checked;
     state.settings.autoMaxSteps = clampSteps($("#set-autosteps").value);
     state.settings.autoPush = $("#set-autopush").checked;
+    state.settings.confirmAutonomous = $("#set-confirm-auto").checked;
     state.settings.gitlab = {
       token: $("#set-gltoken").value.trim(),
       branch: state.settings.gitlab?.branch || "main",
@@ -1777,6 +2191,7 @@
       item("push", "Push to repo") +
       item("export-md", "Export .md") +
       item("export-json", "Export .json") +
+      item("share", "Share .html") +
       item("delete", "Delete", "#ff6b8a");
     document.body.appendChild(pop);
     const r = anchorBtn.getBoundingClientRect();
@@ -1791,11 +2206,33 @@
     pop.querySelector('[data-a="push"]').addEventListener("click", () => { pop.remove(); pushConversation(id); });
     pop.querySelector('[data-a="export-md"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "md"); });
     pop.querySelector('[data-a="export-json"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "json"); });
+    pop.querySelector('[data-a="share"]').addEventListener("click", () => { pop.remove(); shareConversation(id); });
     pop.querySelector('[data-a="delete"]').addEventListener("click", () => { pop.remove(); deleteConversation(id); });
     setTimeout(() => {
       const close = (e) => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener("click", close); } };
       document.addEventListener("click", close);
     }, 0);
+  }
+
+  // Fork a new conversation containing everything up to and including message m.
+  function branchFrom(m) {
+    if (state.streaming) return;
+    const convo = activeConvo();
+    if (!convo) return;
+    const idx = convo.messages.findIndex((x) => x.id === m.id);
+    if (idx === -1) return;
+    const fork = {
+      id: uid(),
+      title: (convo.title || "Chat") + " (branch)",
+      messages: convo.messages.slice(0, idx + 1).map((x) => ({ ...x, id: uid() })),
+      createdAt: Date.now(), updatedAt: Date.now(),
+      repo: convo.repo ? { ...convo.repo } : undefined,
+    };
+    state.conversations.unshift(fork);
+    state.activeId = fork.id;
+    saveActive(); saveConvos();
+    renderConversations(); renderMessages(); updateRepoChip(); updateUsagePill();
+    toast("Branched into a new conversation", "success");
   }
 
   function togglePin(id) {
@@ -1851,7 +2288,7 @@
 
     input.addEventListener("input", () => { autoResize(input); updateCharCount(); updateSendState(); });
     input.addEventListener("keydown", (e) => {
-      if (mentionEl) return; // let the mention handler own the keys
+      if (mentionEl || slashEl) return; // let the autocomplete handlers own the keys
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         if (!state.streaming) sendMessage(input.value);
@@ -1965,15 +2402,30 @@
     $("#files-btn").addEventListener("click", () => {
       if (filesPickerEl) closeFilesPicker(); else openFilesPicker($("#files-btn"));
     });
-    // @file mention autocomplete
-    input.addEventListener("input", () => maybeMention(input));
+    // @file mention + slash-command autocomplete
+    input.addEventListener("input", () => { maybeMention(input); maybeSlash(input); });
     input.addEventListener("keydown", (e) => {
       if (mentionEl) {
         if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); moveMention(e.key === "ArrowDown" ? 1 : -1); }
         else if (e.key === "Enter" && !e.shiftKey) { const a = mentionEl.querySelector(".repo-item.active"); if (a) { e.preventDefault(); a.click(); } }
         else if (e.key === "Escape") { closeMention(); }
+      } else if (slashEl) {
+        const items = [...slashEl.querySelectorAll(".repo-item")];
+        let idx = items.findIndex((x) => x.classList.contains("active"));
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          items[idx]?.classList.remove("active");
+          idx = (idx + (e.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+          items[idx]?.classList.add("active");
+        } else if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); (items[idx] || items[0])?.click(); }
+        else if (e.key === "Escape") { closeSlash(); }
       }
     });
+
+    // voice input + context basket + profiles
+    $("#mic-btn").addEventListener("click", toggleVoice);
+    $("#basket-chip").addEventListener("click", clearBasket);
+    $("#profile-save").addEventListener("click", saveCurrentProfile);
     $("#clear-current").addEventListener("click", () => {
       const c = activeConvo(); if (c) { c.messages = []; c.title = "New chat"; touchConvo(c); renderMessages(); renderConversations(); }
       closeSettings(); toast("Chat cleared");
@@ -1996,7 +2448,7 @@
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closePalette(); }
+      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") { e.preventDefault(); toggleFindBar(true); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }
@@ -2065,6 +2517,7 @@
     updateCharCount();
     updateSendState();
     updateUsagePill();
+    renderBasket();
 
     // Register the service worker for installability + offline shell.
     if ("serviceWorker" in navigator) {

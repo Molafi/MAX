@@ -51,8 +51,20 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 - **Per‑conversation repo binding** — each chat remembers its own repository
 - Works with both **GitHub and GitLab**; tokens are proxied server‑side, never in `localStorage`
 
+**Agentic editing (read → edit → commit → PR)**
+- Ask MAX to change code; it proposes full files, you get a **diff preview**, then
+  **commit to a new branch and open a PR (GitHub) or MR (GitLab)** — with your approval
+- **Context basket** — stage multiple repo files and send them together
+- **Summarize the repo** from its file tree (`/summarize` or the palette)
+
 **More**
 - **Persona library** — save reusable system prompts and apply them in one click
+- **API profiles** — save key + model combos and switch quickly
+- **Voice input** (mic) and **read‑aloud** of replies
+- **Slash commands** (`/summarize`, `/files`, `/repo`, `/explain`, `/test`, `/share`, `/clear`)
+- **Streaming "thinking"** display when the model exposes reasoning
+- **Branch a conversation** from any message; **request log**; **retry** on transient errors
+- **Cost guardrail** before autonomous runs; shareable **read‑only HTML export**
 - **Token + cost estimate** per conversation, shown live in the top bar
 - **Find in conversation** (Ctrl/⌘+F) with match highlighting and next/prev
 - **Pin** important chats; **import** exported `.json` chats; **regenerate** the last answer

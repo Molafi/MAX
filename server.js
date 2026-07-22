@@ -337,25 +337,41 @@ async function handleChat(req, res) {
   };
   res.once("close", abortOnDisconnect);
 
+  const upstreamHeaders = {
+    "Content-Type": "application/json",
+    Accept: body.stream ? "text/event-stream" : "application/json",
+    // AgentRouter accepts either header style; send both for compatibility.
+    "x-api-key": apiKey,
+    Authorization: `Bearer ${apiKey}`,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "claude-code-20250219",
+    // REQUIRED by AgentRouter — must match the Claude CLI wire image.
+    "User-Agent": CONFIG.upstreamUserAgent,
+    "x-app": "cli",
+  };
+  const upstreamBody = JSON.stringify(body);
+  const maxRetries = 2;
+
   let upstream;
   try {
-    upstream = await fetch(upstreamUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: body.stream ? "text/event-stream" : "application/json",
-        // AgentRouter accepts either header style; send both for compatibility.
-        "x-api-key": apiKey,
-        Authorization: `Bearer ${apiKey}`,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "claude-code-20250219",
-        // REQUIRED by AgentRouter — must match the Claude CLI wire image.
-        "User-Agent": CONFIG.upstreamUserAgent,
-        "x-app": "cli",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        upstream = await fetch(upstreamUrl, {
+          method: "POST", headers: upstreamHeaders, body: upstreamBody, signal: controller.signal,
+        });
+      } catch (err) {
+        if (controller.signal.aborted && !timedOut) { clearTimeout(timeout); res.off("close", abortOnDisconnect); return; }
+        if (!timedOut && attempt < maxRetries) { await delay(400 * 2 ** attempt); continue; }
+        throw err;
+      }
+      // Transient upstream failures: back off and retry with a fresh request.
+      if (!upstream.ok && RETRYABLE_STATUS.has(upstream.status) && attempt < maxRetries && !timedOut) {
+        try { await upstream.text(); } catch {}
+        await delay(500 * 2 ** attempt);
+        continue;
+      }
+      break;
+    }
   } catch (err) {
     clearTimeout(timeout);
     res.off("close", abortOnDisconnect);
@@ -470,6 +486,32 @@ function mapStatusType(status) {
   if (status === 429) return "rate_limit";
   if (status >= 500) return "server";
   return "request";
+}
+
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Sanitize + validate a set of {path, content} file edits for committing.
+function normalizeFiles(files) {
+  if (!Array.isArray(files) || !files.length) return null;
+  const out = [];
+  for (const f of files) {
+    if (!f || typeof f.path !== "string" || typeof f.content !== "string") return null;
+    const p = sanitizeRepoPath(f.path);
+    if (!p) return null;
+    if (Buffer.byteLength(f.content, "utf8") > MAX_FILE_BYTES) return null;
+    out.push({ path: p, content: f.content });
+  }
+  return out.length ? out : null;
+}
+function defaultBranchName() {
+  const d = new Date();
+  const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}-${String(d.getHours()).padStart(2, "0")}${String(d.getMinutes()).padStart(2, "0")}`;
+  return `max/edit-${stamp}`;
+}
+function safeBranchName(name) {
+  const s = String(name || "").trim().replace(/[^A-Za-z0-9._/-]/g, "-").replace(/^[-/]+|[-/]+$/g, "").slice(0, 120);
+  return s || defaultBranchName();
 }
 
 /* ------------------------------------------------------------------ */
@@ -887,6 +929,135 @@ async function handleGitlabPush(req, res) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Edit → commit → PR/MR (GitHub + GitLab)                            */
+/* ------------------------------------------------------------------ */
+async function handleGithubCommit(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
+  }
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
+  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
+  const files = normalizeFiles(payload.files);
+  if (!files) return sendJson(res, 400, { error: { type: "bad_request", message: "files must be a non-empty array of { path, content } within the size limit." } });
+
+  const base = gh.branch;
+  const newBranch = safeBranchName(payload.newBranch || defaultBranchName());
+  const message = String(payload.message || `MAX edit: ${files.map((f) => f.path).join(", ")}`).slice(0, 500);
+  const repoRoot = `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}`;
+
+  try {
+    // Resolve base branch head SHA.
+    const ref = await githubApi(gh.token, "GET", `${repoRoot}/git/ref/heads/${encodeURIComponent(base)}`);
+    if (!ref.ok) return ghError(res, ref, `Could not find base branch "${base}".`);
+    const baseSha = ref.json?.object?.sha;
+
+    // Create the working branch if it doesn't already exist.
+    if (newBranch !== base) {
+      const exists = await githubApi(gh.token, "GET", `${repoRoot}/git/ref/heads/${encodeURIComponent(newBranch)}`);
+      if (!exists.ok) {
+        const create = await githubApi(gh.token, "POST", `${repoRoot}/git/refs`, { ref: `refs/heads/${newBranch}`, sha: baseSha });
+        if (!create.ok) return ghError(res, create, "Could not create the working branch.");
+      }
+    }
+
+    // Commit each file to the working branch.
+    const committed = [];
+    for (const f of files) {
+      const enc = f.path.split("/").map(encodeURIComponent).join("/");
+      const cbase = `${repoRoot}/contents/${enc}`;
+      let sha;
+      const ex = await githubApi(gh.token, "GET", `${cbase}?ref=${encodeURIComponent(newBranch)}`);
+      if (ex.ok && ex.json && !Array.isArray(ex.json)) sha = ex.json.sha;
+      const put = await githubApi(gh.token, "PUT", cbase, {
+        message, branch: newBranch, content: Buffer.from(f.content, "utf8").toString("base64"), ...(sha ? { sha } : {}),
+      });
+      if (!put.ok) return ghError(res, put, `Failed to write ${f.path}.`);
+      committed.push({ path: f.path, updated: Boolean(sha) });
+    }
+    return sendJson(res, 200, { ok: true, provider: "github", branch: newBranch, base, files: committed,
+      message: `Committed ${committed.length} file(s) to ${gh.owner}/${gh.repo}@${newBranch}.` });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function handleGithubPr(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
+  }
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
+  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
+  const head = safeBranchName(payload.head);
+  const baseBranch = String(payload.base || gh.branch || "main").trim();
+  const title = String(payload.title || `MAX changes`).slice(0, 250);
+  const bodyText = String(payload.body || "Opened by MAX.").slice(0, 8000);
+  try {
+    const pr = await githubApi(gh.token, "POST", `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/pulls`,
+      { title, head, base: baseBranch, body: bodyText });
+    if (!pr.ok) return ghError(res, pr, "Could not open the pull request.");
+    return sendJson(res, 200, { ok: true, url: pr.json?.html_url, number: pr.json?.number, message: `Opened PR #${pr.json?.number}.` });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function handleGitlabCommit(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
+  }
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
+  const files = normalizeFiles(payload.files);
+  if (!files) return sendJson(res, 400, { error: { type: "bad_request", message: "files must be a non-empty array of { path, content } within the size limit." } });
+
+  const base = gl.branch;
+  const newBranch = safeBranchName(payload.newBranch || defaultBranchName());
+  const message = String(payload.message || `MAX edit: ${files.map((f) => f.path).join(", ")}`).slice(0, 500);
+  const proj = `/projects/${glProjectPath(gl.projectId)}`;
+
+  try {
+    // Decide create vs update for each file by checking existence on the base branch.
+    const actions = [];
+    for (const f of files) {
+      const head = await gitlabApi(gl.token, "GET", `${proj}/repository/files/${encodeURIComponent(f.path)}?ref=${encodeURIComponent(base)}`);
+      actions.push({ action: head.ok ? "update" : "create", file_path: f.path, content: f.content });
+    }
+    const commit = await gitlabApi(gl.token, "POST", `${proj}/repository/commits`, {
+      branch: newBranch, start_branch: base, commit_message: message, actions,
+    });
+    if (!commit.ok) return glError(res, commit, "Commit failed.");
+    return sendJson(res, 200, { ok: true, provider: "gitlab", branch: newBranch, base,
+      files: files.map((f) => ({ path: f.path })), message: `Committed ${files.length} file(s) to ${gl.projectId}@${newBranch}.` });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function handleGitlabMr(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
+  }
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
+  const source = safeBranchName(payload.head || payload.source_branch);
+  const target = String(payload.base || payload.target_branch || gl.branch || "main").trim();
+  const title = String(payload.title || "MAX changes").slice(0, 250);
+  const description = String(payload.body || "Opened by MAX.").slice(0, 8000);
+  try {
+    const mr = await gitlabApi(gl.token, "POST", `/projects/${glProjectPath(gl.projectId)}/merge_requests`,
+      { source_branch: source, target_branch: target, title, description });
+    if (!mr.ok) return glError(res, mr, "Could not open the merge request.");
+    return sendJson(res, 200, { ok: true, url: mr.json?.web_url, iid: mr.json?.iid, message: `Opened MR !${mr.json?.iid}.` });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Router                                                             */
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
@@ -941,6 +1112,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/api/gitlab/push" && req.method === "POST") {
       return await handleGitlabPush(req, res);
+    }
+    if (pathname === "/api/github/commit" && req.method === "POST") {
+      return await handleGithubCommit(req, res);
+    }
+    if (pathname === "/api/github/pr" && req.method === "POST") {
+      return await handleGithubPr(req, res);
+    }
+    if (pathname === "/api/gitlab/commit" && req.method === "POST") {
+      return await handleGitlabCommit(req, res);
+    }
+    if (pathname === "/api/gitlab/mr" && req.method === "POST") {
+      return await handleGitlabMr(req, res);
     }
     if (pathname.startsWith("/api/")) {
       return sendJson(res, 404, { error: { type: "not_found", message: "Unknown API route" } });

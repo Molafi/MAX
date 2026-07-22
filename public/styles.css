@@ -491,6 +491,47 @@ input, textarea, select { font-family: inherit; }
 /* mention popover reuses repo-pop; ensure it floats above composer */
 .mention-pop { max-height: 260px; }
 
+/* accent message action (Review changes) */
+.msg-action--accent { color: var(--accent-2); border-color: var(--border); }
+.msg-action--accent:hover { background: rgba(34,211,238,.12); color: var(--accent-2); border-color: var(--accent-2); }
+
+/* thinking / reasoning box */
+.thinking-box { margin: 0 0 12px; border: 1px dashed var(--border-strong); border-radius: 10px; background: var(--surface-2); overflow: hidden; }
+.thinking-box > summary { cursor: pointer; padding: 8px 12px; font-size: 12.5px; font-weight: 600; color: var(--text-dim); user-select: none; }
+.thinking-body { padding: 0 12px 12px; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; color: var(--text-dim); max-height: 260px; overflow: auto; }
+
+/* diff view */
+.modal--wide { max-width: 900px; }
+.diff-file { border: 1px solid var(--border-strong); border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
+.diff-file__head { padding: 9px 12px; background: var(--surface-2); font-family: var(--mono); font-size: 12.5px; font-weight: 600; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; gap: 10px; }
+.diff-stat { font-weight: 700; }
+.diff-add { color: #34d399; } .diff-del { color: #ff6b8a; }
+.diff-new { color: var(--accent-2); font-weight: 700; }
+.diff-file__body { max-height: 340px; overflow: auto; }
+pre.diff { margin: 0; padding: 8px 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; }
+.diff-line { display: block; padding: 0 12px; white-space: pre-wrap; word-break: break-word; }
+.diff-line.diff-add { background: rgba(52,211,153,.12); color: #a7f3d0; }
+.diff-line.diff-del { background: rgba(255,107,138,.12); color: #fecdd3; }
+.diff-line.diff-ctx { color: var(--text-dim); }
+
+/* request log table */
+.log-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.log-table th, .log-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+.log-table th { color: var(--text-faint); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .4px; }
+
+/* file rows with add-to-basket */
+.file-row { display: flex; align-items: center; gap: 4px; }
+.file-row .repo-item { flex: 1; }
+.file-add { width: 28px; height: 28px; flex-shrink: 0; border-radius: 7px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); font-size: 17px; line-height: 1; }
+.file-add:hover { border-color: var(--accent-1); color: var(--text); }
+
+/* context basket chip badge */
+.basket-chip { display: inline-flex; align-items: center; gap: 5px; width: auto; padding: 0 10px; }
+.basket-chip #basket-count { font-size: 12px; font-weight: 700; color: var(--accent-2); }
+
+/* mic recording state */
+#mic-btn.recording { color: var(--accent-3); animation: autopulse 1.3s ease-in-out infinite; }
+
 /* ============================================================
    Modal
    ============================================================ */
