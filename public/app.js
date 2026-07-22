@@ -11,6 +11,8 @@
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   const SESSION_KEY = "max.apiKey.session.v1";
+  const GH_SESSION_KEY = "max.ghToken.session.v1";
+  const DONE_MARKER = "[[MAX_DONE]]";
   const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
   const DEFAULT_MODELS = [
@@ -30,13 +32,19 @@
 
   /* ---------- state ---------- */
   const state = {
-    config: { defaultModel: "claude-opus-4-8", models: DEFAULT_MODELS, allowClientKey: true, hasServerKey: false },
+    config: {
+      defaultModel: "claude-opus-4-8", models: DEFAULT_MODELS, allowClientKey: true, hasServerKey: false,
+      github: { hasServerToken: false, allowClientToken: true, owner: "", repo: "", branch: "main" },
+    },
     settings: {
       apiKey: "",
       model: "",
       system: "You are MAX, a helpful, friendly and concise AI assistant. Use Markdown for formatting when helpful.",
       maxTokens: 4096,
       temperature: 1.0,
+      autonomous: false,
+      autoMaxSteps: 6,
+      github: { token: "", owner: "", repo: "", branch: "main", pathPrefix: "max-chats" },
     },
     conversations: [],
     activeId: null,
@@ -44,7 +52,11 @@
     streaming: false,
     abort: null,
     renameId: null,
+    autoStop: false,
+    autoRunning: false,
   };
+
+  const githubDefaults = () => ({ token: "", owner: "", repo: "", branch: "main", pathPrefix: "max-chats" });
 
   /* ---------- persistence ---------- */
   function safeStorageSet(storage, key, value, label) {
@@ -65,26 +77,41 @@
     try {
       const s = JSON.parse(localStorage.getItem(LS.settings));
       if (s && typeof s === "object") {
-        // Migrate keys saved by older versions out of persistent localStorage.
+        // Migrate secrets saved by older versions out of persistent localStorage.
         if (typeof s.apiKey === "string" && s.apiKey) {
           safeStorageSet(sessionStorage, SESSION_KEY, s.apiKey);
           delete s.apiKey;
           safeStorageSet(localStorage, LS.settings, JSON.stringify(s));
         }
+        if (s.github && typeof s.github.token === "string" && s.github.token) {
+          safeStorageSet(sessionStorage, GH_SESSION_KEY, s.github.token);
+          delete s.github.token;
+          safeStorageSet(localStorage, LS.settings, JSON.stringify(s));
+        }
         Object.assign(state.settings, s);
       }
+      // Always keep github object well-formed (older saves may lack it).
+      state.settings.github = Object.assign(githubDefaults(), state.settings.github || {});
       state.settings.apiKey = sessionStorage.getItem(SESSION_KEY) || "";
+      state.settings.github.token = sessionStorage.getItem(GH_SESSION_KEY) || "";
     } catch {}
     state.activeId = localStorage.getItem(LS.active) || null;
   }
   const saveConvos = () => safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations), "Conversation history");
   const saveSettings = () => {
-    const { apiKey, ...persistentSettings } = state.settings;
-    safeStorageSet(localStorage, LS.settings, JSON.stringify(persistentSettings), "Settings");
-    if (apiKey) safeStorageSet(sessionStorage, SESSION_KEY, apiKey, "API key");
-    else {
-      try { sessionStorage.removeItem(SESSION_KEY); } catch {}
-    }
+    // Deep-clone, then strip the two session-only secrets before persisting.
+    const persistent = JSON.parse(JSON.stringify(state.settings));
+    const apiKey = persistent.apiKey; delete persistent.apiKey;
+    const ghToken = persistent.github ? persistent.github.token : "";
+    if (persistent.github) delete persistent.github.token;
+    safeStorageSet(localStorage, LS.settings, JSON.stringify(persistent), "Settings");
+
+    const putSession = (key, val) => {
+      if (val) safeStorageSet(sessionStorage, key, val);
+      else { try { sessionStorage.removeItem(key); } catch {} }
+    };
+    putSession(SESSION_KEY, apiKey);
+    putSession(GH_SESSION_KEY, ghToken);
   };
   const saveActive = () => state.activeId
     ? safeStorageSet(localStorage, LS.active, state.activeId)
@@ -259,8 +286,9 @@
     row.className = `msg msg--${m.role}` + (isLast ? " msg--last" : "");
     row.dataset.id = m.id;
 
-    const avatar = `<div class="msg__avatar">${role_short(m.role)}</div>`;
-    const roleName = m.role === "user" ? "You" : "MAX";
+    if (m.auto) row.classList.add("msg--auto");
+    const avatar = `<div class="msg__avatar">${m.auto ? "↻" : role_short(m.role)}</div>`;
+    const roleName = m.auto ? "Auto-continue" : (m.role === "user" ? "You" : "MAX");
 
     const bubble = document.createElement("div");
     bubble.className = "msg__bubble";
@@ -410,6 +438,15 @@
     return state.settings.model || state.config.defaultModel;
   }
 
+  // System prompt actually sent — augmented with agent instructions in autonomous mode.
+  function effectiveSystem() {
+    let sys = state.settings.system || "";
+    if (state.settings.autonomous) {
+      sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line.`;
+    }
+    return sys.trim() || undefined;
+  }
+
   async function sendMessage(text) {
     if (state.streaming) return;
     text = text.trim();
@@ -435,7 +472,49 @@
     renderMessages();
     renderConversations();
 
-    await streamAssistant(convo);
+    if (state.settings.autonomous) await runAutonomousLoop(convo);
+    else await streamAssistant(convo);
+  }
+
+  /* ---------- autonomous multi-step loop ---------- */
+  function clampSteps(n) { return Math.max(2, Math.min(15, parseInt(n, 10) || 6)); }
+
+  async function runAutonomousLoop(convo) {
+    const max = clampSteps(state.settings.autoMaxSteps);
+    state.autoStop = false;
+    state.autoRunning = true;
+    updateAutoPill();
+
+    try {
+      for (let step = 1; step <= max; step++) {
+        setAutoPillStep(step, max);
+        await streamAssistant(convo);
+
+        const last = convo.messages[convo.messages.length - 1];
+        // Stop the loop on: user stop, an error/aborted turn, or the done marker.
+        if (state.autoStop) break;
+        if (!last || last.role !== "assistant" || last.stopped) break;
+
+        if (last.content.includes(DONE_MARKER)) {
+          last.content = last.content.replace(/\s*\[\[MAX_DONE\]\]\s*/g, "").trim();
+          saveConvos();
+          renderMessages();
+          break;
+        }
+        if (step < max) {
+          convo.messages.push({
+            id: uid(), role: "user", auto: true,
+            content: `Continue. If the task is fully complete, end your reply with ${DONE_MARKER}.`,
+          });
+          touchConvo(convo);
+          renderMessages();
+        }
+      }
+    } finally {
+      state.autoRunning = false;
+      updateAutoPill();
+      toggleStreamingUI(false); // restore composer after the last step
+    }
   }
 
   async function streamAssistant(convo) {
@@ -456,7 +535,7 @@
         signal: state.abort.signal,
         body: JSON.stringify({
           model: currentModel(),
-          system: state.settings.system || undefined,
+          system: effectiveSystem(),
           max_tokens: state.settings.maxTokens,
           temperature: state.settings.temperature,
           apiKey: state.settings.apiKey || undefined,
@@ -570,7 +649,25 @@
   }
 
   function stopStreaming() {
+    state.autoStop = true; // also halts the autonomous loop between steps
     if (state.abort) state.abort.abort();
+  }
+
+  /* ---------- autonomous pill UI ---------- */
+  function updateAutoPill() {
+    const pill = $("#auto-toggle");
+    const label = $("#auto-pill-label");
+    if (!pill) return;
+    const on = !!state.settings.autonomous;
+    pill.classList.toggle("on", on);
+    pill.classList.toggle("running", state.autoRunning);
+    pill.setAttribute("aria-pressed", String(on));
+    if (!state.autoRunning) label.textContent = on ? "Auto: On" : "Auto: Off";
+  }
+  function setAutoPillStep(step, max) {
+    const label = $("#auto-pill-label");
+    if (label) label.textContent = `Auto · ${step}/${max}`;
+    $("#auto-toggle")?.classList.add("running");
   }
 
   async function regenerate(aiMsg) {
@@ -629,11 +726,12 @@
   }
   function updateSendState() {
     const hasText = $("#input").value.trim().length > 0 || state.attachments.length > 0;
-    $("#send-btn").disabled = !hasText || state.streaming;
+    $("#send-btn").disabled = !hasText || state.streaming || state.autoRunning;
   }
   function toggleStreamingUI(on) {
-    $("#stop-btn").hidden = !on;
-    $("#send-btn").hidden = on;
+    const active = on || state.autoRunning;
+    $("#stop-btn").hidden = !active;
+    $("#send-btn").hidden = active;
     updateSendState();
   }
 
@@ -709,6 +807,176 @@
   }
 
   /* ============================================================
+     Export + GitHub
+     ============================================================ */
+  function slugify(s) {
+    return String(s || "chat").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "chat";
+  }
+
+  function conversationToMarkdown(convo) {
+    const when = new Date(convo.updatedAt || Date.now()).toISOString();
+    const lines = [
+      `# ${convo.title || "Conversation"}`,
+      "",
+      `> Exported from MAX on ${when}`,
+      `> Model: ${currentModel()}`,
+      "",
+      "---",
+      "",
+    ];
+    for (const m of convo.messages) {
+      if (m.role !== "user" && m.role !== "assistant") continue;
+      const who = m.auto ? "Auto-continue" : (m.role === "user" ? "You" : "MAX");
+      lines.push(`## ${who}`, "");
+      if (m.images && m.images.length) lines.push(`_(${m.images.length} image attachment${m.images.length > 1 ? "s" : ""})_`, "");
+      lines.push((m.content || "").trim(), "");
+    }
+    return lines.join("\n").trim() + "\n";
+  }
+
+  function download(filename, text, mime = "text/plain") {
+    const blob = new Blob([text], { type: mime + ";charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportConversation(id, format) {
+    const convo = state.conversations.find((c) => c.id === id) || activeConvo();
+    if (!convo || !convo.messages.length) { toast("Nothing to export yet.", "error"); return; }
+    const base = `${slugify(convo.title)}-${convo.id}`;
+    if (format === "json") download(`${base}.json`, JSON.stringify(convo, null, 2), "application/json");
+    else download(`${base}.md`, conversationToMarkdown(convo), "text/markdown");
+    toast(`Exported as ${format === "json" ? "JSON" : "Markdown"}`, "success");
+  }
+
+  function githubConfigured() {
+    const g = state.settings.github;
+    const hasToken = g.token || state.config.github?.hasServerToken;
+    const owner = g.owner || state.config.github?.owner;
+    const repo = g.repo || state.config.github?.repo;
+    return Boolean(hasToken && owner && repo);
+  }
+
+  async function pushConversationToGitHub(id) {
+    const convo = state.conversations.find((c) => c.id === id) || activeConvo();
+    if (!convo || !convo.messages.length) { toast("Nothing to push yet.", "error"); return; }
+    if (!githubConfigured()) {
+      toast("Connect GitHub first (token, owner, repo) in Settings.", "error");
+      openSettings();
+      return;
+    }
+    const g = state.settings.github;
+    const prefix = (g.pathPrefix || "max-chats").replace(/^\/+|\/+$/g, "");
+    const path = `${prefix ? prefix + "/" : ""}${slugify(convo.title)}-${convo.id}.md`;
+
+    toast("Pushing to GitHub…");
+    try {
+      const res = await fetch("/api/github/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: g.token || undefined,
+          owner: g.owner || undefined,
+          repo: g.repo || undefined,
+          branch: g.branch || undefined,
+          path,
+          message: `${convo.title || "Chat"} — via MAX`,
+          content: conversationToMarkdown(convo),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `Push failed (HTTP ${res.status})`);
+      if (data.htmlUrl) {
+        toast("Pushed to GitHub ✓", "success");
+        toastLink("View file on GitHub", data.htmlUrl);
+      } else {
+        toast(data.message || "Pushed to GitHub ✓", "success");
+      }
+    } catch (err) {
+      const isNetwork = err instanceof TypeError;
+      toast(isNetwork ? "Can't reach the MAX server (is it running?)." : err.message, "error");
+    }
+  }
+
+  async function testGithubConnection(btn) {
+    const g = readGithubFields();
+    setBtnBusy(btn, true);
+    const out = $("#gh-test-result");
+    out.textContent = "Checking…"; out.style.color = "";
+    try {
+      const res = await fetch("/api/github/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: g.token || undefined, owner: g.owner, repo: g.repo, branch: g.branch }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      out.textContent = "✓ " + (data.message || "Connected.");
+      out.style.color = data.canPush ? "#34d399" : "#fbbf24";
+    } catch (err) {
+      out.textContent = "✗ " + (err instanceof TypeError ? "Can't reach the MAX server." : err.message);
+      out.style.color = "#ff6b8a";
+    } finally {
+      setBtnBusy(btn, false);
+    }
+  }
+
+  async function testAiConnection(btn) {
+    const g = $("#gh-test-result");
+    setBtnBusy(btn, true);
+    g.textContent = "Pinging the AI provider…"; g.style.color = "";
+    try {
+      const res = await fetch("/api/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiKey: ($("#set-apikey").value.trim()) || state.settings.apiKey || undefined,
+          model: $("#set-model-custom").value.trim() || $("#set-model").value,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      g.textContent = "✓ " + (data.message || "AI provider reachable.");
+      g.style.color = "#34d399";
+    } catch (err) {
+      g.textContent = "✗ " + (err instanceof TypeError ? "Can't reach the MAX server." : err.message);
+      g.style.color = "#ff6b8a";
+    } finally {
+      setBtnBusy(btn, false);
+    }
+  }
+
+  function readGithubFields() {
+    return {
+      token: $("#set-ghtoken").value.trim(),
+      owner: $("#set-ghowner").value.trim(),
+      repo: $("#set-ghrepo").value.trim(),
+      branch: $("#set-ghbranch").value.trim() || "main",
+    };
+  }
+
+  function setBtnBusy(btn, busy) {
+    if (!btn) return;
+    btn.disabled = busy;
+    btn.style.opacity = busy ? ".6" : "";
+  }
+
+  function toastLink(text, url) {
+    const host = $("#toast-host");
+    const el = document.createElement("div");
+    el.className = "toast toast--success";
+    const a = document.createElement("a");
+    a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+    a.textContent = text; a.style.color = "var(--accent-2)"; a.style.textDecoration = "underline";
+    el.appendChild(a);
+    host.appendChild(el);
+    setTimeout(() => { el.classList.add("hide"); setTimeout(() => el.remove(), 260); }, 6000);
+  }
+
+  /* ============================================================
      Theme
      ============================================================ */
   function applyTheme(theme) {
@@ -758,6 +1026,30 @@
     $("#set-temp").value = s.temperature;
     $("#temp-val").textContent = Number(s.temperature).toFixed(2);
 
+    // Autonomous
+    $("#set-autonomous").checked = !!s.autonomous;
+    $("#set-autosteps").value = clampSteps(s.autoMaxSteps);
+    $("#autosteps-val").textContent = clampSteps(s.autoMaxSteps);
+
+    // GitHub (fall back to server-provided defaults as placeholders/values)
+    const g = s.github || githubDefaults();
+    const gc = state.config.github || {};
+    $("#set-ghtoken").value = g.token || "";
+    $("#set-ghowner").value = g.owner || gc.owner || "";
+    $("#set-ghrepo").value = g.repo || gc.repo || "";
+    $("#set-ghbranch").value = g.branch || gc.branch || "main";
+    $("#set-ghpath").value = g.pathPrefix || "max-chats";
+    const ghField = $("#ghtoken-field");
+    if (gc.allowClientToken === false) {
+      ghField.style.display = "none";
+    } else {
+      ghField.style.display = "";
+      $("#ghtoken-help").innerHTML = gc.hasServerToken
+        ? "A server token is configured. Leave blank to use it, or paste your own to override."
+        : "Needs the <b>repo</b> scope (or Contents: write on a fine-grained token) to push.";
+    }
+    $("#gh-test-result").textContent = "";
+
     // api key help / visibility
     const field = $("#apikey-field");
     if (!state.config.allowClientKey) {
@@ -780,9 +1072,22 @@
     state.settings.system = $("#set-system").value;
     state.settings.maxTokens = Math.max(256, Math.min(64000, parseInt($("#set-maxtokens").value, 10) || 4096));
     state.settings.temperature = parseFloat($("#set-temp").value);
+
+    state.settings.autonomous = $("#set-autonomous").checked;
+    state.settings.autoMaxSteps = clampSteps($("#set-autosteps").value);
+
+    state.settings.github = {
+      token: $("#set-ghtoken").value.trim(),
+      owner: $("#set-ghowner").value.trim(),
+      repo: $("#set-ghrepo").value.trim(),
+      branch: $("#set-ghbranch").value.trim() || "main",
+      pathPrefix: ($("#set-ghpath").value.trim() || "max-chats").replace(/^\/+|\/+$/g, ""),
+    };
+
     saveSettings();
     updateModelPill();
     updateKeyStatus();
+    updateAutoPill();
     toast("Settings saved", "success");
     closeSettings();
   }
@@ -821,18 +1126,26 @@
       border: "1px solid var(--border-strong)", borderRadius: "10px",
       boxShadow: "var(--shadow)", padding: "5px", minWidth: "150px", fontSize: "14px",
     });
-    pop.innerHTML = `
-      <button data-a="rename" style="display:flex;gap:8px;width:100%;padding:8px 10px;background:none;border:none;color:var(--text);border-radius:7px;text-align:left">Rename</button>
-      <button data-a="delete" style="display:flex;gap:8px;width:100%;padding:8px 10px;background:none;border:none;color:#ff6b8a;border-radius:7px;text-align:left">Delete</button>`;
+    const item = (a, label, color) =>
+      `<button data-a="${a}" style="display:flex;gap:8px;width:100%;padding:8px 10px;background:none;border:none;color:${color || "var(--text)"};border-radius:7px;text-align:left">${label}</button>`;
+    pop.innerHTML =
+      item("rename", "Rename") +
+      item("push", "Push to GitHub") +
+      item("export-md", "Export .md") +
+      item("export-json", "Export .json") +
+      item("delete", "Delete", "#ff6b8a");
     document.body.appendChild(pop);
     const r = anchorBtn.getBoundingClientRect();
-    pop.style.top = `${r.bottom + 6}px`;
+    pop.style.top = `${Math.min(r.bottom + 6, window.innerHeight - 220)}px`;
     pop.style.left = `${Math.min(r.left, window.innerWidth - 170)}px`;
     pop.querySelectorAll("button").forEach((b) => {
       b.addEventListener("mouseenter", () => (b.style.background = "var(--surface-2)"));
       b.addEventListener("mouseleave", () => (b.style.background = "none"));
     });
     pop.querySelector('[data-a="rename"]').addEventListener("click", () => { pop.remove(); openRename(id); });
+    pop.querySelector('[data-a="push"]').addEventListener("click", () => { pop.remove(); pushConversationToGitHub(id); });
+    pop.querySelector('[data-a="export-md"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "md"); });
+    pop.querySelector('[data-a="export-json"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "json"); });
     pop.querySelector('[data-a="delete"]').addEventListener("click", () => { pop.remove(); deleteConversation(id); });
     setTimeout(() => {
       const close = (e) => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener("click", close); } };
@@ -961,6 +1274,28 @@
       const el = $("#set-apikey"); el.type = el.type === "password" ? "text" : "password";
     });
     $("#set-model").addEventListener("change", () => { $("#set-model-custom").value = ""; });
+    $("#set-autosteps").addEventListener("input", (e) => ($("#autosteps-val").textContent = e.target.value));
+    $("#reveal-ghtoken").addEventListener("click", () => {
+      const el = $("#set-ghtoken"); el.type = el.type === "password" ? "text" : "password";
+    });
+    $("#gh-test").addEventListener("click", (e) => testGithubConnection(e.currentTarget));
+    $("#ai-test").addEventListener("click", (e) => testAiConnection(e.currentTarget));
+
+    // topbar: quick Autonomous toggle
+    $("#auto-toggle").addEventListener("click", () => {
+      if (state.autoRunning) return;
+      state.settings.autonomous = !state.settings.autonomous;
+      saveSettings();
+      updateAutoPill();
+      toast(state.settings.autonomous ? "Autonomous mode ON" : "Autonomous mode off", state.settings.autonomous ? "success" : "");
+    });
+
+    // topbar: push current chat to GitHub
+    $("#push-btn").addEventListener("click", () => {
+      const c = activeConvo();
+      if (!c) { toast("Open a conversation first.", "error"); return; }
+      pushConversationToGitHub(c.id);
+    });
     $("#clear-current").addEventListener("click", () => {
       const c = activeConvo(); if (c) { c.messages = []; c.title = "New chat"; touchConvo(c); renderMessages(); renderConversations(); }
       closeSettings(); toast("Chat cleared");
@@ -1023,6 +1358,7 @@
 
     updateModelPill();
     updateKeyStatus();
+    updateAutoPill();
     renderConversations();
     renderMessages();
     updateCharCount();

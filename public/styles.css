@@ -219,7 +219,7 @@ input, textarea, select { font-family: inherit; }
   border-bottom: 1px solid var(--border); background: var(--surface);
   backdrop-filter: blur(18px); z-index: 5;
 }
-.topbar__center { flex: 1; display: flex; justify-content: center; }
+.topbar__center { flex: 1; display: flex; justify-content: center; align-items: center; gap: 10px; }
 .topbar__right { display: flex; align-items: center; gap: 10px; }
 
 .icon-btn {
@@ -243,6 +243,31 @@ input, textarea, select { font-family: inherit; }
 .key-status { font-size: 12px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); white-space: nowrap; }
 .key-status.ok { color: #34d399; border-color: rgba(52,211,153,.35); }
 .key-status.warn { color: #fbbf24; border-color: rgba(251,191,36,.35); }
+
+/* Autonomous toggle pill in the topbar */
+.auto-pill {
+  display: inline-flex; align-items: center; gap: 7px; padding: 8px 13px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text-dim);
+  font-size: 13px; font-weight: 600; transition: border-color .2s, color .2s, box-shadow .2s, background .2s;
+}
+.auto-pill svg { width: 15px; height: 15px; fill: currentColor; stroke: none; }
+.auto-pill:hover { color: var(--text); border-color: var(--border-strong); }
+.auto-pill.on { color: #fff; border-color: transparent; background: var(--accent-grad); box-shadow: 0 6px 18px -8px var(--accent-1); }
+.auto-pill.running { animation: autopulse 1.4s ease-in-out infinite; }
+@keyframes autopulse { 0%,100% { box-shadow: 0 0 0 0 rgba(124,92,255,.5);} 50% { box-shadow: 0 0 0 6px rgba(124,92,255,0);} }
+
+/* section divider inside modals */
+.section-divider { display: flex; align-items: center; gap: 12px; margin: 4px 0 2px; }
+.section-divider::before, .section-divider::after { content: ""; height: 1px; flex: 1; background: var(--border); }
+.section-divider span { font-size: 12px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: var(--text-faint); }
+
+/* switch row */
+.switch-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; cursor: pointer; }
+.switch-row span:first-child { display: flex; flex-direction: column; gap: 3px; }
+.switch { appearance: none; -webkit-appearance: none; position: relative; width: 44px; height: 26px; flex-shrink: 0; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border-strong); cursor: pointer; transition: background .2s; margin-top: 2px; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: var(--text-dim); transition: transform .2s, background .2s; }
+.switch:checked { background: var(--accent-grad); border-color: transparent; }
+.switch:checked::after { transform: translateX(18px); background: #fff; }
 
 /* ---------- Chat ---------- */
 .chat { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
@@ -279,6 +304,9 @@ input, textarea, select { font-family: inherit; }
   word-wrap: break-word; overflow-wrap: break-word;
 }
 .msg--user .msg__bubble { background: var(--bubble-user); color: #fff; box-shadow: 0 10px 26px -14px var(--accent-1); }
+.msg--auto { opacity: .72; }
+.msg--auto .msg__avatar { background: var(--surface-2); border: 1px dashed var(--border-strong); color: var(--text-dim); box-shadow: none; font-size: 16px; }
+.msg--auto .msg__bubble { background: var(--surface-2); color: var(--text-dim); box-shadow: none; font-size: 13.5px; font-style: italic; }
 .msg--assistant .msg__bubble { background: var(--bubble-ai); border: 1px solid var(--border); }
 
 /* message content (markdown) */
@@ -451,6 +479,11 @@ input, textarea, select { font-family: inherit; }
   .welcome__title { font-size: 32px; }
   .messages, .composer-wrap { padding-left: 14px; padding-right: 14px; }
   .field-row { grid-template-columns: 1fr; }
+}
+@media (max-width: 620px) {
+  #model-pill-name { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .auto-pill #auto-pill-label { display: none; }
+  .auto-pill { padding: 8px; }
 }
 @media (max-width: 420px) {
   .composer__meta { display: none; }

@@ -105,8 +105,15 @@
             <span id="model-pill-name">claude-opus-4-8</span>
             <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
           </button>
+          <button class="auto-pill" id="auto-toggle" title="Toggle Autonomous mode" aria-pressed="false">
+            <svg viewBox="0 0 24 24"><path d="M13 2L4.5 13.5H12l-1 8.5 8.5-11.5H12z"/></svg>
+            <span id="auto-pill-label">Auto: Off</span>
+          </button>
         </div>
         <div class="topbar__right">
+          <button class="icon-btn" id="push-btn" title="Push this chat to GitHub" aria-label="Push to GitHub">
+            <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 00-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.5 9.5 0 015 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0012 2z"/></svg>
+          </button>
           <span class="key-status" id="key-status" title="API key status"></span>
         </div>
       </header>
@@ -230,8 +237,63 @@
           </div>
         </div>
 
+        <div class="section-divider"><span>Autonomous mode</span></div>
+
         <div class="field">
-          <label>Danger zone</label>
+          <label class="switch-row" for="set-autonomous">
+            <span>
+              <b>Enable Autonomous mode</b>
+              <span class="field__help">MAX works through a task over multiple steps on its own, continuing until it's done.</span>
+            </span>
+            <input type="checkbox" id="set-autonomous" class="switch" />
+          </label>
+        </div>
+        <div class="field">
+          <label for="set-autosteps">Max autonomous steps <span class="field__val" id="autosteps-val">6</span></label>
+          <input type="range" id="set-autosteps" min="2" max="15" step="1" />
+        </div>
+
+        <div class="section-divider"><span>GitHub</span></div>
+
+        <div class="field" id="ghtoken-field">
+          <label for="set-ghtoken">Personal access token <span class="field__opt">(session only)</span></label>
+          <div class="input-icon">
+            <input type="password" id="set-ghtoken" placeholder="ghp_… or github_pat_…" autocomplete="new-password" spellcheck="false" />
+            <button type="button" class="reveal-btn" id="reveal-ghtoken" title="Show/hide">👁</button>
+          </div>
+          <p class="field__help" id="ghtoken-help">Needs the <b>repo</b> scope (or Contents: write on a fine-grained token) to push.</p>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="set-ghowner">Owner (user/org)</label>
+            <input type="text" id="set-ghowner" placeholder="your-username" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="set-ghrepo">Repository</label>
+            <input type="text" id="set-ghrepo" placeholder="my-chats" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="set-ghbranch">Branch</label>
+            <input type="text" id="set-ghbranch" placeholder="main" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="set-ghpath">Folder / path prefix</label>
+            <input type="text" id="set-ghpath" placeholder="max-chats" spellcheck="false" />
+          </div>
+        </div>
+        <div class="field">
+          <div class="danger-row">
+            <button class="btn btn--ghost" id="gh-test">Test connection</button>
+            <button class="btn btn--ghost" id="ai-test">Test AI provider</button>
+          </div>
+          <p class="field__help" id="gh-test-result"></p>
+        </div>
+
+        <div class="section-divider"><span>Danger zone</span></div>
+
+        <div class="field">
           <div class="danger-row">
             <button class="btn btn--ghost" id="clear-current">Clear current chat</button>
             <button class="btn btn--danger" id="delete-all">Delete all conversations</button>

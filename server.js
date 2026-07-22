@@ -64,7 +64,17 @@ const CONFIG = {
   // looks like the Claude CLI. A matching User-Agent is REQUIRED or requests are
   // rejected/dropped ("fetch failed" or 401). Override only if your gateway differs.
   upstreamUserAgent: process.env.UPSTREAM_USER_AGENT || "claude-cli/2.0.0 (external, cli)",
+  github: {
+    token: process.env.GITHUB_TOKEN || "",
+    owner: process.env.GITHUB_OWNER || "",
+    repo: process.env.GITHUB_REPO || "",
+    branch: process.env.GITHUB_BRANCH || "main",
+    apiBase: (process.env.GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, ""),
+    allowClientToken: (process.env.ALLOW_CLIENT_GITHUB_TOKEN || "true").toLowerCase() !== "false",
+  },
 };
+
+const START_TIME = Date.now();
 
 // Models allowed by the AgentRouter token configuration shown by the user.
 // Users can still enter a custom model ID in the UI if their token permits it.
@@ -218,6 +228,23 @@ function handleConfig(req, res) {
     models: MODELS,
     allowClientKey: CONFIG.allowClientKey,
     hasServerKey: Boolean(CONFIG.apiKey),
+    github: {
+      hasServerToken: Boolean(CONFIG.github.token),
+      allowClientToken: CONFIG.github.allowClientToken,
+      owner: CONFIG.github.owner,
+      repo: CONFIG.github.repo,
+      branch: CONFIG.github.branch,
+    },
+  });
+}
+
+function handleHealth(req, res) {
+  sendJson(res, 200, {
+    ok: true,
+    uptimeSeconds: Math.round((Date.now() - START_TIME) / 1000),
+    node: process.version,
+    hasServerKey: Boolean(CONFIG.apiKey),
+    github: { hasServerToken: Boolean(CONFIG.github.token) },
   });
 }
 
@@ -432,6 +459,181 @@ function mapStatusType(status) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  /api/test — cheap connectivity/key check against the AI provider   */
+/* ------------------------------------------------------------------ */
+async function handleTest(req, res) {
+  let payload = {};
+  try {
+    payload = JSON.parse((await readBody(req)) || "{}");
+  } catch {}
+  const clientKey = CONFIG.allowClientKey ? String(payload.apiKey || "").trim() : "";
+  const apiKey = clientKey || CONFIG.apiKey;
+  if (!apiKey) {
+    return sendJson(res, 401, { error: { type: "no_api_key", message: "No API key configured." } });
+  }
+  const model = typeof payload.model === "string" && payload.model.trim() ? payload.model.trim() : CONFIG.defaultModel;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const r = await fetch(`${CONFIG.baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        Authorization: `Bearer ${apiKey}`,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "claude-code-20250219",
+        "User-Agent": CONFIG.upstreamUserAgent,
+        "x-app": "cli",
+      },
+      body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "ping" }] }),
+      signal: controller.signal,
+    });
+    const text = await r.text().catch(() => "");
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { const j = JSON.parse(text); msg = j?.error?.message || j?.message || msg; } catch {}
+      return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: msg } });
+    }
+    return sendJson(res, 200, { ok: true, model, message: "Connection OK — the provider accepted the request." });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.cause?.message || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach the AI provider (${cause}).` } });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  GitHub integration (proxied so the token can stay server-side)     */
+/* ------------------------------------------------------------------ */
+function resolveGithub(payload) {
+  const clientToken = CONFIG.github.allowClientToken ? String(payload.token || "").trim() : "";
+  return {
+    token: clientToken || CONFIG.github.token,
+    owner: String(payload.owner || CONFIG.github.owner || "").trim(),
+    repo: String(payload.repo || CONFIG.github.repo || "").trim(),
+    branch: String(payload.branch || CONFIG.github.branch || "main").trim() || "main",
+  };
+}
+
+async function githubApi(token, method, apiPath, body) {
+  const url = `${CONFIG.github.apiBase}${apiPath}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25_000);
+  try {
+    const r = await fetch(url, {
+      method,
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "MAX-chat",
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+    const text = await r.text().catch(() => "");
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch {}
+    return { status: r.status, ok: r.ok, json, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function ghError(res, resp, fallback) {
+  const message = resp?.json?.message || resp?.text || fallback || "GitHub request failed";
+  return sendJson(res, resp?.status || 502, {
+    error: { type: mapStatusType(resp?.status || 502), status: resp?.status, message },
+  });
+}
+
+async function handleGithubTest(req, res) {
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
+  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
+
+  try {
+    const who = await githubApi(gh.token, "GET", "/user");
+    if (!who.ok) return ghError(res, who, "Token rejected by GitHub.");
+    const repo = await githubApi(gh.token, "GET", `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}`);
+    if (!repo.ok) return ghError(res, repo, "Repository not found or not accessible.");
+    const canPush = repo.json?.permissions?.push !== false;
+    return sendJson(res, 200, {
+      ok: true,
+      login: who.json?.login,
+      repo: repo.json?.full_name,
+      defaultBranch: repo.json?.default_branch,
+      canPush,
+      message: canPush
+        ? `Connected as ${who.json?.login}. Ready to push to ${repo.json?.full_name}.`
+        : `Connected as ${who.json?.login}, but this token cannot push to ${repo.json?.full_name}.`,
+    });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+  }
+}
+
+async function handleGithubPush(req, res) {
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
+  }
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided. Add one in Settings." } });
+  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "GitHub owner and repository are required." } });
+
+  const content = typeof payload.content === "string" ? payload.content : "";
+  if (!content) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to push (empty content)." } });
+
+  // Sanitize the target path: no leading slash, no traversal.
+  let filePath = String(payload.path || "").trim().replace(/^\/+/, "");
+  filePath = filePath.split("/").filter((seg) => seg && seg !== "." && seg !== "..").join("/");
+  if (!filePath) return sendJson(res, 400, { error: { type: "bad_request", message: "A valid file path is required." } });
+
+  const message = String(payload.message || `Add ${filePath} via MAX`).slice(0, 500);
+  const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
+  const base = `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/contents/${encodedPath}`;
+
+  try {
+    // Look up existing file to obtain its sha (needed to update in place).
+    let sha;
+    const existing = await githubApi(gh.token, "GET", `${base}?ref=${encodeURIComponent(gh.branch)}`);
+    if (existing.ok && existing.json && !Array.isArray(existing.json)) sha = existing.json.sha;
+    else if (existing.status !== 404) {
+      // 404 is fine (new file); anything else that isn't ok is a real error.
+      if (!existing.ok) return ghError(res, existing, "Could not read the target path.");
+    }
+
+    const put = await githubApi(gh.token, "PUT", base, {
+      message,
+      content: Buffer.from(content, "utf8").toString("base64"),
+      branch: gh.branch,
+      ...(sha ? { sha } : {}),
+    });
+    if (!put.ok) return ghError(res, put, "Push failed.");
+
+    return sendJson(res, 200, {
+      ok: true,
+      path: filePath,
+      updated: Boolean(sha),
+      htmlUrl: put.json?.content?.html_url,
+      commitUrl: put.json?.commit?.html_url,
+      commitSha: put.json?.commit?.sha,
+      message: `${sha ? "Updated" : "Created"} ${filePath} on ${gh.owner}/${gh.repo}@${gh.branch}.`,
+    });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Router                                                             */
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
@@ -448,8 +650,20 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/config" && req.method === "GET") {
       return handleConfig(req, res);
     }
+    if (pathname === "/api/health" && req.method === "GET") {
+      return handleHealth(req, res);
+    }
     if (pathname === "/api/chat" && req.method === "POST") {
       return await handleChat(req, res);
+    }
+    if (pathname === "/api/test" && req.method === "POST") {
+      return await handleTest(req, res);
+    }
+    if (pathname === "/api/github/test" && req.method === "POST") {
+      return await handleGithubTest(req, res);
+    }
+    if (pathname === "/api/github/push" && req.method === "POST") {
+      return await handleGithubPush(req, res);
     }
     if (pathname.startsWith("/api/")) {
       return sendJson(res, 404, { error: { type: "not_found", message: "Unknown API route" } });
@@ -491,5 +705,6 @@ server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`│  Default model  : ${CONFIG.defaultModel}`);
   console.log(`│  Rate limit     : ${CONFIG.rateLimitPerMin || "off"} req/min per IP`);
   console.log(`│  Timeout        : ${CONFIG.upstreamTimeoutMs} ms`);
+  console.log(`│  GitHub token   : ${CONFIG.github.token ? "loaded ✓" : "not set (add in Settings, or .env)"}`);
   console.log(`└${line}┘\n`);
 });

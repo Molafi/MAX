@@ -37,10 +37,25 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 - Fully mobile‑responsive
 - Image upload (drag‑drop, paste, or picker) sent as base64 for vision models
 
+**Autonomous mode**
+- Flip **Auto** on (topbar pill or Settings) and MAX works through a task over
+  multiple steps on its own, auto‑continuing until it's done (or you hit **Stop**)
+- Configurable step limit; finishes when the model emits its completion marker
+
+**GitHub integration**
+- Connect a GitHub token + repo in Settings and **push any conversation** to the
+  repository as a Markdown file (create or update), straight from the chat
+- **Test connection** button verifies the token, repo, and push permission
+- The token is proxied server‑side and never stored in `localStorage`
+
+**Export**
+- Download any conversation as **Markdown** or **JSON** from its ⋯ menu
+
 **Backend**
 - Small proxy that keeps your key secret + relays the streaming response
 - Per‑IP rate limiting (configurable)
 - Model switcher, system prompt, `max_tokens`, and `temperature` controls
+- `/api/health` and a **Test AI provider** button for quick diagnostics
 
 ---
 
@@ -108,6 +123,9 @@ All settings live in `.env` (see `.env.example`):
 | `PORT`                 | `8787`                      | Local port.                                             |
 | `ALLOW_CLIENT_KEY`     | `true`                      | Let users supply their own key in Settings.             |
 | `RATE_LIMIT_PER_MIN`   | `60`                        | Per‑IP request cap per minute (`0` disables).           |
+| `GITHUB_TOKEN`         | *(empty)*                   | Optional server‑side GitHub token (else supply in UI).  |
+| `GITHUB_OWNER` / `GITHUB_REPO` / `GITHUB_BRANCH` | *(empty)* / *(empty)* / `main` | Default push target.                   |
+| `ALLOW_CLIENT_GITHUB_TOKEN` | `true`                 | Let users supply their own GitHub token in Settings.    |
 
 You can also change the **model, system prompt, temperature, and max tokens** at any time
 from the ⚙️ **Settings** panel in the app.
@@ -128,6 +146,25 @@ Browser (public/)  ──POST /api/chat──▶  server.js  ──/v1/messages�
 - The streaming response is piped straight back to the browser and rendered live.
 
 ---
+
+## 🤖 Autonomous mode
+
+Turn on **Auto** (the topbar pill, or Settings → Autonomous mode). Now when you
+send a task, MAX plans and executes it over several turns automatically, showing
+`Auto · step N/max` while it works. It stops when the task is complete, when it
+reaches the step limit, or when you press **Stop**. Adjust the step cap in Settings.
+
+## 🐙 Push chats to GitHub
+
+1. Create a token at **GitHub → Settings → Developer settings → Personal access tokens**
+   with the **`repo`** scope (classic) or **Contents: Read and write** (fine‑grained).
+2. Open MAX **Settings → GitHub**, paste the token, and set **owner**, **repository**,
+   **branch**, and an optional **folder** (path prefix). Click **Test connection**.
+3. Push a conversation via the **GitHub icon** in the topbar, or a conversation's
+   **⋯ → Push to GitHub**. It's saved as `‹folder›/‹title›-‹id›.md` (created or updated).
+
+> Your token is sent to the local MAX server only to make the GitHub call; it is
+> kept in `sessionStorage` (cleared when you close the tab), never in `localStorage`.
 
 ## 🛠️ Troubleshooting
 

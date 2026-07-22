@@ -1,6 +1,6 @@
 {
   "name": "max-chat",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MAX — a premium AI chat application powered by AgentRouter (Anthropic-compatible). Zero runtime dependencies.",
   "type": "module",
   "main": "server.js",
