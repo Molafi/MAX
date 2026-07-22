@@ -82,6 +82,46 @@ const CONFIG = {
 // Cap on how much of a repo file we return to the browser (protects memory + context).
 const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_BYTES || "524288", 10); // 512 KB
 const MAX_TREE_ENTRIES = 4000;
+const MAX_FETCH_BYTES = 2 * 1024 * 1024; // 2 MB cap on fetched web pages
+
+// Powers catalog. `status: "available"` powers work in MAX right now; the rest are
+// catalog entries you can wire up to their real backends (they open Details/links).
+const POWERS = [
+  { id: "web-fetch", name: "Web Fetch", provider: "MAX", category: "Web", official: true, requiresKey: false, status: "available",
+    blurb: "Fetch a web page and drop its readable text into the chat. Use /fetch <url>.", commands: ["/fetch"] },
+  { id: "web-search", name: "Web Search", provider: "Tavily / Brave", category: "Web", official: true, requiresKey: true, status: "available",
+    blurb: "Search the web and add the top results as context. Use /search <query>.", commands: ["/search"],
+    keyHelp: "Paste a Tavily API key (tavily.com) — free tier available.", provider_id: "tavily" },
+  { id: "context7", name: "Context7 Docs", provider: "Context7", category: "AI/ML", official: true, requiresKey: false, status: "catalog",
+    blurb: "Up-to-date library documentation for codegen.", url: "https://context7.com" },
+  { id: "exa", name: "Exa Web Search & Research", provider: "Exa", category: "Web", official: true, requiresKey: true, status: "catalog",
+    blurb: "Neural web search and research.", url: "https://exa.ai" },
+  { id: "figma", name: "Design to Code with Figma", provider: "Figma", category: "Design", official: true, requiresKey: false, status: "catalog",
+    blurb: "Turn Figma designs into code.", url: "https://figma.com" },
+  { id: "postman", name: "API Testing with Postman", provider: "Postman", category: "DevOps", official: true, requiresKey: false, status: "catalog",
+    blurb: "Design, test and document APIs.", url: "https://postman.com" },
+  { id: "supabase", name: "Build a backend with Supabase", provider: "Supabase", category: "Database", official: true, requiresKey: false, status: "catalog",
+    blurb: "Postgres, auth, storage and edge functions.", url: "https://supabase.com" },
+  { id: "neon", name: "Build a database with Neon", provider: "Neon", category: "Database", official: true, requiresKey: false, status: "catalog",
+    blurb: "Serverless Postgres.", url: "https://neon.tech" },
+  { id: "mongodb", name: "MongoDB", provider: "MongoDB Inc.", category: "Database", official: true, requiresKey: false, status: "catalog",
+    blurb: "Document database.", url: "https://mongodb.com" },
+  { id: "terraform", name: "Deploy infrastructure with Terraform", provider: "HashiCorp", category: "DevOps", official: true, requiresKey: false, status: "catalog",
+    blurb: "Infrastructure as code.", url: "https://terraform.io" },
+  { id: "stripe", name: "Stripe Payments", provider: "Stripe", category: "Payments", official: true, requiresKey: true, status: "catalog",
+    blurb: "Payments, subscriptions and billing.", url: "https://stripe.com" },
+  { id: "datadog", name: "Datadog Observability", provider: "Datadog", category: "Observability", official: true, requiresKey: true, status: "catalog",
+    blurb: "Metrics, traces and logs.", url: "https://datadoghq.com" },
+  { id: "elevenlabs", name: "ElevenLabs", provider: "ElevenLabs", category: "AI/ML", official: true, requiresKey: true, status: "catalog",
+    blurb: "High-quality text to speech.", url: "https://elevenlabs.io" },
+  { id: "aikido", name: "Scan code with Aikido Security", provider: "Aikido Security", category: "Security", official: true, requiresKey: true, status: "catalog",
+    blurb: "Scan code and dependencies for issues.", url: "https://aikido.dev" },
+  { id: "brightdata", name: "Web scraping with Bright Data", provider: "Bright Data", category: "Web", official: false, requiresKey: true, status: "catalog",
+    blurb: "Scrape sites at scale.", url: "https://brightdata.com" },
+  { id: "zapier", name: "Zapier", provider: "Zapier", category: "Other", official: true, requiresKey: false, status: "catalog",
+    blurb: "Automate across 6000+ apps.", url: "https://zapier.com" },
+];
+const POWER_CATEGORIES = ["AWS", "Security", "Database", "Observability", "Payments", "Design", "DevOps", "AI/ML", "Web", "Other"];
 
 const START_TIME = Date.now();
 
@@ -1058,6 +1098,104 @@ async function handleGitlabMr(req, res) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Powers (integrations gallery)                                      */
+/* ------------------------------------------------------------------ */
+function handlePowers(req, res) {
+  sendJson(res, 200, { ok: true, categories: POWER_CATEGORIES, powers: POWERS });
+}
+
+// Basic SSRF guard: only http/https, block obvious localhost/private/metadata hosts.
+function isBlockedHost(hostname) {
+  const h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal") || h.endsWith(".local")) return true;
+  if (h === "::1" || h === "0.0.0.0") return true;
+  if (h === "169.254.169.254" || h.startsWith("169.254.")) return true; // cloud metadata + link-local
+  // IPv4 private ranges
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const [a, b] = [parseInt(m[1], 10), parseInt(m[2], 10)];
+    if (a === 10 || a === 127) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+  }
+  if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80")) return true; // IPv6 private
+  return false;
+}
+
+// Strip HTML to readable-ish text.
+function htmlToText(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<\/(p|div|section|article|li|h[1-6]|tr|br)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+async function handlePowerFetch(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  let url;
+  try { url = new URL(String(payload.url || "").trim()); } catch { return sendJson(res, 400, { error: { type: "bad_request", message: "Provide a valid URL." } }); }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return sendJson(res, 400, { error: { type: "bad_request", message: "Only http/https URLs are allowed." } });
+  if (isBlockedHost(url.hostname)) return sendJson(res, 403, { error: { type: "blocked", message: "That host is not allowed (local/private addresses are blocked)." } });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const r = await fetch(url.href, { redirect: "follow", headers: { "User-Agent": "MAX-chat web-fetch", Accept: "text/html,text/plain,application/json,*/*" }, signal: controller.signal });
+    const type = r.headers.get("content-type") || "";
+    if (!r.ok) return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: `Fetch failed (HTTP ${r.status}).` } });
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > MAX_FETCH_BYTES) return sendJson(res, 413, { error: { type: "too_large", message: "Page is too large to fetch." } });
+    let text = buf.toString("utf8");
+    if (/text\/html/i.test(type)) text = htmlToText(text);
+    if (text.length > 100_000) text = text.slice(0, 100_000) + "\n… (truncated)";
+    return sendJson(res, 200, { ok: true, url: url.href, contentType: type, text });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not fetch that page (${cause}).` } });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handlePowerSearch(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const query = String(payload.query || "").trim();
+  const key = String(payload.key || "").trim();
+  const provider = String(payload.provider || "tavily").trim();
+  if (!query) return sendJson(res, 400, { error: { type: "bad_request", message: "Provide a search query." } });
+  if (!key) return sendJson(res, 401, { error: { type: "no_token", message: "This power needs an API key. Add it in Powers." } });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    // Tavily-compatible search (default). Other providers can be added similarly.
+    const base = process.env.TAVILY_API_BASE || "https://api.tavily.com";
+    const r = await fetch(`${base.replace(/\/+$/, "")}/search`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: key, query, max_results: clampInt(payload.max, 1, 10, 5), include_answer: true }),
+      signal: controller.signal,
+    });
+    const text = await r.text().catch(() => "");
+    let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+    if (!r.ok) {
+      const msg = json?.error || json?.message || `Search failed (HTTP ${r.status}).`;
+      return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: typeof msg === "string" ? msg : "Search failed." } });
+    }
+    const results = (json?.results || []).map((x) => ({ title: x.title, url: x.url, content: x.content }));
+    return sendJson(res, 200, { ok: true, provider, query, answer: json?.answer || "", results });
+  } catch (err) {
+    const cause = err?.cause?.code || err?.message || "unknown error";
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach the search provider (${cause}).` } });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Router                                                             */
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
@@ -1124,6 +1262,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/api/gitlab/mr" && req.method === "POST") {
       return await handleGitlabMr(req, res);
+    }
+    if (pathname === "/api/powers" && req.method === "GET") {
+      return handlePowers(req, res);
+    }
+    if (pathname === "/api/powers/fetch" && req.method === "POST") {
+      return await handlePowerFetch(req, res);
+    }
+    if (pathname === "/api/powers/search" && req.method === "POST") {
+      return await handlePowerSearch(req, res);
     }
     if (pathname.startsWith("/api/")) {
       return sendJson(res, 404, { error: { type: "not_found", message: "Unknown API route" } });

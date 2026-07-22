@@ -57,6 +57,14 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 - **Context basket** — stage multiple repo files and send them together
 - **Summarize the repo** from its file tree (`/summarize` or the palette)
 
+**Powers (integrations gallery)**
+- A browsable, searchable catalog (All / Official / Community tabs, category sidebar) — open it
+  from the sidebar **Powers** button or the command palette
+- Two powers **work out of the box**: **Web Fetch** (`/fetch <url>`, no key, SSRF‑guarded) pulls a
+  page's text into the chat, and **Web Search** (`/search <query>`, Tavily key) adds top results
+- Installed powers add slash commands and are advertised to the model; other entries are honest
+  catalog stubs you can wire to their real backends
+
 **More**
 - **Persona library** — save reusable system prompts and apply them in one click
 - **API profiles** — save key + model combos and switch quickly

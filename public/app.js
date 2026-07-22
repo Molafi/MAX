@@ -64,6 +64,7 @@
       lastRepo: null,
       confirmAutonomous: true,
       profiles: [],
+      powers: { installed: [] },
     },
     conversations: [],
     activeId: null,
@@ -119,6 +120,7 @@
       state.settings.github = Object.assign(githubDefaults(), state.settings.github || {});
       state.settings.gitlab = Object.assign({ token: "", branch: "main" }, state.settings.gitlab || {});
       if (!Array.isArray(state.settings.personas)) state.settings.personas = [];
+      if (!state.settings.powers || !Array.isArray(state.settings.powers.installed)) state.settings.powers = { installed: [] };
       if (state.settings.provider !== "gitlab") state.settings.provider = "github";
       state.settings.apiKey = sessionStorage.getItem(SESSION_KEY) || "";
       state.settings.github.token = sessionStorage.getItem(GH_SESSION_KEY) || "";
@@ -517,15 +519,31 @@
       sys += `\n\n[Working repository] The user has selected the ${repo.provider} repository ${repo.fullName} (branch ${repo.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo.fullName}.`;
       sys += `\n\n[Editing files] When you want to change or create files, output each file as a fenced code block whose opening fence includes a path attribute, exactly like:\n\`\`\`js path=src/example.js\n<the COMPLETE new contents of the file>\n\`\`\`\nAlways include the full file content (not a diff), one block per file. MAX shows the user a diff and lets them commit these to a branch and open a pull request. Only use this format for real file changes.`;
     }
+    sys += powersSystemNote();
     if (state.settings.autonomous) {
       sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line.`;
     }
     return sys.trim() || undefined;
   }
 
+  // Intercept slash commands typed with an argument (e.g. "/fetch https://…").
+  function handleSlashSend(text) {
+    const m = text.match(/^\/(\w+)(?:\s+([\s\S]+))?$/);
+    if (!m) return false;
+    const cmd = "/" + m[1].toLowerCase();
+    const arg = (m[2] || "").trim();
+    if (cmd === "/fetch") { $("#input").value = ""; updateCharCount(); updateSendState(); runFetchCommand(arg); return true; }
+    if (cmd === "/search") { $("#input").value = ""; updateCharCount(); updateSendState(); runSearchCommand(arg); return true; }
+    const all = SLASH.concat(powerSlashCommands());
+    const found = all.find((s) => s.cmd === cmd);
+    if (found && !arg) { $("#input").value = ""; updateCharCount(); updateSendState(); found.run(); return true; }
+    return false;
+  }
+
   async function sendMessage(text) {
     if (state.streaming) return;
     text = text.trim();
+    if (text && handleSlashSend(text)) return;
     const imgs = state.attachments.slice();
     const staged = state.basket.slice();
     if (!text && imgs.length === 0 && !staged.length) return;
@@ -1667,6 +1685,158 @@ a{color:#22d3ee}</style></head>
   }
 
   /* ============================================================
+     Powers (integrations gallery)
+     ============================================================ */
+  let powersCatalog = null;         // { categories, powers }
+  const powerKeyName = (id) => `max.powerKey.${id}.v1`;
+  const isInstalled = (id) => state.settings.powers.installed.includes(id);
+  const powerById = (id) => (powersCatalog?.powers || []).find((p) => p.id === id);
+  const getPowerKey = (id) => { try { return sessionStorage.getItem(powerKeyName(id)) || ""; } catch { return ""; } };
+  function setPowerKey(id, key) {
+    try { if (key) sessionStorage.setItem(powerKeyName(id), key); else sessionStorage.removeItem(powerKeyName(id)); } catch {}
+  }
+
+  async function loadPowers() {
+    if (powersCatalog) return powersCatalog;
+    try {
+      const res = await fetch("/api/powers");
+      powersCatalog = res.ok ? await res.json() : { categories: [], powers: [] };
+    } catch { powersCatalog = { categories: [], powers: [] }; }
+    return powersCatalog;
+  }
+
+  function installedPowers() {
+    return (powersCatalog?.powers || []).filter((p) => isInstalled(p.id));
+  }
+
+  // Slash commands contributed by installed, available powers.
+  function powerSlashCommands() {
+    const cmds = [];
+    if (isInstalled("web-fetch")) cmds.push({ cmd: "/fetch", desc: "Fetch a web page into the chat", run: () => runFetchCommand() });
+    if (isInstalled("web-search")) cmds.push({ cmd: "/search", desc: "Search the web and add results", run: () => runSearchCommand() });
+    return cmds;
+  }
+
+  // Capability note injected into the system prompt for installed powers.
+  function powersSystemNote() {
+    const active = installedPowers().filter((p) => p.status === "available");
+    if (!active.length) return "";
+    const lines = active.map((p) => `- ${p.name}: ${p.blurb}`);
+    return `\n\n[Enabled powers] The user has enabled these MAX capabilities:\n${lines.join("\n")}`;
+  }
+
+  async function togglePower(id) {
+    const p = powerById(id);
+    if (!p) return;
+    if (isInstalled(id)) {
+      state.settings.powers.installed = state.settings.powers.installed.filter((x) => x !== id);
+      setPowerKey(id, "");
+      saveSettings(); renderPowers(); toast(`Removed ${p.name}`);
+      return;
+    }
+    if (p.status !== "available") {
+      // Catalog-only entry: point the user to its real setup.
+      if (p.url) window.open(p.url, "_blank", "noopener");
+      toast(`${p.name} is a catalog entry — opens its site for setup.`, "");
+      return;
+    }
+    if (p.requiresKey && !getPowerKey(id)) {
+      const key = (prompt(`${p.name}\n\n${p.keyHelp || "Enter the API key for this power:"}`, "") || "").trim();
+      if (!key) return;
+      setPowerKey(id, key);
+    }
+    state.settings.powers.installed.push(id);
+    saveSettings(); renderPowers(); toast(`Installed ${p.name} ✓`, "success");
+  }
+
+  let powersScope = "all";
+  let powersCat = "All";
+  function openPowers() {
+    $("#powers-overlay").hidden = false;
+    loadPowers().then(() => { renderPowerCats(); renderPowers(); });
+  }
+  function closePowers() { $("#powers-overlay").hidden = true; }
+
+  function renderPowerCats() {
+    const box = $("#powers-cats");
+    const cats = ["All", ...(powersCatalog?.categories || [])];
+    box.innerHTML = cats.map((c) =>
+      `<button class="powers-cat${c === powersCat ? " active" : ""}" data-cat="${esc(c)}" type="button">${esc(c)}</button>`).join("");
+    box.querySelectorAll(".powers-cat").forEach((b) => b.addEventListener("click", () => { powersCat = b.dataset.cat; renderPowerCats(); renderPowers(); }));
+  }
+
+  function renderPowers() {
+    const grid = $("#powers-grid");
+    if (!grid) return;
+    const q = $("#powers-search-input").value.trim().toLowerCase();
+    let list = (powersCatalog?.powers || []).slice();
+    if (powersScope === "official") list = list.filter((p) => p.official);
+    else if (powersScope === "community") list = list.filter((p) => !p.official);
+    else if (powersScope === "installed") list = list.filter((p) => isInstalled(p.id));
+    if (powersCat !== "All") list = list.filter((p) => p.category === powersCat);
+    if (q) list = list.filter((p) => (p.name + " " + p.provider + " " + p.blurb).toLowerCase().includes(q));
+
+    if (!list.length) { grid.innerHTML = `<p class="empty-hint">No powers match.</p>`; return; }
+    grid.innerHTML = list.map((p) => {
+      const installed = isInstalled(p.id);
+      const badge = p.requiresKey ? `<span class="power-badge">Requires API key</span>` : "";
+      const avail = p.status === "available" ? `<span class="power-avail" title="Works in MAX now">● works now</span>` : "";
+      const initial = esc((p.name[0] || "P").toUpperCase());
+      return `
+        <div class="power-card">
+          <div class="power-card__top">
+            <div class="power-ico">${initial}</div>
+            <div class="power-meta">
+              <div class="power-name">${esc(p.name)}</div>
+              <div class="power-provider">${esc(p.provider)}</div>
+            </div>
+          </div>
+          <p class="power-blurb">${esc(p.blurb)}</p>
+          <div class="power-tags">${avail} ${badge}</div>
+          <div class="power-actions">
+            <button class="btn ${installed ? "btn--ghost" : "btn--primary"} power-install" data-id="${esc(p.id)}" type="button">${installed ? "Remove" : (p.status === "available" ? "Install" : "Get it")}</button>
+            ${p.url ? `<a class="btn btn--ghost" href="${esc(p.url)}" target="_blank" rel="noopener">Details ↗</a>` : ""}
+          </div>
+        </div>`;
+    }).join("");
+    grid.querySelectorAll(".power-install").forEach((b) => b.addEventListener("click", () => togglePower(b.dataset.id)));
+  }
+
+  /* ---------- working powers: fetch + search ---------- */
+  async function runFetchCommand(urlArg) {
+    const url = (urlArg || prompt("Fetch which URL?", "https://") || "").trim();
+    if (!url || url === "https://") return;
+    toast("Fetching page…");
+    try {
+      const res = await fetch("/api/powers/fetch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      const input = $("#input");
+      input.value = (input.value + `\n\nWeb page ${data.url}:\n"""\n${data.text}\n"""\n`).trimStart();
+      autoResize(input); updateCharCount(); updateSendState(); input.focus();
+      toast("Page added to the message", "success");
+    } catch (err) { toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error"); }
+  }
+
+  async function runSearchCommand(queryArg) {
+    const query = (queryArg || prompt("Search the web for:", "") || "").trim();
+    if (!query) return;
+    if (!getPowerKey("web-search")) { toast("Add a Web Search API key in Powers first.", "error"); openPowers(); return; }
+    toast("Searching…");
+    try {
+      const res = await fetch("/api/powers/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query, key: getPowerKey("web-search") }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      const block = [`Web search results for "${query}":`, data.answer ? `\nSummary: ${data.answer}` : "",
+        ...data.results.map((r, i) => `\n${i + 1}. ${r.title}\n${r.url}\n${(r.content || "").slice(0, 400)}`)].join("\n");
+      const input = $("#input");
+      input.value = (input.value + `\n\n${block}\n`).trimStart();
+      autoResize(input); updateCharCount(); updateSendState(); input.focus();
+      toast(`Added ${data.results.length} results`, "success");
+    } catch (err) { toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error"); }
+  }
+
+  /* ============================================================
      Voice input (Web Speech API)
      ============================================================ */
   let recognition = null;
@@ -1762,7 +1932,7 @@ a{color:#22d3ee}</style></head>
     const v = input.value;
     if (!/^\/[a-z]*$/i.test(v.trim()) || v.includes("\n")) { closeSlash(); return; }
     const q = v.trim().toLowerCase();
-    const matches = SLASH.filter((s) => s.cmd.startsWith(q));
+    const matches = SLASH.concat(powerSlashCommands()).filter((s) => s.cmd.startsWith(q));
     if (!matches.length) { closeSlash(); return; }
     if (!slashEl) {
       slashEl = document.createElement("div");
@@ -1956,6 +2126,7 @@ a{color:#22d3ee}</style></head>
       { label: "Export current chat (.md)", run: () => { const c = activeConvo(); if (c) exportConversation(c.id, "md"); } },
       { label: "Share current chat (.html)", run: () => { const c = activeConvo(); if (c) shareConversation(c.id); } },
       { label: "View request log", run: openRequestLog },
+      { label: "Open Powers (integrations)", run: openPowers },
       { label: "Open Settings", run: openSettings },
     ];
   }
@@ -2422,6 +2593,17 @@ a{color:#22d3ee}</style></head>
       }
     });
 
+    // powers modal
+    $("#powers-btn").addEventListener("click", openPowers);
+    $("#powers-close").addEventListener("click", closePowers);
+    $("#powers-overlay").addEventListener("click", (e) => { if (e.target.id === "powers-overlay") closePowers(); });
+    $("#powers-search-input").addEventListener("input", renderPowers);
+    $$(".powers-tab").forEach((t) => t.addEventListener("click", () => {
+      powersScope = t.dataset.scope;
+      $$(".powers-tab").forEach((x) => x.classList.toggle("active", x === t));
+      renderPowers();
+    }));
+
     // voice input + context basket + profiles
     $("#mic-btn").addEventListener("click", toggleVoice);
     $("#basket-chip").addEventListener("click", clearBasket);
@@ -2448,7 +2630,7 @@ a{color:#22d3ee}</style></head>
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); }
+      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") { e.preventDefault(); toggleFindBar(true); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }

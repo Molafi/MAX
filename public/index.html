@@ -88,6 +88,10 @@
           <svg class="ico-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>
           <span class="foot-btn__label">Theme</span>
         </button>
+        <button class="foot-btn" id="powers-btn" title="Powers — integrations">
+          <svg viewBox="0 0 24 24"><path d="M13 2L4.5 13.5H12l-1 8.5 8.5-11.5H12z"/></svg>
+          <span class="foot-btn__label">Powers</span>
+        </button>
         <button class="foot-btn" id="settings-btn" title="Settings">
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5V21a2 2 0 11-4 0v-.1A1.6 1.6 0 008.8 19a1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H3a2 2 0 110-4h.1A1.6 1.6 0 005 8.8a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H11a1.6 1.6 0 001-1.5V3a2 2 0 114 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V11a1.6 1.6 0 001.5 1H21a2 2 0 110 4h-.1a1.6 1.6 0 00-1.5 1z"/></svg>
           <span class="foot-btn__label">Settings</span>
@@ -384,6 +388,37 @@
       <div class="modal__foot">
         <span class="modal__note" id="settings-note"></span>
         <button class="btn btn--primary" id="settings-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ Powers modal ============================ -->
+  <div class="modal-overlay" id="powers-overlay" hidden>
+    <div class="modal modal--wide powers-modal" role="dialog" aria-modal="true" aria-labelledby="powers-title">
+      <div class="modal__head">
+        <div>
+          <h2 id="powers-title">Powers</h2>
+          <p class="powers-sub">Integrations and capabilities for MAX. Enabled powers add slash commands and abilities.</p>
+        </div>
+        <button class="icon-btn" id="powers-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="powers-tabs">
+        <button class="powers-tab active" data-scope="all" type="button">All powers</button>
+        <button class="powers-tab" data-scope="official" type="button">Official</button>
+        <button class="powers-tab" data-scope="community" type="button">Community</button>
+        <button class="powers-tab" data-scope="installed" type="button">Installed</button>
+      </div>
+      <div class="powers-body">
+        <nav class="powers-cats" id="powers-cats" aria-label="Categories"></nav>
+        <div class="powers-main">
+          <div class="search-box powers-search">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+            <input type="text" id="powers-search-input" placeholder="Search powers…" autocomplete="off" />
+          </div>
+          <div class="powers-grid" id="powers-grid"></div>
+        </div>
       </div>
     </div>
   </div>
