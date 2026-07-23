@@ -550,7 +550,8 @@
     if (repo) {
       sys += `\n\n[Working repository] The user has selected the ${repo.provider} repository ${repo.fullName} (branch ${repo.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo.fullName}.`;
       sys += `\n\n[Reading the repo] You can read this repository YOURSELF using tools — do not ask the user to paste files. Use \`list_repo_files\` to see the layout, \`search_repo\` to find files by name, and \`read_repo_file\` to read a file's contents. Always inspect the real files before answering questions about the code or proposing changes.`;
-      sys += `\n\n[Editing the repo] You can edit this repository like a coding agent using tools: \`write_file\` (create or fully overwrite a file), \`edit_file\` (replace an exact snippet — preferred for small, precise changes), and \`delete_file\`. Always read a file before editing it so your \`old_str\` matches exactly. Your changes are STAGED, not pushed automatically — MAX shows the user a diff of everything you changed and lets them commit it to a new branch and open a pull request. Make the actual edits with tools instead of pasting whole files into the chat, then briefly summarize what you changed.`;
+      sys += `\n\n[Editing the repo] You can edit this repository like a coding agent using tools: \`write_file\` (create or fully overwrite a file), \`edit_file\` (replace an exact snippet — preferred for small, precise changes), and \`delete_file\`. Always read a file before editing it so your \`old_str\` matches exactly. Make real edits with these tools instead of pasting whole files into the chat.`;
+      sys += `\n\n[Committing & pushing] Edits you make are first STAGED. When the user asks you to commit or push, call \`commit_changes\` to push them yourself: by default it pushes directly to the working branch, or pass open_pr:true to push to a new branch and open a pull request. If the user doesn't ask you to push, just leave the changes staged — they'll review the diff and commit from the UI. After editing, briefly summarize what you changed.`;
     }
     if (toolsAvailable()) {
       sys += `\n\n[Tools] You have tools available. Call them when they help (for example to read repository files or fetch a web page) instead of guessing. Keep going until you can fully answer, then give your final answer as normal text.`;
@@ -675,6 +676,7 @@
     write_file:      { icon: "✍️", verb: "Writing file" },
     edit_file:       { icon: "✏️", verb: "Editing file" },
     delete_file:     { icon: "🗑", verb: "Deleting file" },
+    commit_changes:  { icon: "🚀", verb: "Committing & pushing" },
     web_fetch:       { icon: "🌐", verb: "Fetching web page" },
     web_search:      { icon: "🔍", verb: "Searching the web" },
   };
@@ -727,6 +729,15 @@
         path: { type: "string", description: "Repository-relative path to delete." },
       }, required: ["path"] },
     },
+    commit_changes: {
+      name: "commit_changes",
+      description: "Commit and PUSH all currently staged file changes to the selected repository. By default it pushes directly to the working branch. Set open_pr:true to instead push to a new branch and open a pull request. Only call this after staging edits with write_file/edit_file/delete_file, and when the user has asked you to commit or push.",
+      input_schema: { type: "object", properties: {
+        message: { type: "string", description: "A clear commit message summarizing the change." },
+        open_pr: { type: "boolean", description: "If true, push to a new branch and open a pull request instead of committing directly to the working branch (default false)." },
+        branch: { type: "string", description: "Optional branch name to create when open_pr is true." },
+      }, required: ["message"] },
+    },
     web_fetch: {
       name: "web_fetch",
       description: "Fetch a web page and return its readable text.",
@@ -748,7 +759,7 @@
     const defs = [];
     if (activeRepo()) {
       defs.push(TOOL_DEFS.list_repo_files, TOOL_DEFS.search_repo, TOOL_DEFS.read_repo_file,
-        TOOL_DEFS.write_file, TOOL_DEFS.edit_file, TOOL_DEFS.delete_file);
+        TOOL_DEFS.write_file, TOOL_DEFS.edit_file, TOOL_DEFS.delete_file, TOOL_DEFS.commit_changes);
     }
     if (isInstalled("web-fetch") || activeRepo()) defs.push(TOOL_DEFS.web_fetch);
     if (isInstalled("web-search") && getPowerKey("web-search")) defs.push(TOOL_DEFS.web_search);
@@ -766,6 +777,7 @@
       case "write_file": return `Writing ${inp.path || "file"}`;
       case "edit_file": return `Editing ${inp.path || "file"}`;
       case "delete_file": return `Deleting ${inp.path || "file"}`;
+      case "commit_changes": return inp.open_pr ? "Pushing to a new branch & opening a PR" : "Committing & pushing changes";
       case "web_fetch": return `Fetching ${inp.url || "page"}`;
       case "web_search": return `Searching the web for "${inp.query || "…"}"`;
       default: return (TOOL_META[run.name]?.verb) || run.name;
@@ -891,6 +903,19 @@
         if (wf.deleted) return `${path} is already staged for deletion.`;
         stageDelete(path);
         return `Staged deletion of ${path}. Review & commit to apply.`;
+      }
+      case "commit_changes": {
+        const repo = activeRepo();
+        if (!repo) return "Error: no repository is selected.";
+        if (!providerHasToken(repo.provider)) return `Error: connect ${repo.provider === "gitlab" ? "GitLab" : "GitHub"} with a write-enabled token in Settings first.`;
+        const edits = pendingEditsList();
+        if (!edits.length) return "Error: there are no staged changes to commit. Stage edits first with write_file / edit_file / delete_file.";
+        const message = String(input.message || "").trim() || `MAX: update ${edits.length} file(s)`;
+        try {
+          return await runCommit(repo, edits, { message, openPr: input.open_pr === true, branch: input.branch });
+        } catch (e) {
+          return "Error committing: " + (e?.message || e);
+        }
       }
       case "web_fetch": {
         const url = String(input.url || "").trim();
@@ -2099,6 +2124,52 @@
       toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error");
       return false;
     }
+  }
+
+  // Programmatic commit+push used by the commit_changes tool, so MAX can push on
+  // its own. Either pushes straight to the working branch, or (openPr) to a new
+  // branch and opens a PR/MR. Returns a human/tool-readable summary string.
+  async function runCommit(repo, edits, { message, openPr, branch }) {
+    const token = providerToken(repo.provider) || undefined;
+    const base = repo.branch || "main";
+    const sanitize = (b) => String(b || "").trim().replace(/[^A-Za-z0-9._/-]+/g, "-").replace(/^[-/]+|[-/]+$/g, "").slice(0, 200);
+    const targetBranch = openPr ? (sanitize(branch) || `max/edit-${Date.now().toString(36).slice(-5)}`) : base;
+    const commitFiles = edits.map((e) => e.deleted ? { path: e.path, deleted: true } : { path: e.path, content: e.content });
+
+    const commitBody = { token, branch: base, newBranch: targetBranch, files: commitFiles, message };
+    if (repo.provider === "gitlab") commitBody.projectId = repo.projectId ?? repo.fullName;
+    else { commitBody.owner = repo.owner; commitBody.repo = repo.name; }
+
+    const cRes = await fetch(`/api/${repo.provider}/commit`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(commitBody),
+    });
+    const cData = await cRes.json().catch(() => ({}));
+    if (!cRes.ok) throw new Error(cData?.error?.message || `Commit failed (HTTP ${cRes.status})`);
+
+    // Drop the edits we just pushed from the staged working copy.
+    for (const e of edits) delete state.pendingEdits[e.path];
+    renderChangesChip();
+
+    const summary = `Committed ${edits.length} file(s) to ${repo.fullName} on branch "${targetBranch}" — "${message}".`;
+    if (!openPr) {
+      toast(`MAX pushed ${edits.length} change(s) to ${targetBranch}`, "success");
+      return summary + " Pushed directly to the working branch.";
+    }
+
+    // Open a PR/MR from the new branch back into the working branch.
+    const prPath = repo.provider === "gitlab" ? "mr" : "pr";
+    const prBody = { token, head: targetBranch, base, title: message, body: "Proposed by MAX." };
+    if (repo.provider === "gitlab") prBody.projectId = repo.projectId ?? repo.fullName;
+    else { prBody.owner = repo.owner; prBody.repo = repo.name; }
+    const prRes = await fetch(`/api/${repo.provider}/${prPath}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(prBody),
+    });
+    const prData = await prRes.json().catch(() => ({}));
+    if (prRes.ok && prData.url) {
+      toastLink(repo.provider === "gitlab" ? "View merge request" : "View pull request", prData.url);
+      return `${summary} Opened ${prPath.toUpperCase()}: ${prData.url}`;
+    }
+    return `${summary} (The commit succeeded, but opening the ${prPath.toUpperCase()} failed: ${prData?.error?.message || "unknown error"}.)`;
   }
 
   /* ============================================================
