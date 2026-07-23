@@ -67,7 +67,7 @@
       apiKey: "",
       model: "",
       system: "You are MAX, a helpful, friendly and concise AI assistant. Use Markdown for formatting when helpful.",
-      maxTokens: 4096,
+      maxTokens: 8192,
       temperature: 1.0,
       autonomous: false,
       autoMaxSteps: 6,
@@ -1166,7 +1166,24 @@
         throw new Error("The model returned an empty response. Try another model or prompt.");
       }
       if (!finalText.trim() && toolRuns.length) {
-        finalText = "_(MAX finished working with its tools but produced no final text.)_";
+        // The model used tools but produced no final text. This usually means it
+        // ran out of output tokens mid-tool-loop, or the last turn was all tool
+        // calls with no text follow-up. Ask it for a summary of what it found.
+        const lastResults = toolRuns.filter((r) => r.status === "done").slice(-3)
+          .map((r) => `${r.name}(${JSON.stringify(r.input || {})}) → ${(r.result || "").slice(0, 500)}`).join("\n");
+        const summaryMsg = { role: "user", content: [{ type: "text", text: "You already gathered the information above. Now give your final answer to the user based on what you found. Be concise and helpful." }] };
+        apiMessages.push(summaryMsg);
+        // One more turn without tools to force a text response.
+        const follow = await runModelTurn(apiMessages, useModel, [], stream, {
+          priorText: "",
+          toolRuns,
+        });
+        if (follow.text) {
+          finalText = follow.text;
+          usage = mergeUsage(usage, follow.usage);
+        } else {
+          finalText = "I finished reading the repository but couldn't generate a summary. This usually means the model ran out of output tokens. Try asking a more specific question, or increase Max tokens in Settings.";
+        }
       }
 
       // finalize

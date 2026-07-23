@@ -677,7 +677,7 @@ async function handleChat(req, res) {
 
   const body = {
     model,
-    max_tokens: clampInt(payload.max_tokens, 1, 64000, 4096),
+    max_tokens: clampInt(payload.max_tokens, 1, 64000, 8192),
     messages,
     stream: payload.stream !== false,
   };
