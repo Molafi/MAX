@@ -47,7 +47,7 @@
     <div class="bg-grid"></div>
   </div>
 
-  <form class="login-card" id="login-form">
+  <form class="login-card" id="login-form" method="post" action="/api/auth/login">
     <div class="login-logo">
       <svg viewBox="0 0 64 64" class="logo-svg logo-svg--xl" aria-hidden="true">
         <defs>
@@ -78,37 +78,6 @@
     <p class="login-foot">First time here? Sign in with <b>admin</b> / <b>admin</b>, then change your password.</p>
   </form>
 
-  <script>
-    (function () {
-      const form = document.getElementById("login-form");
-      const errEl = document.getElementById("login-error");
-      const btn = document.getElementById("login-btn");
-
-      // If already signed in, go straight to the app.
-      fetch("/api/auth/me").then((r) => { if (r.ok) location.replace("/"); }).catch(() => {});
-
-      form.addEventListener("submit", async (e) => {
-        e.preventDefault();
-        errEl.textContent = "";
-        btn.disabled = true; btn.textContent = "Signing in…";
-        try {
-          const res = await fetch("/api/auth/login", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              username: document.getElementById("username").value.trim(),
-              password: document.getElementById("password").value,
-            }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) throw new Error(data?.error?.message || "Sign in failed.");
-          location.replace("/");
-        } catch (err) {
-          errEl.textContent = err.message;
-          btn.disabled = false; btn.textContent = "Sign in";
-        }
-      });
-    })();
-  </script>
+  <script src="login.js" defer></script>
 </body>
 </html>
