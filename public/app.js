@@ -1208,10 +1208,26 @@
         stream.row.remove();
         renderMessages();
       } else {
+        const msg = err.message || "";
+        // Transient provider/gateway failures (e.g. new-api "panic",
+        // 5xx/overloaded/rate-limit, dropped connection). These usually succeed
+        // on a second try — retry the same request a couple of times with backoff
+        // before doing anything else, as long as nothing has been produced yet.
+        const transient = /panic|interface conversion|new-api|overloaded|temporarily|rate.?limit|too many requests|\b429\b|\b50[0-9]\b|bad gateway|gateway tim|unavailable|try again|timed? ?out|took too long|econnreset|reset by peer|eof/i.test(msg);
+        const attempt = opts.attempt || 0;
+        if (transient && attempt < 2 && !finalText.trim() && !toolRuns.length) {
+          stream.row.remove();
+          toast(`Provider hiccup — retrying (${attempt + 1}/2)…`, "");
+          state.streaming = false; state.abort = null;
+          await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+          await streamAssistant(convo, { ...opts, attempt: attempt + 1 });
+          return;
+        }
+
         // Some models/gateways don't support tool use and may error (or time out).
         // If we sent tools and got nothing back, retry once as a plain chat so the
         // user still gets an answer instead of a dead end.
-        const skipRetry = /api key|unauthorized|forbidden|\b401\b|\b403\b|no_api_key/i.test(err.message || "");
+        const skipRetry = /api key|unauthorized|forbidden|\b401\b|\b403\b|no_api_key/i.test(msg);
         if (!opts.noTools && toolDefs.length && !finalText.trim() && !toolRuns.length && !skipRetry) {
           stream.row.remove();
           toast("That model had trouble with tools — retrying without them…", "");
@@ -1219,10 +1235,13 @@
           await streamAssistant(convo, { ...opts, noTools: true });
           return;
         }
-        const isNetwork = err instanceof TypeError || /failed to fetch|networkerror|load failed|connection/i.test(err.message || "");
-        const friendly = isNetwork
-          ? "Can't reach the MAX server. Make sure it's still running (node server.js) in your terminal, then reload this page and try again."
-          : err.message;
+        const isNetwork = err instanceof TypeError || /failed to fetch|networkerror|load failed|connection/i.test(msg);
+        const isProviderPanic = /panic|interface conversion|new-api/i.test(msg);
+        const friendly = isProviderPanic
+          ? "The AI provider's gateway crashed on this request (an internal 'panic' in AgentRouter/new-api — not a MAX bug). This is usually temporary. Press Retry, switch to another model, or check your AgentRouter key/quota if it keeps happening."
+          : isNetwork
+            ? "Can't reach the MAX server. Make sure it's still running (node server.js) in your terminal, then reload this page and try again."
+            : msg;
         logRequest({ model: useModel, ok: false, status: "error", ms: Date.now() - startedAt });
         stream.bubble.classList.remove("md");
         stream.bubble.innerHTML = `<div style="color:#ff6b8a">⚠ ${esc(friendly)}</div>`;
