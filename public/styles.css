@@ -229,7 +229,9 @@ input, textarea, select { font-family: inherit; }
 }
 .icon-btn svg { width: 20px; height: 20px; }
 .icon-btn:hover { background: var(--surface-2); color: var(--text); }
-#menu-btn { display: none; }
+/* The sidebar toggle stays available on every screen size so the sidebar can
+   always be reopened after it's hidden. */
+#menu-btn { display: grid; }
 
 .model-pill {
   display: flex; align-items: center; gap: 9px; padding: 8px 14px; border-radius: 999px;
@@ -500,6 +502,25 @@ input, textarea, select { font-family: inherit; }
 .thinking-box > summary { cursor: pointer; padding: 8px 12px; font-size: 12.5px; font-weight: 600; color: var(--text-dim); user-select: none; }
 .thinking-body { padding: 0 12px 12px; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; color: var(--text-dim); max-height: 260px; overflow: auto; }
 
+/* ---------- Background tool activity (Kiro-style) ---------- */
+.tool-runs { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; }
+.tool-run { border: 1px solid var(--border); border-left: 3px solid var(--border-strong); border-radius: 10px; background: var(--surface-2); overflow: hidden; animation: msgIn .25s var(--ease); }
+.tool-run--running { border-left-color: var(--accent-2); }
+.tool-run--done { border-left-color: #34d399; }
+.tool-run--error { border-left-color: #ff6b8a; }
+.tool-run__row { display: flex; align-items: center; gap: 9px; padding: 8px 11px; font-size: 13px; }
+.tool-run__ico { font-size: 14px; line-height: 1; flex-shrink: 0; }
+.tool-run__label { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-run--running .tool-run__label { color: var(--text); }
+.tool-run__spin { width: 14px; height: 14px; border: 2px solid var(--border-strong); border-top-color: var(--accent-2); border-radius: 50%; animation: spin .7s linear infinite; flex-shrink: 0; }
+.tool-run__mark { width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 800; flex-shrink: 0; }
+.tool-run__mark--ok { color: #34d399; }
+.tool-run__mark--err { color: #ff6b8a; background: rgba(255,107,138,.14); }
+.tool-run__detail { border-top: 1px solid var(--border); }
+.tool-run__detail > summary { cursor: pointer; padding: 6px 11px; font-size: 11.5px; color: var(--text-faint); user-select: none; }
+.tool-run__detail > summary:hover { color: var(--text-dim); }
+.tool-run__detail pre { margin: 0; padding: 0 11px 10px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text-dim); max-height: 240px; overflow: auto; }
+
 /* diff view */
 .modal--wide { max-width: 900px; }
 .diff-file { border: 1px solid var(--border-strong); border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
@@ -528,6 +549,12 @@ pre.diff { margin: 0; padding: 8px 0; font-family: var(--mono); font-size: 12.5p
 /* context basket chip badge */
 .basket-chip { display: inline-flex; align-items: center; gap: 5px; width: auto; padding: 0 10px; }
 .basket-chip #basket-count { font-size: 12px; font-weight: 700; color: var(--accent-2); }
+
+/* review-changes chip: MAX has staged file edits to review + commit */
+.changes-chip { display: inline-flex; align-items: center; gap: 5px; width: auto; padding: 0 10px; border-color: rgba(52,211,153,.45); color: #34d399; }
+.changes-chip:hover { border-color: #34d399; color: #34d399; box-shadow: 0 0 0 1.5px rgba(52,211,153,.4); }
+.changes-chip svg { color: #34d399; }
+.changes-chip #changes-count { font-size: 12px; font-weight: 700; }
 
 /* mic recording state */
 #mic-btn.recording { color: var(--accent-3); animation: autopulse 1.3s ease-in-out infinite; }
