@@ -214,6 +214,10 @@ MAX ships with **login enabled by default**. On first run it creates a super adm
 - Set `SUPERADMIN_USERNAME` / `SUPERADMIN_PASSWORD` in `.env` to choose the credentials, **or**
 - leave `SUPERADMIN_PASSWORD` blank and MAX prints a generated password in the server console once.
 
+**Forgot the password (or username)?** Set `SUPERADMIN_USERNAME` and `SUPERADMIN_PASSWORD`
+in `.env` and restart — those values are authoritative and are applied on every startup
+(the account is created or its password/role reset to match), so you can't get locked out.
+
 Sign in at `/login.html`. As the super admin, open **Manage users** (the people icon by your name in
 the sidebar, or ⌘K → "Manage users") to add accounts, watch activity, enable/disable users, and reset
 passwords. Users change their own password by clicking their name in the sidebar.

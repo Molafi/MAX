@@ -360,23 +360,53 @@ function createUser({ username, password, role = "user" }) {
   return user;
 }
 
-// Bootstrap the first super admin if the store is empty.
+// Ensure a super admin exists.
+//
+// If SUPERADMIN_USERNAME/SUPERADMIN_PASSWORD are set in the environment, they are
+// AUTHORITATIVE: on every startup MAX creates that account, or resets its password,
+// role and enabled-state to match. This means you can always fix a forgotten
+// username/password just by editing .env and restarting — you can't get locked out.
+//
+// If no SUPERADMIN_PASSWORD is set and there is no super admin yet, MAX generates a
+// random password once and prints it to the console.
 function ensureSuperAdmin() {
   if (!CONFIG.auth.enabled) return;
   const store = loadUsers();
+  const username = (CONFIG.auth.superUser || "admin").trim();
+
+  if (CONFIG.auth.superPass) {
+    const { salt, hash } = hashPassword(CONFIG.auth.superPass);
+    let u = findByName(username);
+    if (u) {
+      u.username = username; // normalise casing to match .env
+      u.role = "superadmin";
+      u.disabled = false;
+      u.salt = salt; u.hash = hash;
+      u.mustChangePassword = false;
+      saveUsers();
+      BOOTSTRAP_NOTICE = `Super admin "${username}" synced from .env (username + password applied).`;
+    } else {
+      store.users.push({
+        id: crypto.randomUUID(), username, role: "superadmin", salt, hash,
+        disabled: false, createdAt: Date.now(), lastLoginAt: null, lastSeenAt: null, loginCount: 0,
+      });
+      saveUsers();
+      BOOTSTRAP_NOTICE = `Super admin "${username}" created from .env credentials.`;
+    }
+    return;
+  }
+
+  // No env password: only bootstrap once, with a generated password.
   if (store.users.some((u) => u.role === "superadmin")) return;
-  const username = CONFIG.auth.superUser || "admin";
-  const password = CONFIG.auth.superPass || crypto.randomBytes(9).toString("base64url");
+  const password = crypto.randomBytes(9).toString("base64url");
   const { salt, hash } = hashPassword(password);
   store.users.push({
     id: crypto.randomUUID(), username, role: "superadmin", salt, hash,
     disabled: false, createdAt: Date.now(), lastLoginAt: null, lastSeenAt: null, loginCount: 0,
-    mustChangePassword: !CONFIG.auth.superPass,
+    mustChangePassword: true,
   });
   saveUsers();
-  BOOTSTRAP_NOTICE = CONFIG.auth.superPass
-    ? `Super admin "${username}" ready (password from SUPERADMIN_PASSWORD).`
-    : `Super admin created → username: ${username}  password: ${password}\n│  (set SUPERADMIN_PASSWORD in .env to control this; change it after first login)`;
+  BOOTSTRAP_NOTICE = `Super admin created → username: ${username}  password: ${password}\n│  (set SUPERADMIN_USERNAME / SUPERADMIN_PASSWORD in .env to control these; change after first login)`;
 }
 let BOOTSTRAP_NOTICE = "";
 
