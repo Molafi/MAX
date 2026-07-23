@@ -82,6 +82,20 @@
 
       <nav class="conversations" id="conversation-list" aria-label="Conversation history"></nav>
 
+      <div class="account" id="account" hidden>
+        <div class="account__avatar" id="account-avatar">U</div>
+        <div class="account__info">
+          <span class="account__name" id="account-name">—</span>
+          <span class="account__role" id="account-role"></span>
+        </div>
+        <button class="icon-btn" id="admin-btn" title="Manage users" aria-label="Manage users" hidden>
+          <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+        </button>
+        <button class="icon-btn" id="logout-btn" title="Sign out" aria-label="Sign out">
+          <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+        </button>
+      </div>
+
       <div class="sidebar__foot">
         <button class="foot-btn" id="theme-btn" title="Toggle theme">
           <svg class="ico-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg>
@@ -418,6 +432,38 @@
             <input type="text" id="powers-search-input" placeholder="Search powers…" autocomplete="off" />
           </div>
           <div class="powers-grid" id="powers-grid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ Admin (user management) modal ============================ -->
+  <div class="modal-overlay" id="admin-overlay" hidden>
+    <div class="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="admin-title">
+      <div class="modal__head">
+        <div>
+          <h2 id="admin-title">User management</h2>
+          <p class="powers-sub">Add users, monitor activity, enable/disable accounts, and reset passwords.</p>
+        </div>
+        <button class="icon-btn" id="admin-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal__body">
+        <div class="admin-add">
+          <input type="text" id="admin-new-user" placeholder="username" spellcheck="false" autocomplete="off" />
+          <input type="password" id="admin-new-pass" placeholder="temp password (min 6)" autocomplete="new-password" />
+          <select id="admin-new-role">
+            <option value="user">User</option>
+            <option value="superadmin">Super admin</option>
+          </select>
+          <button class="btn btn--primary" id="admin-add-btn" type="button">Add user</button>
+        </div>
+        <div class="admin-table-wrap">
+          <table class="admin-table" id="admin-table">
+            <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Created</th><th>Last login</th><th>Logins</th><th>Actions</th></tr></thead>
+            <tbody id="admin-tbody"></tbody>
+          </table>
         </div>
       </div>
     </div>

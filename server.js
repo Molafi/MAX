@@ -13,12 +13,14 @@
 
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
+const DATA_DIR = path.join(__dirname, "data");
 
 /* ------------------------------------------------------------------ */
 /*  Minimal .env loader (no dotenv dependency)                         */
@@ -76,6 +78,13 @@ const CONFIG = {
     token: process.env.GITLAB_TOKEN || "",
     apiBase: (process.env.GITLAB_API_BASE || "https://gitlab.com/api/v4").replace(/\/+$/, ""),
     allowClientToken: (process.env.ALLOW_CLIENT_GITLAB_TOKEN || "true").toLowerCase() !== "false",
+  },
+  auth: {
+    enabled: (process.env.AUTH_ENABLED || "true").toLowerCase() !== "false",
+    superUser: process.env.SUPERADMIN_USERNAME || "admin",
+    superPass: process.env.SUPERADMIN_PASSWORD || "",
+    sessionTtlHours: parseInt(process.env.SESSION_TTL_HOURS || "168", 10), // 7 days
+    cookieName: "max_session",
   },
 };
 
@@ -270,6 +279,162 @@ function clientIp(req) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Auth: user store (JSON), scrypt hashing, HMAC session cookies      */
+/* ------------------------------------------------------------------ */
+const USERS_FILE = path.join(DATA_DIR, "users.json");
+const SECRET_FILE = path.join(DATA_DIR, ".session_secret");
+const b64url = (buf) => Buffer.from(buf).toString("base64url");
+
+function ensureDataDir() {
+  try { if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+}
+
+// Persistent HMAC secret so sessions survive restarts.
+let SESSION_SECRET = "";
+function loadSessionSecret() {
+  if (process.env.SESSION_SECRET) { SESSION_SECRET = process.env.SESSION_SECRET; return; }
+  ensureDataDir();
+  try {
+    if (existsSync(SECRET_FILE)) { SESSION_SECRET = readFileSync(SECRET_FILE, "utf8").trim(); }
+    if (!SESSION_SECRET) {
+      SESSION_SECRET = crypto.randomBytes(48).toString("hex");
+      writeFileSync(SECRET_FILE, SESSION_SECRET, { mode: 0o600 });
+    }
+  } catch {
+    SESSION_SECRET = crypto.randomBytes(48).toString("hex"); // in-memory fallback
+  }
+}
+
+let usersCache = null;
+function loadUsers() {
+  if (usersCache) return usersCache;
+  ensureDataDir();
+  try {
+    if (existsSync(USERS_FILE)) usersCache = JSON.parse(readFileSync(USERS_FILE, "utf8"));
+  } catch {}
+  if (!usersCache || !Array.isArray(usersCache.users)) usersCache = { users: [] };
+  return usersCache;
+}
+function saveUsers() {
+  ensureDataDir();
+  try { writeFileSync(USERS_FILE, JSON.stringify(usersCache, null, 2), { mode: 0o600 }); }
+  catch (err) { console.error("[MAX] Could not save users:", err.message); }
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
+  const hash = crypto.scryptSync(String(password), salt, 64).toString("hex");
+  return { salt, hash };
+}
+function verifyPassword(password, salt, hash) {
+  try {
+    const test = crypto.scryptSync(String(password), salt, 64);
+    const known = Buffer.from(hash, "hex");
+    return test.length === known.length && crypto.timingSafeEqual(test, known);
+  } catch { return false; }
+}
+
+function publicUser(u) {
+  if (!u) return null;
+  return {
+    id: u.id, username: u.username, role: u.role, disabled: !!u.disabled,
+    createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null, lastSeenAt: u.lastSeenAt || null,
+    loginCount: u.loginCount || 0, mustChangePassword: !!u.mustChangePassword,
+  };
+}
+const findUser = (id) => loadUsers().users.find((u) => u.id === id);
+const findByName = (name) => loadUsers().users.find((u) => u.username.toLowerCase() === String(name).toLowerCase());
+
+function createUser({ username, password, role = "user" }) {
+  const store = loadUsers();
+  username = String(username || "").trim();
+  if (!/^[A-Za-z0-9._-]{2,32}$/.test(username)) throw new Error("Username must be 2–32 chars (letters, numbers, . _ -).");
+  if (findByName(username)) throw new Error("That username already exists.");
+  if (String(password || "").length < 6) throw new Error("Password must be at least 6 characters.");
+  const { salt, hash } = hashPassword(password);
+  const user = {
+    id: crypto.randomUUID(), username, role: role === "superadmin" ? "superadmin" : "user",
+    salt, hash, disabled: false, createdAt: Date.now(), lastLoginAt: null, lastSeenAt: null, loginCount: 0,
+  };
+  store.users.push(user);
+  saveUsers();
+  return user;
+}
+
+// Bootstrap the first super admin if the store is empty.
+function ensureSuperAdmin() {
+  if (!CONFIG.auth.enabled) return;
+  const store = loadUsers();
+  if (store.users.some((u) => u.role === "superadmin")) return;
+  const username = CONFIG.auth.superUser || "admin";
+  const password = CONFIG.auth.superPass || crypto.randomBytes(9).toString("base64url");
+  const { salt, hash } = hashPassword(password);
+  store.users.push({
+    id: crypto.randomUUID(), username, role: "superadmin", salt, hash,
+    disabled: false, createdAt: Date.now(), lastLoginAt: null, lastSeenAt: null, loginCount: 0,
+    mustChangePassword: !CONFIG.auth.superPass,
+  });
+  saveUsers();
+  BOOTSTRAP_NOTICE = CONFIG.auth.superPass
+    ? `Super admin "${username}" ready (password from SUPERADMIN_PASSWORD).`
+    : `Super admin created → username: ${username}  password: ${password}\n│  (set SUPERADMIN_PASSWORD in .env to control this; change it after first login)`;
+}
+let BOOTSTRAP_NOTICE = "";
+
+/* ---------- session tokens (stateless, HMAC-signed) ---------- */
+function signSession(uid) {
+  const payload = b64url(JSON.stringify({ uid, exp: Date.now() + CONFIG.auth.sessionTtlHours * 3600_000 }));
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+function verifySessionToken(token) {
+  if (!token || token.indexOf(".") === -1) return null;
+  const [payload, sig] = token.split(".");
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  const a = Buffer.from(sig || ""), b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!data.exp || Date.now() > data.exp) return null;
+    return data.uid;
+  } catch { return null; }
+}
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of raw.split(";")) {
+    const i = part.indexOf("=");
+    if (i === -1) continue;
+    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+function setSessionCookie(res, token) {
+  const maxAge = CONFIG.auth.sessionTtlHours * 3600;
+  res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}`);
+}
+function clearSessionCookie(res) {
+  res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+}
+
+// Resolve the authenticated (non-disabled) user for a request, or null.
+function authUser(req) {
+  if (!CONFIG.auth.enabled) return null;
+  const token = parseCookies(req)[CONFIG.auth.cookieName];
+  const uid = verifySessionToken(token);
+  if (!uid) return null;
+  const u = findUser(uid);
+  if (!u || u.disabled) return null;
+  return u;
+}
+function touchSeen(u) {
+  if (!u) return;
+  const now = Date.now();
+  if (!u.lastSeenAt || now - u.lastSeenAt > 60_000) { u.lastSeenAt = now; saveUsers(); }
+}
+
+/* ------------------------------------------------------------------ */
 /*  /api/config                                                        */
 /* ------------------------------------------------------------------ */
 function handleConfig(req, res) {
@@ -299,7 +464,126 @@ function handleHealth(req, res) {
     node: process.version,
     hasServerKey: Boolean(CONFIG.apiKey),
     github: { hasServerToken: Boolean(CONFIG.github.token) },
+    authEnabled: CONFIG.auth.enabled,
   });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Auth + admin endpoints                                             */
+/* ------------------------------------------------------------------ */
+const loginAttempts = new Map(); // ip -> { count, resetAt }
+function loginThrottled(ip) {
+  const now = Date.now();
+  let b = loginAttempts.get(ip);
+  if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 15 * 60_000 }; loginAttempts.set(ip, b); }
+  b.count += 1;
+  return b.count > 20; // max 20 attempts / 15 min / IP
+}
+
+async function handleLogin(req, res) {
+  if (loginThrottled(clientIp(req))) {
+    return sendJson(res, 429, { error: { type: "rate_limit", message: "Too many attempts. Try again later." } });
+  }
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req, 64 * 1024)) || "{}"); } catch {}
+  const user = findByName(payload.username);
+  // Constant-ish work whether or not the user exists.
+  const ok = user && !user.disabled && verifyPassword(payload.password, user.salt, user.hash);
+  if (!ok) return sendJson(res, 401, { error: { type: "auth", message: "Invalid username or password." } });
+  user.lastLoginAt = Date.now();
+  user.lastSeenAt = Date.now();
+  user.loginCount = (user.loginCount || 0) + 1;
+  saveUsers();
+  setSessionCookie(res, signSession(user.id));
+  sendJson(res, 200, { ok: true, user: publicUser(user) });
+}
+
+function handleLogout(req, res) {
+  clearSessionCookie(res);
+  sendJson(res, 200, { ok: true });
+}
+
+function handleMe(req, res) {
+  const u = authUser(req);
+  if (!u) return sendJson(res, 401, { error: { type: "auth", message: "Not signed in." } });
+  touchSeen(u);
+  sendJson(res, 200, { user: publicUser(u) });
+}
+
+// Any signed-in user may change their OWN password.
+async function handleChangePassword(req, res) {
+  const u = authUser(req);
+  if (!u) return sendJson(res, 401, { error: { type: "auth", message: "Not signed in." } });
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req, 64 * 1024)) || "{}"); } catch {}
+  if (!verifyPassword(payload.current, u.salt, u.hash)) {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Current password is incorrect." } });
+  }
+  if (String(payload.next || "").length < 6) {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "New password must be at least 6 characters." } });
+  }
+  const { salt, hash } = hashPassword(payload.next);
+  u.salt = salt; u.hash = hash; u.mustChangePassword = false;
+  saveUsers();
+  sendJson(res, 200, { ok: true });
+}
+
+function requireAdmin(req, res) {
+  const u = authUser(req);
+  if (!u) { sendJson(res, 401, { error: { type: "auth", message: "Not signed in." } }); return null; }
+  if (u.role !== "superadmin") { sendJson(res, 403, { error: { type: "forbidden", message: "Super admin only." } }); return null; }
+  return u;
+}
+
+function handleAdminList(req, res) {
+  const admin = requireAdmin(req, res); if (!admin) return;
+  sendJson(res, 200, { ok: true, users: loadUsers().users.map(publicUser) });
+}
+
+async function handleAdminCreate(req, res) {
+  const admin = requireAdmin(req, res); if (!admin) return;
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req, 64 * 1024)) || "{}"); } catch {}
+  try {
+    const u = createUser({ username: payload.username, password: payload.password, role: payload.role });
+    sendJson(res, 200, { ok: true, user: publicUser(u) });
+  } catch (err) {
+    sendJson(res, 400, { error: { type: "bad_request", message: err.message } });
+  }
+}
+
+// enable/disable/reset-password/delete on a target user
+async function handleAdminUpdate(req, res, id, action) {
+  const admin = requireAdmin(req, res); if (!admin) return;
+  const target = findUser(id);
+  if (!target) return sendJson(res, 404, { error: { type: "not_found", message: "User not found." } });
+
+  if (action === "disable" || action === "enable") {
+    if (target.id === admin.id) return sendJson(res, 400, { error: { type: "bad_request", message: "You can't disable your own account." } });
+    target.disabled = action === "disable";
+    saveUsers();
+    return sendJson(res, 200, { ok: true, user: publicUser(target) });
+  }
+  if (action === "reset") {
+    let payload = {};
+    try { payload = JSON.parse((await readBody(req, 64 * 1024)) || "{}"); } catch {}
+    const next = String(payload.password || "");
+    if (next.length < 6) return sendJson(res, 400, { error: { type: "bad_request", message: "Password must be at least 6 characters." } });
+    const { salt, hash } = hashPassword(next);
+    target.salt = salt; target.hash = hash; target.mustChangePassword = true;
+    saveUsers();
+    return sendJson(res, 200, { ok: true, user: publicUser(target) });
+  }
+  if (action === "delete") {
+    if (target.id === admin.id) return sendJson(res, 400, { error: { type: "bad_request", message: "You can't delete your own account." } });
+    if (target.role === "superadmin" && loadUsers().users.filter((u) => u.role === "superadmin").length <= 1) {
+      return sendJson(res, 400, { error: { type: "bad_request", message: "Can't delete the last super admin." } });
+    }
+    usersCache.users = usersCache.users.filter((u) => u.id !== id);
+    saveUsers();
+    return sendJson(res, 200, { ok: true });
+  }
+  sendJson(res, 400, { error: { type: "bad_request", message: "Unknown action." } });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1209,11 +1493,45 @@ const server = http.createServer(async (req, res) => {
   const { pathname } = new URL(req.url, "http://x");
 
   try {
-    if (pathname === "/api/config" && req.method === "GET") {
-      return handleConfig(req, res);
-    }
+    // ---- Auth routes (always open) ----
     if (pathname === "/api/health" && req.method === "GET") {
       return handleHealth(req, res);
+    }
+    if (pathname === "/api/auth/login" && req.method === "POST") {
+      return await handleLogin(req, res);
+    }
+    if (pathname === "/api/auth/logout" && req.method === "POST") {
+      return handleLogout(req, res);
+    }
+    if (pathname === "/api/auth/me" && req.method === "GET") {
+      return handleMe(req, res);
+    }
+    if (pathname === "/api/auth/password" && req.method === "POST") {
+      return await handleChangePassword(req, res);
+    }
+
+    // ---- Gate every other /api/* behind a valid session ----
+    if (CONFIG.auth.enabled && pathname.startsWith("/api/") && !authUser(req)) {
+      return sendJson(res, 401, { error: { type: "auth", message: "Sign in required." } });
+    }
+
+    // ---- Admin (super admin only) ----
+    if (pathname === "/api/admin/users" && req.method === "GET") {
+      return handleAdminList(req, res);
+    }
+    if (pathname === "/api/admin/users" && req.method === "POST") {
+      return await handleAdminCreate(req, res);
+    }
+    let am;
+    if ((am = pathname.match(/^\/api\/admin\/users\/([^/]+)\/(disable|enable|reset)$/)) && req.method === "POST") {
+      return await handleAdminUpdate(req, res, decodeURIComponent(am[1]), am[2]);
+    }
+    if ((am = pathname.match(/^\/api\/admin\/users\/([^/]+)$/)) && req.method === "DELETE") {
+      return await handleAdminUpdate(req, res, decodeURIComponent(am[1]), "delete");
+    }
+
+    if (pathname === "/api/config" && req.method === "GET") {
+      return handleConfig(req, res);
     }
     if (pathname === "/api/chat" && req.method === "POST") {
       return await handleChat(req, res);
@@ -1301,6 +1619,12 @@ process.on("unhandledRejection", (reason) => {
   console.error("[MAX] unhandledRejection (kept alive):", reason);
 });
 
+// Initialise auth before accepting traffic.
+if (CONFIG.auth.enabled) {
+  loadSessionSecret();
+  ensureSuperAdmin();
+}
+
 server.listen(CONFIG.port, CONFIG.host, () => {
   const line = "─".repeat(52);
   console.log(`\n┌${line}┐`);
@@ -1313,5 +1637,10 @@ server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`│  Rate limit     : ${CONFIG.rateLimitPerMin || "off"} req/min per IP`);
   console.log(`│  Timeout        : ${CONFIG.upstreamTimeoutMs} ms`);
   console.log(`│  GitHub token   : ${CONFIG.github.token ? "loaded ✓" : "not set (add in Settings, or .env)"}`);
+  console.log(`│  Auth           : ${CONFIG.auth.enabled ? "ENABLED (login required)" : "disabled"}`);
+  if (BOOTSTRAP_NOTICE) {
+    console.log(`│`);
+    for (const l of BOOTSTRAP_NOTICE.split("\n")) console.log(`│  ${l}`);
+  }
   console.log(`└${line}┘\n`);
 });

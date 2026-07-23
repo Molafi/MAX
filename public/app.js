@@ -10,10 +10,25 @@
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-  const SESSION_KEY = "max.apiKey.session.v1";
-  const GH_SESSION_KEY = "max.ghToken.session.v1";
-  const GL_SESSION_KEY = "max.glToken.session.v1";
+  // Storage keys are namespaced per signed-in user (so multiple accounts on one
+  // browser stay isolated). applyScope() sets the prefix once we know the user.
+  let SCOPE = "";
+  let SESSION_KEY = "max.apiKey.session.v1";
+  let GH_SESSION_KEY = "max.ghToken.session.v1";
+  let GL_SESSION_KEY = "max.glToken.session.v1";
   const DONE_MARKER = "[[MAX_DONE]]";
+
+  function applyScope(uid) {
+    if (!uid) return;
+    SCOPE = "u_" + uid + ".";
+    SESSION_KEY = SCOPE + "max.apiKey.session.v1";
+    GH_SESSION_KEY = SCOPE + "max.ghToken.session.v1";
+    GL_SESSION_KEY = SCOPE + "max.glToken.session.v1";
+    LS.convos = SCOPE + "max.conversations.v1";
+    LS.settings = SCOPE + "max.settings.v1";
+    LS.active = SCOPE + "max.active.v1";
+    // theme stays global across accounts on the same browser
+  }
 
   // Rough per-model pricing (USD per 1M tokens) for the running cost estimate.
   const PRICING = {
@@ -75,6 +90,7 @@
     autoStop: false,
     autoRunning: false,
     basket: [], // staged repo files: {path, content}
+    user: null, // signed-in user (when auth is enabled)
   };
 
   const githubDefaults = () => ({ token: "", owner: "", repo: "", branch: "main", pathPrefix: "max-chats" });
@@ -1688,7 +1704,7 @@ a{color:#22d3ee}</style></head>
      Powers (integrations gallery)
      ============================================================ */
   let powersCatalog = null;         // { categories, powers }
-  const powerKeyName = (id) => `max.powerKey.${id}.v1`;
+  const powerKeyName = (id) => `${SCOPE}max.powerKey.${id}.v1`;
   const isInstalled = (id) => state.settings.powers.installed.includes(id);
   const powerById = (id) => (powersCatalog?.powers || []).find((p) => p.id === id);
   const getPowerKey = (id) => { try { return sessionStorage.getItem(powerKeyName(id)) || ""; } catch { return ""; } };
@@ -1837,6 +1853,126 @@ a{color:#22d3ee}</style></head>
   }
 
   /* ============================================================
+     Account + admin (user management)
+     ============================================================ */
+  function renderAccount() {
+    const box = $("#account");
+    if (!box) return;
+    if (!state.user) { box.hidden = true; return; }
+    box.hidden = false;
+    $("#account-avatar").textContent = (state.user.username[0] || "U").toUpperCase();
+    $("#account-name").textContent = state.user.username;
+    $("#account-role").textContent = state.user.role === "superadmin" ? "Super admin" : "User";
+    $("#admin-btn").hidden = state.user.role !== "superadmin";
+    if (state.user.mustChangePassword) {
+      setTimeout(() => toast("Please change your temporary password (Account → change password).", ""), 900);
+    }
+  }
+
+  async function logout() {
+    try { await fetch("/api/auth/logout", { method: "POST" }); } catch {}
+    location.replace("/login.html");
+  }
+
+  async function changeOwnPassword() {
+    const current = prompt("Current password:");
+    if (current == null) return;
+    const next = prompt("New password (min 6 chars):");
+    if (!next) return;
+    try {
+      const res = await fetch("/api/auth/password", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ current, next }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || "Could not change password.");
+      toast("Password changed", "success");
+    } catch (err) { toast(err.message, "error"); }
+  }
+
+  function fmtDate(ts) { return ts ? new Date(ts).toLocaleString() : "—"; }
+
+  async function openAdmin() {
+    $("#admin-overlay").hidden = false;
+    await renderAdminUsers();
+  }
+  function closeAdmin() { $("#admin-overlay").hidden = true; }
+
+  async function renderAdminUsers() {
+    const tb = $("#admin-tbody");
+    tb.innerHTML = `<tr><td colspan="7"><div class="repo-spinner"></div></td></tr>`;
+    try {
+      const res = await fetch("/api/admin/users");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      const me = state.user?.id;
+      tb.innerHTML = data.users.map((u) => {
+        const isSelf = u.id === me;
+        const status = u.disabled
+          ? `<span class="badge-off">Disabled</span>`
+          : `<span class="badge-on">Active</span>`;
+        const roleTag = u.role === "superadmin" ? `<span class="role-super">super admin</span>` : "user";
+        const actions = [
+          !isSelf ? `<button class="mini-btn" data-act="${u.disabled ? "enable" : "disable"}" data-id="${esc(u.id)}">${u.disabled ? "Enable" : "Disable"}</button>` : "",
+          `<button class="mini-btn" data-act="reset" data-id="${esc(u.id)}">Reset pw</button>`,
+          !isSelf ? `<button class="mini-btn mini-btn--danger" data-act="delete" data-id="${esc(u.id)}">Delete</button>` : "",
+        ].join("");
+        return `<tr>
+          <td><b>${esc(u.username)}</b>${isSelf ? ' <span class="you-tag">you</span>' : ""}</td>
+          <td>${roleTag}</td>
+          <td>${status}</td>
+          <td>${fmtDate(u.createdAt)}</td>
+          <td>${fmtDate(u.lastLoginAt)}</td>
+          <td>${u.loginCount || 0}</td>
+          <td class="admin-actions">${actions}</td>
+        </tr>`;
+      }).join("");
+      tb.querySelectorAll("button[data-act]").forEach((b) => b.addEventListener("click", () => adminAction(b.dataset.act, b.dataset.id)));
+    } catch (err) {
+      tb.innerHTML = `<tr><td colspan="7" style="color:#ff6b8a;padding:16px">✗ ${esc(err.message)}</td></tr>`;
+    }
+  }
+
+  async function adminAction(action, id) {
+    try {
+      let opts = { method: "POST", headers: { "Content-Type": "application/json" } };
+      let url = `/api/admin/users/${encodeURIComponent(id)}/${action}`;
+      if (action === "reset") {
+        const pw = prompt("New temporary password (min 6 chars):");
+        if (!pw) return;
+        opts.body = JSON.stringify({ password: pw });
+      } else if (action === "delete") {
+        if (!confirm("Delete this user? This cannot be undone.")) return;
+        url = `/api/admin/users/${encodeURIComponent(id)}`;
+        opts = { method: "DELETE" };
+      }
+      const res = await fetch(url, opts);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      toast(action === "reset" ? "Password reset ✓" : action === "delete" ? "User deleted" : `User ${action}d`, "success");
+      renderAdminUsers();
+    } catch (err) { toast(err.message, "error"); }
+  }
+
+  async function adminAddUser() {
+    const username = $("#admin-new-user").value.trim();
+    const password = $("#admin-new-pass").value;
+    const role = $("#admin-new-role").value;
+    if (!username || !password) { toast("Enter a username and temp password.", "error"); return; }
+    try {
+      const res = await fetch("/api/admin/users", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password, role }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      $("#admin-new-user").value = ""; $("#admin-new-pass").value = "";
+      toast(`Added ${username}`, "success");
+      renderAdminUsers();
+    } catch (err) { toast(err.message, "error"); }
+  }
+
+  /* ============================================================
      Voice input (Web Speech API)
      ============================================================ */
   let recognition = null;
@@ -1953,7 +2089,7 @@ a{color:#22d3ee}</style></head>
   /* ============================================================
      API profiles
      ============================================================ */
-  const profileKeyName = (id) => `max.profileKey.${id}.v1`;
+  const profileKeyName = (id) => `${SCOPE}max.profileKey.${id}.v1`;
   function renderProfiles() {
     const box = $("#profile-list");
     if (!box) return;
@@ -2128,6 +2264,9 @@ a{color:#22d3ee}</style></head>
       { label: "View request log", run: openRequestLog },
       { label: "Open Powers (integrations)", run: openPowers },
       { label: "Open Settings", run: openSettings },
+      ...(state.user ? [{ label: "Change my password", run: changeOwnPassword }] : []),
+      ...(state.user?.role === "superadmin" ? [{ label: "Manage users (admin)", run: openAdmin }] : []),
+      ...(state.user ? [{ label: "Sign out", run: logout }] : []),
     ];
   }
   function openPalette() {
@@ -2593,6 +2732,14 @@ a{color:#22d3ee}</style></head>
       }
     });
 
+    // account + admin
+    $("#logout-btn").addEventListener("click", logout);
+    $("#account-name").addEventListener("click", changeOwnPassword);
+    $("#admin-btn").addEventListener("click", openAdmin);
+    $("#admin-close").addEventListener("click", closeAdmin);
+    $("#admin-overlay").addEventListener("click", (e) => { if (e.target.id === "admin-overlay") closeAdmin(); });
+    $("#admin-add-btn").addEventListener("click", adminAddUser);
+
     // powers modal
     $("#powers-btn").addEventListener("click", openPowers);
     $("#powers-close").addEventListener("click", closePowers);
@@ -2630,7 +2777,7 @@ a{color:#22d3ee}</style></head>
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); }
+      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); closeAdmin(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") { e.preventDefault(); toggleFindBar(true); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }
@@ -2665,6 +2812,20 @@ a{color:#22d3ee}</style></head>
     // theme first (avoid flash)
     applyTheme(localStorage.getItem(LS.theme) || "dark");
 
+    // ---- Auth gate: if auth is enabled and we're not signed in, go to login ----
+    let authEnabled = true;
+    try {
+      const h = await fetch("/api/health");
+      if (h.ok) authEnabled = (await h.json()).authEnabled !== false;
+    } catch { authEnabled = false; } // server unreachable — let the app surface the error later
+    if (authEnabled) {
+      try {
+        const r = await fetch("/api/auth/me");
+        if (r.ok) { state.user = (await r.json()).user; applyScope(state.user.id); }
+        else { location.replace("/login.html"); return; }
+      } catch { location.replace("/login.html"); return; }
+    }
+
     loadState();
 
     // fetch server config
@@ -2690,6 +2851,7 @@ a{color:#22d3ee}</style></head>
     // ensure there is an active conversation reference (but don't force-create)
     if (state.activeId && !activeConvo()) state.activeId = state.conversations[0]?.id || null;
 
+    renderAccount();
     updateModelPill();
     updateKeyStatus();
     updateAutoPill();

@@ -3,6 +3,9 @@
 .env.local
 *.key
 
+# Auth data (users, session secret) — never commit
+data/
+
 # Node
 node_modules/
 npm-debug.log*

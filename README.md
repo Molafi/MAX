@@ -57,6 +57,13 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 - **Context basket** — stage multiple repo files and send them together
 - **Summarize the repo** from its file tree (`/summarize` or the palette)
 
+**Accounts & administration**
+- **Login page** with secure sessions (scrypt‑hashed passwords, HMAC‑signed httpOnly cookies)
+- A **super admin** who can **add users, monitor them** (created / last login / login count / status),
+  **enable or disable** accounts, **reset passwords**, and delete users — all from an in‑app panel
+- Each user's chats are **isolated per account** in the browser; **logout** and **change‑password** built in
+- Disable auth entirely with `AUTH_ENABLED=false` for single‑user local use
+
 **Powers (integrations gallery)**
 - A browsable, searchable catalog (All / Official / Community tabs, category sidebar) — open it
   from the sidebar **Powers** button or the command palette
@@ -199,6 +206,22 @@ reaches the step limit, or when you press **Stop**. Adjust the step cap in Setti
 
 > Your token is sent to the local MAX server only to make the GitHub call; it is
 > kept in `sessionStorage` (cleared when you close the tab), never in `localStorage`.
+
+## 🔐 Accounts & the super admin
+
+MAX ships with **login enabled by default**. On first run it creates a super admin:
+
+- Set `SUPERADMIN_USERNAME` / `SUPERADMIN_PASSWORD` in `.env` to choose the credentials, **or**
+- leave `SUPERADMIN_PASSWORD` blank and MAX prints a generated password in the server console once.
+
+Sign in at `/login.html`. As the super admin, open **Manage users** (the people icon by your name in
+the sidebar, or ⌘K → "Manage users") to add accounts, watch activity, enable/disable users, and reset
+passwords. Users change their own password by clicking their name in the sidebar.
+
+Prefer the old single‑user experience? Set `AUTH_ENABLED=false` and there's no login at all.
+
+> User records and the session secret live in `./data/` (gitignored). Passwords are scrypt‑hashed;
+> sessions are HMAC‑signed httpOnly cookies. Run behind HTTPS in production.
 
 ## 🛠️ Troubleshooting
 
