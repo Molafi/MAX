@@ -83,6 +83,11 @@ const CONFIG = {
     enabled: (process.env.AUTH_ENABLED || "true").toLowerCase() !== "false",
     superUser: process.env.SUPERADMIN_USERNAME || "admin",
     superPass: process.env.SUPERADMIN_PASSWORD || "",
+    // Known default password used to bootstrap the very first super admin when
+    // SUPERADMIN_PASSWORD is left blank. It is applied ONLY on first creation
+    // (never authoritatively re-applied), so you can sign in immediately and then
+    // change it — your new password will stick across restarts.
+    superDefaultPass: process.env.SUPERADMIN_DEFAULT_PASSWORD || "admin",
     sessionTtlHours: parseInt(process.env.SESSION_TTL_HOURS || "168", 10), // 7 days
     cookieName: "max_session",
   },
@@ -396,9 +401,12 @@ function ensureSuperAdmin() {
     return;
   }
 
-  // No env password: only bootstrap once, with a generated password.
+  // No env password: only bootstrap once, with a KNOWN default password so you
+  // can always sign in on a fresh install without hunting through the console.
+  // This is applied once only, and you're asked to change it after first login —
+  // whatever you change it to then persists across restarts.
   if (store.users.some((u) => u.role === "superadmin")) return;
-  const password = crypto.randomBytes(9).toString("base64url");
+  const password = CONFIG.auth.superDefaultPass || "admin";
   const { salt, hash } = hashPassword(password);
   store.users.push({
     id: crypto.randomUUID(), username, role: "superadmin", salt, hash,
@@ -406,7 +414,7 @@ function ensureSuperAdmin() {
     mustChangePassword: true,
   });
   saveUsers();
-  BOOTSTRAP_NOTICE = `Super admin created → username: ${username}  password: ${password}\n│  (set SUPERADMIN_USERNAME / SUPERADMIN_PASSWORD in .env to control these; change after first login)`;
+  BOOTSTRAP_NOTICE = `Super admin ready → username: ${username}  password: ${password}\n│  (default login — change it after signing in; set SUPERADMIN_USERNAME / SUPERADMIN_PASSWORD in .env to override)`;
 }
 let BOOTSTRAP_NOTICE = "";
 
@@ -675,6 +683,16 @@ async function handleChat(req, res) {
   if (payload.temperature !== undefined && payload.temperature !== null) {
     body.temperature = clampFloat(payload.temperature, 0, 1, 1);
   }
+  // Agentic tool use: forward a sanitized tools list (and optional tool_choice)
+  // so the model can call MAX's read/search capabilities. The browser executes
+  // the tools and sends results back as tool_result blocks on the next turn.
+  const tools = sanitizeTools(payload.tools);
+  if (tools) {
+    body.tools = tools;
+    if (payload.tool_choice && typeof payload.tool_choice === "object") {
+      body.tool_choice = payload.tool_choice;
+    }
+  }
 
   const upstreamUrl = `${CONFIG.baseUrl}/v1/messages`;
 
@@ -682,10 +700,19 @@ async function handleChat(req, res) {
   // body finishes. The request `close` event can fire before fetch starts.
   const controller = new AbortController();
   let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, Math.max(1_000, CONFIG.upstreamTimeoutMs));
+  // This is an INACTIVITY timeout, not a hard total cap: it fires only if we go
+  // `upstreamTimeoutMs` with no progress. We re-arm it on every streamed chunk,
+  // so long but healthy responses (and multi-step agentic runs) aren't killed.
+  const idleMs = Math.max(1_000, CONFIG.upstreamTimeoutMs);
+  let timeout = null;
+  const armTimeout = () => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, idleMs);
+  };
+  armTimeout();
   const abortOnDisconnect = () => {
     if (!res.writableEnded) controller.abort();
   };
@@ -793,6 +820,7 @@ async function handleChat(req, res) {
       const { done, value } = await reader.read();
       if (done) break;
       if (res.writableEnded || res.destroyed) break; // client went away
+      armTimeout(); // healthy progress → reset the inactivity timer
       // value is a Uint8Array chunk of the SSE stream
       res.write(Buffer.from(value));
     }
@@ -819,10 +847,34 @@ function isValidMessage(message) {
   return message.content.every((block) => {
     if (!block || typeof block !== "object") return false;
     if (block.type === "text") return typeof block.text === "string";
+    // Agentic tool-use blocks (assistant) and their results (user).
+    if (block.type === "tool_use") {
+      return typeof block.id === "string" && typeof block.name === "string" &&
+        block.input !== undefined && block.input !== null;
+    }
+    if (block.type === "tool_result") {
+      return typeof block.tool_use_id === "string";
+    }
     return block.type === "image" && block.source?.type === "base64" &&
       ALLOWED_IMAGE_TYPES.has(block.source.media_type) && typeof block.source.data === "string" &&
       block.source.data.length > 0;
   });
+}
+
+// Validate + trim a tools array coming from the browser. Only the fields the
+// Anthropic Messages API expects are forwarded; anything malformed is dropped.
+function sanitizeTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return null;
+  const out = [];
+  for (const t of tools.slice(0, 32)) {
+    if (!t || typeof t.name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(t.name)) continue;
+    const schema = t.input_schema && typeof t.input_schema === "object"
+      ? t.input_schema : { type: "object", properties: {} };
+    const tool = { name: t.name, input_schema: schema };
+    if (typeof t.description === "string") tool.description = t.description.slice(0, 4000);
+    out.push(tool);
+  }
+  return out.length ? out : null;
 }
 
 function clampInt(v, min, max, dflt) {
@@ -845,14 +897,17 @@ function mapStatusType(status) {
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Sanitize + validate a set of {path, content} file edits for committing.
+// Sanitize + validate a set of file edits for committing. Each entry is either
+// a write { path, content } or a deletion { path, deleted:true }.
 function normalizeFiles(files) {
   if (!Array.isArray(files) || !files.length) return null;
   const out = [];
   for (const f of files) {
-    if (!f || typeof f.path !== "string" || typeof f.content !== "string") return null;
+    if (!f || typeof f.path !== "string") return null;
     const p = sanitizeRepoPath(f.path);
     if (!p) return null;
+    if (f.deleted === true) { out.push({ path: p, deleted: true }); continue; }
+    if (typeof f.content !== "string") return null;
     if (Buffer.byteLength(f.content, "utf8") > MAX_FILE_BYTES) return null;
     out.push({ path: p, content: f.content });
   }
@@ -954,9 +1009,24 @@ async function githubApi(token, method, apiPath, body) {
 }
 
 function ghError(res, resp, fallback) {
-  const message = resp?.json?.message || resp?.text || fallback || "GitHub request failed";
-  return sendJson(res, resp?.status || 502, {
-    error: { type: mapStatusType(resp?.status || 502), status: resp?.status, message },
+  let message = resp?.json?.message || resp?.text || fallback || "GitHub request failed";
+  const status = resp?.status || 502;
+  // GitHub returns this generic 403 when a fine-grained token is missing the
+  // right permission or the repo isn't in its allowed list. Give real guidance.
+  if (/resource not accessible by (personal access token|integration)/i.test(message) ||
+      (status === 403 && /not accessible/i.test(message))) {
+    message =
+      "GitHub blocked this token (\"Resource not accessible by personal access token\"). " +
+      "Your token is missing repository access. Fix it by creating a token that can read the repo:\n" +
+      "• Classic token: enable the \"repo\" scope.\n" +
+      "• Fine-grained token: under \"Repository access\" select this repository, and grant " +
+      "\"Contents: Read and write\" (plus \"Pull requests: Read and write\" if you want PRs).\n" +
+      "Then paste the new token in Settings → GitHub and try again.";
+  } else if (status === 401) {
+    message = "GitHub rejected the token (401). It may be invalid or expired — generate a new one and paste it in Settings → GitHub.";
+  }
+  return sendJson(res, status, {
+    error: { type: mapStatusType(status), status, message },
   });
 }
 
@@ -1315,7 +1385,7 @@ async function handleGithubCommit(req, res) {
       }
     }
 
-    // Commit each file to the working branch.
+    // Commit each file to the working branch (writes and deletions).
     const committed = [];
     for (const f of files) {
       const enc = f.path.split("/").map(encodeURIComponent).join("/");
@@ -1323,6 +1393,16 @@ async function handleGithubCommit(req, res) {
       let sha;
       const ex = await githubApi(gh.token, "GET", `${cbase}?ref=${encodeURIComponent(newBranch)}`);
       if (ex.ok && ex.json && !Array.isArray(ex.json)) sha = ex.json.sha;
+
+      if (f.deleted) {
+        // Nothing to delete if it doesn't exist on the branch — skip quietly.
+        if (!sha) { committed.push({ path: f.path, deleted: true, skipped: true }); continue; }
+        const del = await githubApi(gh.token, "DELETE", cbase, { message, branch: newBranch, sha });
+        if (!del.ok) return ghError(res, del, `Failed to delete ${f.path}.`);
+        committed.push({ path: f.path, deleted: true });
+        continue;
+      }
+
       const put = await githubApi(gh.token, "PUT", cbase, {
         message, branch: newBranch, content: Buffer.from(f.content, "utf8").toString("base64"), ...(sha ? { sha } : {}),
       });
@@ -1373,12 +1453,17 @@ async function handleGitlabCommit(req, res) {
   const proj = `/projects/${glProjectPath(gl.projectId)}`;
 
   try {
-    // Decide create vs update for each file by checking existence on the base branch.
+    // Decide create/update/delete for each file by checking existence on the base branch.
     const actions = [];
     for (const f of files) {
       const head = await gitlabApi(gl.token, "GET", `${proj}/repository/files/${encodeURIComponent(f.path)}?ref=${encodeURIComponent(base)}`);
+      if (f.deleted) {
+        if (head.ok) actions.push({ action: "delete", file_path: f.path }); // skip if it doesn't exist
+        continue;
+      }
       actions.push({ action: head.ok ? "update" : "create", file_path: f.path, content: f.content });
     }
+    if (!actions.length) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to commit (files may not exist on the base branch)." } });
     const commit = await gitlabApi(gl.token, "POST", `${proj}/repository/commits`, {
       branch: newBranch, start_branch: base, commit_message: message, actions,
     });

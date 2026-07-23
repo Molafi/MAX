@@ -90,6 +90,7 @@
     autoStop: false,
     autoRunning: false,
     basket: [], // staged repo files: {path, content}
+    pendingEdits: {}, // staged repo edits by path: {content, deleted, isNew, original}
     user: null, // signed-in user (when auth is enabled)
   };
 
@@ -356,7 +357,8 @@
       const think = m.thinking
         ? `<details class="thinking-box"><summary>Thinking…</summary><div class="thinking-body">${esc(m.thinking)}</div></details>`
         : "";
-      bubble.innerHTML = think + renderMarkdown(m.content);
+      const tools = m.toolRuns && m.toolRuns.length ? toolRunsHtml(m.toolRuns) : "";
+      bubble.innerHTML = think + tools + renderMarkdown(m.content);
       enhanceContent(bubble);
     } else {
       // user: show images + text (escaped, preserve newlines)
@@ -414,7 +416,8 @@
       speakBtn.addEventListener("click", () => speak(m.content));
       actions.appendChild(speakBtn);
 
-      const edits = parseEdits(m.content);
+      // Prefer edits MAX staged via tools; fall back to parsing path= code blocks.
+      const edits = (Array.isArray(m.stagedEdits) && m.stagedEdits.length) ? m.stagedEdits : parseEdits(m.content);
       if (edits.length && activeRepo()) {
         const reviewBtn = actionBtn("review", `<path d="M20 6L9 17l-5-5"/>`, `Review ${edits.length} change${edits.length > 1 ? "s" : ""}`);
         reviewBtn.classList.add("msg-action--accent");
@@ -462,6 +465,19 @@
           ? `<details class="thinking-box" open><summary>Thinking…</summary><div class="thinking-body">${esc(thinking)}</div></details>`
           : "";
         this.bubble.innerHTML = think + renderMarkdown(text) + (withCursor ? '<span class="cursor-blink"></span>' : "");
+        enhanceContent(this.bubble);
+      },
+      // Like setText, but also renders the live tool-activity cards above the text.
+      setAgent(text, withCursor, thinking, toolRuns) {
+        const think = thinking
+          ? `<details class="thinking-box" open><summary>Thinking…</summary><div class="thinking-body">${esc(thinking)}</div></details>`
+          : "";
+        const tools = toolRunsHtml(toolRuns);
+        const textHtml = text
+          ? renderMarkdown(text)
+          : (tools ? "" : `<div class="typing"><span></span><span></span><span></span></div>`);
+        const cursor = (withCursor && text) ? '<span class="cursor-blink"></span>' : "";
+        this.bubble.innerHTML = think + tools + textHtml + cursor;
         enhanceContent(this.bubble);
       },
     };
@@ -533,7 +549,11 @@
     const repo = activeRepo();
     if (repo) {
       sys += `\n\n[Working repository] The user has selected the ${repo.provider} repository ${repo.fullName} (branch ${repo.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo.fullName}.`;
-      sys += `\n\n[Editing files] When you want to change or create files, output each file as a fenced code block whose opening fence includes a path attribute, exactly like:\n\`\`\`js path=src/example.js\n<the COMPLETE new contents of the file>\n\`\`\`\nAlways include the full file content (not a diff), one block per file. MAX shows the user a diff and lets them commit these to a branch and open a pull request. Only use this format for real file changes.`;
+      sys += `\n\n[Reading the repo] You can read this repository YOURSELF using tools — do not ask the user to paste files. Use \`list_repo_files\` to see the layout, \`search_repo\` to find files by name, and \`read_repo_file\` to read a file's contents. Always inspect the real files before answering questions about the code or proposing changes.`;
+      sys += `\n\n[Editing the repo] You can edit this repository like a coding agent using tools: \`write_file\` (create or fully overwrite a file), \`edit_file\` (replace an exact snippet — preferred for small, precise changes), and \`delete_file\`. Always read a file before editing it so your \`old_str\` matches exactly. Your changes are STAGED, not pushed automatically — MAX shows the user a diff of everything you changed and lets them commit it to a new branch and open a pull request. Make the actual edits with tools instead of pasting whole files into the chat, then briefly summarize what you changed.`;
+    }
+    if (toolsAvailable()) {
+      sys += `\n\n[Tools] You have tools available. Call them when they help (for example to read repository files or fetch a web page) instead of guessing. Keep going until you can fully answer, then give your final answer as normal text.`;
     }
     sys += powersSystemNote();
     if (state.settings.autonomous) {
@@ -644,131 +664,535 @@
     }
   }
 
+  /* ============================================================
+     Agentic tools — MAX reads the repo / web itself, Kiro-style
+     ============================================================ */
+  // Human-readable metadata for the background "tool activity" cards.
+  const TOOL_META = {
+    list_repo_files: { icon: "🗂", verb: "Listing repository files" },
+    search_repo:     { icon: "🔎", verb: "Searching the repository" },
+    read_repo_file:  { icon: "📄", verb: "Reading file" },
+    write_file:      { icon: "✍️", verb: "Writing file" },
+    edit_file:       { icon: "✏️", verb: "Editing file" },
+    delete_file:     { icon: "🗑", verb: "Deleting file" },
+    web_fetch:       { icon: "🌐", verb: "Fetching web page" },
+    web_search:      { icon: "🔍", verb: "Searching the web" },
+  };
+
+  // Tool definitions advertised to the model (Anthropic tool schema).
+  const TOOL_DEFS = {
+    list_repo_files: {
+      name: "list_repo_files",
+      description: "List file paths in the currently selected repository. Call this first to understand the project layout.",
+      input_schema: { type: "object", properties: {
+        filter: { type: "string", description: "Optional substring to filter paths (e.g. 'src/' or '.js')." },
+      } },
+    },
+    search_repo: {
+      name: "search_repo",
+      description: "Find files in the selected repository whose path matches a query string.",
+      input_schema: { type: "object", properties: {
+        query: { type: "string", description: "Text to match against file paths." },
+      }, required: ["query"] },
+    },
+    read_repo_file: {
+      name: "read_repo_file",
+      description: "Read the full text contents of a file in the selected repository. Reflects any changes you've already staged this session.",
+      input_schema: { type: "object", properties: {
+        path: { type: "string", description: "Repository-relative path, e.g. 'src/app.js'." },
+      }, required: ["path"] },
+    },
+    write_file: {
+      name: "write_file",
+      description: "Create a new file, or completely overwrite an existing one, in the selected repository. Provide the COMPLETE new file contents. The change is staged for the user to review as a diff and commit.",
+      input_schema: { type: "object", properties: {
+        path: { type: "string", description: "Repository-relative path, e.g. 'src/app.js'." },
+        content: { type: "string", description: "The complete new contents of the file." },
+      }, required: ["path", "content"] },
+    },
+    edit_file: {
+      name: "edit_file",
+      description: "Make a targeted edit to an EXISTING file by replacing an exact snippet. `old_str` must match the current file exactly (including whitespace and indentation) and must be unique unless `replace_all` is true. Prefer this over write_file for small, precise changes. Read the file first so the match is exact.",
+      input_schema: { type: "object", properties: {
+        path: { type: "string", description: "Repository-relative path." },
+        old_str: { type: "string", description: "The exact text to find and replace." },
+        new_str: { type: "string", description: "The replacement text." },
+        replace_all: { type: "boolean", description: "Replace every occurrence instead of requiring a unique match (default false)." },
+      }, required: ["path", "old_str", "new_str"] },
+    },
+    delete_file: {
+      name: "delete_file",
+      description: "Delete a file from the selected repository. The deletion is staged for the user to review and commit.",
+      input_schema: { type: "object", properties: {
+        path: { type: "string", description: "Repository-relative path to delete." },
+      }, required: ["path"] },
+    },
+    web_fetch: {
+      name: "web_fetch",
+      description: "Fetch a web page and return its readable text.",
+      input_schema: { type: "object", properties: {
+        url: { type: "string", description: "An http(s) URL." },
+      }, required: ["url"] },
+    },
+    web_search: {
+      name: "web_search",
+      description: "Search the web and return the top results.",
+      input_schema: { type: "object", properties: {
+        query: { type: "string", description: "The search query." },
+      }, required: ["query"] },
+    },
+  };
+
+  // Which tools are usable right now, given the selected repo + installed powers.
+  function availableToolDefs() {
+    const defs = [];
+    if (activeRepo()) {
+      defs.push(TOOL_DEFS.list_repo_files, TOOL_DEFS.search_repo, TOOL_DEFS.read_repo_file,
+        TOOL_DEFS.write_file, TOOL_DEFS.edit_file, TOOL_DEFS.delete_file);
+    }
+    if (isInstalled("web-fetch") || activeRepo()) defs.push(TOOL_DEFS.web_fetch);
+    if (isInstalled("web-search") && getPowerKey("web-search")) defs.push(TOOL_DEFS.web_search);
+    return defs;
+  }
+  const toolsAvailable = () => availableToolDefs().length > 0;
+
+  // A short, Kiro-style label describing what a tool call is doing.
+  function describeToolRun(run) {
+    const inp = run.input || {};
+    switch (run.name) {
+      case "list_repo_files": return inp.filter ? `Listing files matching "${inp.filter}"` : "Listing repository files";
+      case "search_repo": return `Searching the repo for "${inp.query || "…"}"`;
+      case "read_repo_file": return `Reading ${inp.path || "file"}`;
+      case "write_file": return `Writing ${inp.path || "file"}`;
+      case "edit_file": return `Editing ${inp.path || "file"}`;
+      case "delete_file": return `Deleting ${inp.path || "file"}`;
+      case "web_fetch": return `Fetching ${inp.url || "page"}`;
+      case "web_search": return `Searching the web for "${inp.query || "…"}"`;
+      default: return (TOOL_META[run.name]?.verb) || run.name;
+    }
+  }
+
+  /* ---------- staged working copy (Kiro-style edits) ---------- */
+  const pendingCount = () => Object.keys(state.pendingEdits).length;
+  function clearPendingEdits() { state.pendingEdits = {}; renderChangesChip(); }
+
+  // Read a file as it currently stands in the working copy: a staged edit if one
+  // exists, otherwise the real repo. Returns { content, exists, deleted, isNew }.
+  async function readWorkingFile(path) {
+    const pend = state.pendingEdits[path];
+    if (pend) {
+      if (pend.deleted) return { content: "", exists: false, deleted: true, isNew: false };
+      return { content: pend.content, exists: true, deleted: false, isNew: pend.isNew };
+    }
+    try {
+      const data = await providerFetch("file", { path });
+      return { content: data.content || "", exists: true, deleted: false, isNew: false };
+    } catch (err) {
+      // Treat "not found" as a non-existent file; surface real errors.
+      if (/not found|404|could not read the file/i.test(err.message || "")) {
+        return { content: "", exists: false, deleted: false, isNew: true };
+      }
+      throw err;
+    }
+  }
+
+  function stageWrite(path, content, isNew) {
+    const prev = state.pendingEdits[path];
+    state.pendingEdits[path] = { content, deleted: false, isNew: prev ? prev.isNew : Boolean(isNew) };
+    renderChangesChip();
+  }
+  function stageDelete(path) {
+    const prev = state.pendingEdits[path];
+    // Deleting a brand-new (uncommitted) staged file just drops the stage.
+    if (prev && prev.isNew) { delete state.pendingEdits[path]; renderChangesChip(); return; }
+    state.pendingEdits[path] = { content: "", deleted: true, isNew: false };
+    renderChangesChip();
+  }
+  function pendingEditsList() {
+    return Object.keys(state.pendingEdits).map((path) => {
+      const e = state.pendingEdits[path];
+      return { path, content: e.content, deleted: e.deleted, isNew: e.isNew };
+    });
+  }
+
+  // Execute one tool locally and return a string result for the model.
+  async function executeTool(name, input) {
+    input = input || {};
+    switch (name) {
+      case "list_repo_files": {
+        if (!activeRepo()) return "Error: no repository is selected.";
+        const files = await getTree();
+        let paths = files.map((f) => f.path);
+        if (input.filter) { const q = String(input.filter).toLowerCase(); paths = paths.filter((p) => p.toLowerCase().includes(q)); }
+        const total = paths.length;
+        const shown = paths.slice(0, 600);
+        const r = activeRepo();
+        return `Repository ${r.fullName} (branch ${r.branch || "main"}) — ${total} file(s)${input.filter ? ` matching "${input.filter}"` : ""}:\n` +
+          shown.join("\n") + (total > shown.length ? `\n… (${total - shown.length} more; narrow with a filter)` : "");
+      }
+      case "search_repo": {
+        if (!activeRepo()) return "Error: no repository is selected.";
+        const files = await getTree();
+        const q = String(input.query || "").toLowerCase();
+        if (!q) return "Error: 'query' is required.";
+        const matches = files.filter((f) => f.path.toLowerCase().includes(q)).map((f) => f.path).slice(0, 300);
+        return matches.length ? `Files matching "${input.query}":\n` + matches.join("\n") : `No file paths match "${input.query}".`;
+      }
+      case "read_repo_file": {
+        if (!activeRepo()) return "Error: no repository is selected.";
+        const path = String(input.path || "").trim();
+        if (!path) return "Error: 'path' is required.";
+        const wf = await readWorkingFile(path);
+        if (wf.deleted) return `File ${path} is staged for deletion.`;
+        if (!wf.exists) return `File ${path} does not exist in the repository. Use write_file to create it.`;
+        let content = wf.content;
+        const CAP = 60000;
+        let note = "";
+        if (content.length > CAP) { content = content.slice(0, CAP); note = `\n… (truncated at ${CAP} characters — read a narrower part if you need more)`; }
+        const staged = state.pendingEdits[path] ? " (includes your staged, uncommitted changes)" : "";
+        return `File ${path} (${content.length} chars)${staged}:\n\n${content}${note}`;
+      }
+      case "write_file": {
+        if (!activeRepo()) return "Error: no repository is selected.";
+        const path = String(input.path || "").trim();
+        if (!path) return "Error: 'path' is required.";
+        if (typeof input.content !== "string") return "Error: 'content' (the complete file text) is required.";
+        let wf;
+        try { wf = await readWorkingFile(path); } catch (e) { return "Error reading current file: " + (e?.message || e); }
+        stageWrite(path, input.content, !wf.exists);
+        return `Staged ${wf.exists ? "an overwrite of" : "a new file"} ${path} (${input.content.length} chars). It will be shown to the user as a diff to review and commit.`;
+      }
+      case "edit_file": {
+        if (!activeRepo()) return "Error: no repository is selected.";
+        const path = String(input.path || "").trim();
+        if (!path) return "Error: 'path' is required.";
+        if (typeof input.old_str !== "string" || typeof input.new_str !== "string") return "Error: 'old_str' and 'new_str' must both be strings.";
+        if (input.old_str === "") return "Error: 'old_str' must not be empty. Use write_file to create a file or fully replace its contents.";
+        let wf;
+        try { wf = await readWorkingFile(path); } catch (e) { return "Error reading file: " + (e?.message || e); }
+        if (!wf.exists) return `Error: ${path} does not exist${wf.deleted ? " (it is staged for deletion)" : ""}. Use write_file to create it.`;
+        const occurrences = wf.content.split(input.old_str).length - 1;
+        if (occurrences === 0) return `Error: old_str was not found in ${path}. It must match the current file EXACTLY, including whitespace and indentation. Read the file again and retry with an exact snippet.`;
+        if (occurrences > 1 && !input.replace_all) return `Error: old_str appears ${occurrences} times in ${path}. Add more surrounding context to make it unique, or set replace_all: true.`;
+        const newContent = input.replace_all
+          ? wf.content.split(input.old_str).join(input.new_str)
+          : wf.content.replace(input.old_str, input.new_str);
+        if (newContent === wf.content) return `No change: the edit to ${path} would not modify the file.`;
+        stageWrite(path, newContent, wf.isNew);
+        return `Staged an edit to ${path} (${occurrences === 1 ? "1 replacement" : occurrences + " replacements"}). Review & commit to apply.`;
+      }
+      case "delete_file": {
+        if (!activeRepo()) return "Error: no repository is selected.";
+        const path = String(input.path || "").trim();
+        if (!path) return "Error: 'path' is required.";
+        let wf;
+        try { wf = await readWorkingFile(path); } catch (e) { return "Error: " + (e?.message || e); }
+        if (!wf.exists && !wf.deleted) return `Error: ${path} does not exist, so there is nothing to delete.`;
+        if (wf.deleted) return `${path} is already staged for deletion.`;
+        stageDelete(path);
+        return `Staged deletion of ${path}. Review & commit to apply.`;
+      }
+      case "web_fetch": {
+        const url = String(input.url || "").trim();
+        if (!url) return "Error: 'url' is required.";
+        const res = await fetch("/api/powers/fetch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return `Error fetching page: ${data?.error?.message || `HTTP ${res.status}`}`;
+        let text = data.text || "";
+        if (text.length > 40000) text = text.slice(0, 40000) + "\n… (truncated)";
+        return `Fetched ${data.url}:\n\n${text}`;
+      }
+      case "web_search": {
+        const query = String(input.query || "").trim();
+        if (!query) return "Error: 'query' is required.";
+        const key = getPowerKey("web-search");
+        if (!key) return "Error: Web Search isn't configured (no API key).";
+        const res = await fetch("/api/powers/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query, key }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return `Error searching: ${data?.error?.message || `HTTP ${res.status}`}`;
+        const parts = [];
+        if (data.answer) parts.push(`Summary: ${data.answer}`);
+        (data.results || []).forEach((r, i) => parts.push(`${i + 1}. ${r.title}\n${r.url}\n${(r.content || "").slice(0, 500)}`));
+        return parts.join("\n\n") || "No results.";
+      }
+      default:
+        return `Error: unknown tool "${name}".`;
+    }
+  }
+
+  // Render the live "what MAX is doing" activity cards.
+  function toolRunsHtml(runs) {
+    if (!runs || !runs.length) return "";
+    return `<div class="tool-runs">` + runs.map((r) => {
+      const icon = TOOL_META[r.name]?.icon || "🔧";
+      const status = r.status || "done";
+      const mark = status === "running"
+        ? `<span class="tool-run__spin" aria-label="running"></span>`
+        : status === "error"
+          ? `<span class="tool-run__mark tool-run__mark--err">!</span>`
+          : `<span class="tool-run__mark tool-run__mark--ok">✓</span>`;
+      const detail = r.result
+        ? `<details class="tool-run__detail"><summary>result</summary><pre>${esc(String(r.result).slice(0, 4000))}</pre></details>`
+        : "";
+      return `<div class="tool-run tool-run--${status}">
+        <div class="tool-run__row"><span class="tool-run__ico">${icon}</span><span class="tool-run__label">${esc(describeToolRun(r))}</span>${mark}</div>
+        ${detail}</div>`;
+    }).join("") + `</div>`;
+  }
+
+  /* ============================================================
+     Agent turn + tool loop (streaming)
+     ============================================================ */
+  // Stream a single model response, updating the visible bubble live (text +
+  // tool-activity cards). Returns the parsed { text, thinking, toolUses, stopReason, usage }.
+  async function runModelTurn(apiMessages, useModel, toolDefs, stream, ctx) {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: state.abort.signal,
+      body: JSON.stringify({
+        model: useModel,
+        system: effectiveSystem(),
+        max_tokens: state.settings.maxTokens,
+        temperature: state.settings.temperature,
+        apiKey: state.settings.apiKey || undefined,
+        stream: true,
+        messages: apiMessages,
+        tools: toolDefs.length ? toolDefs : undefined,
+      }),
+    });
+    if (!res.ok || !res.body) {
+      let msg = `Request failed (HTTP ${res.status})`;
+      try { const j = await res.json(); msg = j?.error?.message || msg; } catch {}
+      throw new Error(msg);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let stopped = false;
+
+    const blocks = {}; // index -> { type, text, id, name, json }
+    let stopReason = null;
+    let usage = null;
+    let curText = "";
+    let curThinking = "";
+
+    const rerender = () => stream.setAgent(ctx.priorText + curText, true, curThinking, ctx.toolRuns);
+
+    const consumeRecord = (record) => {
+      if (!record?.data) return false;
+      if (record.data.trim() === "[DONE]") return true;
+      let evt;
+      try { evt = JSON.parse(record.data); } catch { return false; }
+      if (record.event === "error" || evt.type === "error") {
+        throw new Error(evt.error?.message || evt.message || "Stream error");
+      }
+      switch (evt.type) {
+        case "message_start":
+          if (evt.message?.usage) usage = { ...evt.message.usage };
+          break;
+        case "content_block_start": {
+          const cb = evt.content_block || {};
+          if (cb.type === "tool_use") {
+            blocks[evt.index] = { type: "tool_use", id: cb.id, name: cb.name, json: "" };
+            ctx.toolRuns.push({ id: cb.id, name: cb.name, input: null, status: "running", result: null });
+            rerender();
+          } else {
+            blocks[evt.index] = { type: cb.type || "text", text: "" };
+          }
+          break;
+        }
+        case "content_block_delta": {
+          const b = blocks[evt.index];
+          if (evt.delta?.type === "text_delta" && evt.delta.text) {
+            if (b) b.text = (b.text || "") + evt.delta.text;
+            curText += evt.delta.text; rerender(); scrollToBottomIfNear();
+          } else if (evt.delta?.type === "thinking_delta" && evt.delta.thinking) {
+            curThinking += evt.delta.thinking; rerender();
+          } else if (evt.delta?.type === "input_json_delta" && evt.delta.partial_json != null && b) {
+            b.json = (b.json || "") + evt.delta.partial_json;
+          }
+          break;
+        }
+        case "content_block_stop": {
+          const b = blocks[evt.index];
+          if (b && b.type === "tool_use") {
+            let input = {};
+            try { input = b.json ? JSON.parse(b.json) : {}; } catch { input = {}; }
+            b.input = input;
+            const run = ctx.toolRuns.find((r) => r.id === b.id);
+            if (run) { run.input = input; rerender(); }
+          }
+          break;
+        }
+        case "message_delta":
+          if (evt.delta?.stop_reason) stopReason = evt.delta.stop_reason;
+          if (evt.usage) usage = { ...(usage || {}), ...evt.usage };
+          break;
+        case "message_stop":
+          return true;
+        default:
+          break;
+      }
+      return false;
+    };
+
+    while (!stopped) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        const final = takeSseRecords(buffer, true);
+        for (const record of final.records) if (consumeRecord(record)) break;
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const parsed = takeSseRecords(buffer);
+      buffer = parsed.rest;
+      for (const record of parsed.records) {
+        if (consumeRecord(record)) { stopped = true; await reader.cancel().catch(() => {}); break; }
+      }
+    }
+
+    const orderedIdx = Object.keys(blocks).map(Number).sort((a, b) => a - b);
+    let text = "";
+    const toolUses = [];
+    for (const i of orderedIdx) {
+      const b = blocks[i];
+      if (b.type === "text") text += b.text || "";
+      else if (b.type === "tool_use") toolUses.push({ id: b.id, name: b.name, input: b.input || {} });
+    }
+    return { text, thinking: curThinking, toolUses, stopReason, usage };
+  }
+
+  function mergeUsage(a, b) {
+    if (!a) return b ? { ...b } : null;
+    if (!b) return a;
+    return {
+      input_tokens: (a.input_tokens || 0) + (b.input_tokens || 0),
+      output_tokens: (a.output_tokens || 0) + (b.output_tokens || 0),
+    };
+  }
+
   async function streamAssistant(convo, opts = {}) {
     state.streaming = true;
     toggleStreamingUI(true);
 
     const stream = appendStreamingAssistant();
-    let acc = "";
-    let thinking = "";
-    let usage = null;
-    let gotFirst = false;
     const useModel = opts.model || currentModel();
     const startedAt = Date.now();
+    const toolDefs = opts.noTools ? [] : availableToolDefs();
+    const MAX_TOOL_ROUNDS = 16;
+
+    // One-time nudge: repo read/edit tools are most reliable on Claude models.
+    if (toolDefs.length && !/^claude/i.test(useModel) && !state._toolModelWarned) {
+      state._toolModelWarned = true;
+      toast("Tip: repo reading & editing work most reliably with a Claude model.", "");
+    }
+
+    // Local working history for this agent turn (tool_use/tool_result blocks are
+    // kept here only; the persisted conversation stores just the final text).
+    const apiMessages = buildApiMessages(convo);
+    const toolRuns = [];    // display + persistence
+    let finalText = "";
+    let finalThinking = "";
+    let usage = null;
 
     state.abort = new AbortController();
 
     try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: state.abort.signal,
-        body: JSON.stringify({
-          model: useModel,
-          system: effectiveSystem(),
-          max_tokens: state.settings.maxTokens,
-          temperature: state.settings.temperature,
-          apiKey: state.settings.apiKey || undefined,
-          stream: true,
-          messages: buildApiMessages(convo),
-        }),
-      });
+      let round = 0;
+      for (; round <= MAX_TOOL_ROUNDS; round++) {
+        if (state.abort.signal.aborted) break;
+        const turn = await runModelTurn(apiMessages, useModel, toolDefs, stream, {
+          priorText: finalText ? finalText + "\n\n" : "",
+          toolRuns,
+        });
+        usage = mergeUsage(usage, turn.usage);
+        if (turn.thinking) finalThinking = turn.thinking;
+        if (turn.text) finalText = finalText ? finalText + "\n\n" + turn.text : turn.text;
 
-      if (!res.ok || !res.body) {
-        let msg = `Request failed (HTTP ${res.status})`;
-        try { const j = await res.json(); msg = j?.error?.message || msg; } catch {}
-        throw new Error(msg);
+        const wantsTools = turn.stopReason === "tool_use" && turn.toolUses.length;
+        if (!wantsTools || state.autoStop || state.abort.signal.aborted) break;
+
+        // Record the assistant tool-use turn in the working history…
+        const assistantBlocks = [];
+        if (turn.text) assistantBlocks.push({ type: "text", text: turn.text });
+        for (const tu of turn.toolUses) assistantBlocks.push({ type: "tool_use", id: tu.id, name: tu.name, input: tu.input });
+        apiMessages.push({ role: "assistant", content: assistantBlocks });
+
+        // …execute each tool and feed the results back.
+        const resultBlocks = [];
+        for (const tu of turn.toolUses) {
+          const run = toolRuns.find((r) => r.id === tu.id) || { id: tu.id, name: tu.name, input: tu.input, status: "running" };
+          let result, ok = true;
+          try { result = await executeTool(tu.name, tu.input); }
+          catch (e) { ok = false; result = "Error: " + (e?.message || e); }
+          run.status = ok ? "done" : "error";
+          run.result = result;
+          stream.setAgent(finalText, true, finalThinking, toolRuns);
+          resultBlocks.push({ type: "tool_result", tool_use_id: tu.id, content: String(result), ...(ok ? {} : { is_error: true }) });
+        }
+        apiMessages.push({ role: "user", content: resultBlocks });
       }
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let stopped = false;
-
-      const consumeRecord = (record) => {
-        if (!record?.data) return false;
-        if (record.data.trim() === "[DONE]") return true;
-
-        let evt;
-        try { evt = JSON.parse(record.data); } catch { return false; }
-        if (record.event === "error" || evt.type === "error") {
-          throw new Error(evt.error?.message || evt.message || "Stream error");
-        }
-
-        switch (evt.type) {
-          case "message_start":
-            if (evt.message?.usage) usage = { ...evt.message.usage };
-            break;
-          case "content_block_delta":
-            if (evt.delta?.type === "text_delta" && evt.delta.text) {
-              gotFirst = true;
-              acc += evt.delta.text;
-              stream.setText(acc, true, thinking);
-              scrollToBottomIfNear();
-            } else if (evt.delta?.type === "thinking_delta" && evt.delta.thinking) {
-              thinking += evt.delta.thinking;
-              stream.setText(acc, true, thinking);
-              scrollToBottomIfNear();
-            }
-            break;
-          case "message_delta":
-            if (evt.usage) usage = { ...(usage || {}), ...evt.usage };
-            break;
-          case "message_stop":
-            return true;
-          default:
-            break;
-        }
-        return false;
-      };
-
-      while (!stopped) {
-        const { done, value } = await reader.read();
-        if (done) {
-          buffer += decoder.decode();
-          const final = takeSseRecords(buffer, true);
-          for (const record of final.records) {
-            if (consumeRecord(record)) break;
-          }
-          break;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        const parsed = takeSseRecords(buffer);
-        buffer = parsed.rest;
-        for (const record of parsed.records) {
-          if (consumeRecord(record)) {
-            stopped = true;
-            await reader.cancel().catch(() => {});
-            break;
-          }
-        }
-      }
-
-      if (!gotFirst || !acc.trim()) {
+      if (!finalText.trim() && !toolRuns.length) {
         throw new Error("The model returned an empty response. Try another model or prompt.");
+      }
+      if (!finalText.trim() && toolRuns.length) {
+        finalText = "_(MAX finished working with its tools but produced no final text.)_";
       }
 
       // finalize
-      stream.setText(acc, false, thinking);
-      const aiMsg = { id: uid(), role: "assistant", content: acc, usage, model: useModel, thinking: thinking || undefined };
+      stream.setAgent(finalText, false, finalThinking, toolRuns);
+      const pending = pendingEditsList();
+      const aiMsg = {
+        id: uid(), role: "assistant", content: finalText, usage, model: useModel,
+        thinking: finalThinking || undefined,
+        toolRuns: toolRuns.length ? toolRuns.map((r) => ({
+          name: r.name, input: r.input, status: r.status,
+          result: typeof r.result === "string" ? r.result.slice(0, 8000) : r.result,
+        })) : undefined,
+        stagedEdits: pending.length ? pending : undefined,
+      };
       convo.messages.push(aiMsg);
       touchConvo(convo);
       renderMessages();
       renderConversations();
       updateUsagePill();
       logRequest({ model: useModel, ok: true, ms: Date.now() - startedAt, tokens: usage?.output_tokens });
+
+      // If MAX changed files this turn, nudge the user to review the diff.
+      const editedThisTurn = toolRuns.some((r) => ["write_file", "edit_file", "delete_file"].includes(r.name) && r.status === "done");
+      if (editedThisTurn && pending.length) {
+        const n = pending.length;
+        toast(`MAX staged ${n} file change${n > 1 ? "s" : ""} — review to commit`, "success");
+        if (!state.settings.autonomous && !state.autoRunning) {
+          setTimeout(() => { if (!state.streaming) openDiffModal(pendingEditsList()); }, 350);
+        }
+      }
     } catch (err) {
       const aborted = err.name === "AbortError" || state.abort?.signal.aborted;
-      if (aborted && acc) {
-        // keep whatever we streamed so far
-        stream.setText(acc, false);
-        convo.messages.push({ id: uid(), role: "assistant", content: acc, usage, stopped: true });
+      if (aborted && (finalText || toolRuns.length)) {
+        stream.setAgent(finalText, false, finalThinking, toolRuns);
+        convo.messages.push({ id: uid(), role: "assistant", content: finalText || "_(stopped)_", usage, stopped: true, toolRuns: toolRuns.length ? toolRuns : undefined });
         touchConvo(convo);
         renderMessages();
       } else if (aborted) {
         stream.row.remove();
         renderMessages();
       } else {
+        // Some models/gateways don't support tool use and may error (or time out).
+        // If we sent tools and got nothing back, retry once as a plain chat so the
+        // user still gets an answer instead of a dead end.
+        const skipRetry = /api key|unauthorized|forbidden|\b401\b|\b403\b|no_api_key/i.test(err.message || "");
+        if (!opts.noTools && toolDefs.length && !finalText.trim() && !toolRuns.length && !skipRetry) {
+          stream.row.remove();
+          toast("That model had trouble with tools — retrying without them…", "");
+          state.streaming = false; state.abort = null;
+          await streamAssistant(convo, { ...opts, noTools: true });
+          return;
+        }
         const isNetwork = err instanceof TypeError || /failed to fetch|networkerror|load failed|connection/i.test(err.message || "");
         const friendly = isNetwork
           ? "Can't reach the MAX server. Make sure it's still running (node server.js) in your terminal, then reload this page and try again."
@@ -1227,6 +1651,7 @@
     updateRepoChip();
     renderConversations();
     treeCache = null; // invalidate cached file tree
+    clearPendingEdits(); // staged edits belong to the previous repo
     toast(`MAX is now working in ${repo.fullName}`, "success");
   }
 
@@ -1237,7 +1662,35 @@
     saveSettings();
     updateRepoChip();
     treeCache = null;
+    clearPendingEdits();
     toast("Repository cleared");
+  }
+
+  // Bind the repo configured in Settings (Owner/Repository + token) as MAX's
+  // working repo, so the agentic read/edit tools activate. Without this,
+  // configuring GitHub in Settings alone would NOT let MAX read the repo — the
+  // tools require a selected working repository.
+  function bindRepoFromGithubSettings(silent) {
+    const g = state.settings.github || {};
+    if (!g.owner || !g.repo) return false;
+    if (!providerHasToken("github")) return false;
+    const bind = {
+      provider: "github",
+      fullName: `${g.owner}/${g.repo}`,
+      owner: g.owner,
+      name: g.repo,
+      projectId: null,
+      branch: g.branch || "main",
+    };
+    const c = activeConvo();
+    if (c) { c.repo = bind; touchConvo(c); }
+    state.settings.lastRepo = bind;
+    saveSettings();
+    updateRepoChip();
+    renderConversations();
+    treeCache = null;
+    if (!silent) toast(`MAX is now working in ${bind.fullName} (${bind.branch})`, "success");
+    return true;
   }
 
   async function providerFetch(path, extra) {
@@ -1583,11 +2036,16 @@
       let current = "";
       try { const data = await providerFetch("file", { path: e.path }); current = data.content || ""; }
       catch { current = ""; /* new file */ }
-      const rows = diffLines(current, e.content);
+      // A deletion diffs the current content against nothing.
+      const newContent = e.deleted ? "" : e.content;
+      const rows = diffLines(current, newContent);
       const added = rows.filter((r) => r.type === "add").length;
       const removed = rows.filter((r) => r.type === "del").length;
+      const tag = e.deleted
+        ? ' <span class="diff-del diff-new">deleted file</span>'
+        : (current ? "" : ' <span class="diff-new">new file</span>');
       box.querySelector(".diff-file__head").innerHTML =
-        `${esc(e.path)} <span class="diff-stat"><span class="diff-add">+${added}</span> <span class="diff-del">−${removed}</span>${current ? "" : ' <span class="diff-new">new file</span>'}</span>`;
+        `${esc(e.path)} <span class="diff-stat"><span class="diff-add">+${added}</span> <span class="diff-del">−${removed}</span>${tag}</span>`;
       box.querySelector(".diff-file__body").innerHTML =
         `<pre class="diff">${rows.map((r) =>
           `<span class="diff-line diff-${r.type}">${r.type === "add" ? "+" : r.type === "del" ? "−" : " "} ${esc(r.text)}</span>`).join("\n")}</pre>`;
@@ -1606,9 +2064,11 @@
 
   async function commitAndOpenRequest(repo, edits, branch, title) {
     const token = providerToken(repo.provider) || undefined;
+    // Shape each edit for the commit API: writes carry content, deletions a flag.
+    const commitFiles = edits.map((e) => e.deleted ? { path: e.path, deleted: true } : { path: e.path, content: e.content });
     const commitBody = {
       token, branch: repo.branch,
-      newBranch: branch, files: edits, message: title,
+      newBranch: branch, files: commitFiles, message: title,
     };
     if (repo.provider === "gitlab") commitBody.projectId = repo.projectId ?? repo.fullName;
     else { commitBody.owner = repo.owner; commitBody.repo = repo.name; }
@@ -1630,6 +2090,10 @@
       if (!prRes.ok) throw new Error(prData?.error?.message || `Could not open request (HTTP ${prRes.status})`);
       toast(prData.message || "Opened request", "success");
       if (prData.url) toastLink(repo.provider === "gitlab" ? "View merge request" : "View pull request", prData.url);
+      // These edits are now committed — drop them from the staged working copy.
+      for (const e of edits) delete state.pendingEdits[e.path];
+      renderChangesChip();
+      renderMessages();
       return true;
     } catch (err) {
       toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error");
@@ -2017,6 +2481,17 @@ a{color:#22d3ee}</style></head>
     if (!chip) return;
     chip.hidden = state.basket.length === 0;
     $("#basket-count").textContent = state.basket.length;
+  }
+
+  // The "review changes" chip reflects how many file edits MAX has staged.
+  function renderChangesChip() {
+    const chip = $("#changes-chip");
+    if (!chip) return;
+    const n = pendingCount();
+    chip.hidden = n === 0;
+    const count = $("#changes-count");
+    if (count) count.textContent = n;
+    chip.title = n ? `Review ${n} staged change${n > 1 ? "s" : ""} and commit` : "";
   }
   function basketPrefix() {
     if (!state.basket.length) return "";
@@ -2454,6 +2929,21 @@ a{color:#22d3ee}</style></head>
     updateModelPill();
     updateKeyStatus();
     updateAutoPill();
+
+    // Make the GitHub repo configured here MAX's working repo, so it can read
+    // and edit it right away (otherwise the tools stay off until you pick a repo
+    // from the chip). This is the key link between "I added the token" and
+    // "MAX can now read/edit the repo".
+    if (state.settings.github.owner && state.settings.github.repo && providerHasToken("github")) {
+      const desired = `${state.settings.github.owner}/${state.settings.github.repo}`;
+      const cur = activeRepo();
+      if (!cur || cur.provider !== "github" || cur.fullName !== desired) {
+        bindRepoFromGithubSettings(false); // visible toast — the working repo changed
+      } else if (cur.branch !== (state.settings.github.branch || "main")) {
+        bindRepoFromGithubSettings(true);  // silent branch update
+      }
+    }
+
     toast("Settings saved", "success");
     closeSettings();
   }
@@ -2580,6 +3070,7 @@ a{color:#22d3ee}</style></head>
     state.activeId = id;
     saveActive();
     treeCache = null; // repo may differ per conversation
+    clearPendingEdits(); // don't carry staged edits across conversations/repos
     renderConversations();
     renderMessages();
     updateRepoChip();
@@ -2754,6 +3245,7 @@ a{color:#22d3ee}</style></head>
     // voice input + context basket + profiles
     $("#mic-btn").addEventListener("click", toggleVoice);
     $("#basket-chip").addEventListener("click", clearBasket);
+    $("#changes-chip").addEventListener("click", () => { if (pendingCount()) openDiffModal(pendingEditsList()); });
     $("#profile-save").addEventListener("click", saveCurrentProfile);
     $("#clear-current").addEventListener("click", () => {
       const c = activeConvo(); if (c) { c.messages = []; c.title = "New chat"; touchConvo(c); renderMessages(); renderConversations(); }
@@ -2851,6 +3343,10 @@ a{color:#22d3ee}</style></head>
     // ensure there is an active conversation reference (but don't force-create)
     if (state.activeId && !activeConvo()) state.activeId = state.conversations[0]?.id || null;
 
+    // If GitHub is configured in Settings but no working repo is bound yet,
+    // adopt it automatically so the read/edit tools are available on first use.
+    if (!activeRepo()) bindRepoFromGithubSettings(true);
+
     renderAccount();
     updateModelPill();
     updateKeyStatus();
@@ -2862,6 +3358,7 @@ a{color:#22d3ee}</style></head>
     updateSendState();
     updateUsagePill();
     renderBasket();
+    renderChangesChip();
 
     // Register the service worker for installability + offline shell.
     if ("serviceWorker" in navigator) {
