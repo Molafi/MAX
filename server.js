@@ -80,7 +80,9 @@ const CONFIG = {
     allowClientToken: (process.env.ALLOW_CLIENT_GITLAB_TOKEN || "true").toLowerCase() !== "false",
   },
   auth: {
-    enabled: (process.env.AUTH_ENABLED || "true").toLowerCase() !== "false",
+    // Login is OFF by default so the app opens directly. Set AUTH_ENABLED=true
+    // in .env to require sign-in (a super admin is then created automatically).
+    enabled: (process.env.AUTH_ENABLED || "false").toLowerCase() === "true",
     superUser: process.env.SUPERADMIN_USERNAME || "admin",
     superPass: process.env.SUPERADMIN_PASSWORD || "",
     // Known default password used to bootstrap the very first super admin when
