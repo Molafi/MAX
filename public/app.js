@@ -1230,8 +1230,9 @@
           saveConvos();
           renderMessages();
           if (state.settings.autoPush && activeRepo()) {
-            toast("Autonomous run complete — pushing to your repo…");
-            pushConversation(convo.id);
+            // Auto-push disabled — MAX only pushes code, not conversations.
+            // toast("Autonomous run complete — pushing to your repo…");
+            // pushConversation(convo.id);
           }
           break;
         }
@@ -3588,7 +3589,6 @@ a{color:#22d3ee}</style></head>
       { label: "Pick a repository", run: () => openRepoPicker($("#repo-chip")) },
       { label: "Browse repository files", run: () => { if (activeRepo()) openFilesPicker($("#files-btn")); else toast("Pick a repository first.", "error"); } },
       { label: "Summarize the repository", run: summarizeRepo },
-      { label: "Push conversation to repo", run: () => { const c = activeConvo(); if (c) pushConversation(c.id); } },
       { label: state.settings.autonomous ? "Turn OFF Autonomous mode" : "Turn ON Autonomous mode", run: () => $("#auto-toggle").click() },
       { label: "Toggle theme (light/dark)", run: toggleTheme },
       { label: "Import chat (.json)", run: () => $("#import-input").click() },
@@ -3927,7 +3927,6 @@ a{color:#22d3ee}</style></head>
     pop.innerHTML =
       item("pin", convo?.pinned ? "Unpin" : "Pin") +
       item("rename", "Rename") +
-      item("push", "Push to repo") +
       item("export-md", "Export .md") +
       item("export-json", "Export .json") +
       item("share", "Share .html") +
@@ -3942,7 +3941,6 @@ a{color:#22d3ee}</style></head>
     });
     pop.querySelector('[data-a="pin"]').addEventListener("click", () => { pop.remove(); togglePin(id); });
     pop.querySelector('[data-a="rename"]').addEventListener("click", () => { pop.remove(); openRename(id); });
-    pop.querySelector('[data-a="push"]').addEventListener("click", () => { pop.remove(); pushConversation(id); });
     pop.querySelector('[data-a="export-md"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "md"); });
     pop.querySelector('[data-a="export-json"]').addEventListener("click", () => { pop.remove(); exportConversation(id, "json"); });
     pop.querySelector('[data-a="share"]').addEventListener("click", () => { pop.remove(); shareConversation(id); });
@@ -4127,14 +4125,7 @@ a{color:#22d3ee}</style></head>
       toast(state.settings.autonomous ? "Autonomous mode ON" : "Autonomous mode off", state.settings.autonomous ? "success" : "");
     });
 
-    // topbar: push current chat to GitHub
-    $("#push-btn").addEventListener("click", () => {
-      const c = activeConvo();
-      if (!c) { toast("Open a conversation first.", "error"); return; }
-      pushConversationToGitHub(c.id);
-    });
-
-    // composer: repository picker
+    // topbar: repository picker
     $("#repo-chip").addEventListener("click", (e) => {
       if (e.target.closest("#repo-chip-clear")) return; // handled below
       if (repoPickerEl) closeRepoPicker();
