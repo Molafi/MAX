@@ -177,6 +177,11 @@ const MODELS = [
 /*  Tiny in-memory per-IP rate limiter                                 */
 /* ------------------------------------------------------------------ */
 const rateBuckets = new Map(); // ip -> { count, resetAt }
+// Periodic cleanup so the map can't grow unbounded from unique IPs.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, b] of rateBuckets) if (now > b.resetAt) rateBuckets.delete(ip);
+}, 5 * 60_000).unref?.();
 function checkRateLimit(ip) {
   if (!CONFIG.rateLimitPerMin || CONFIG.rateLimitPerMin <= 0) return true;
   const now = Date.now();
@@ -1924,6 +1929,19 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   console.error("[MAX] unhandledRejection (kept alive):", reason);
 });
+
+// Graceful shutdown: close active connections cleanly on SIGTERM/SIGINT.
+function gracefulShutdown(signal) {
+  console.log(`\n[MAX] ${signal} received — shutting down gracefully…`);
+  server.close(() => {
+    console.log("[MAX] All connections closed. Goodbye.");
+    process.exit(0);
+  });
+  // Force-kill after 10s if connections don't drain
+  setTimeout(() => { console.log("[MAX] Forcing exit."); process.exit(1); }, 10_000).unref?.();
+}
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // Initialise auth before accepting traffic.
 if (CONFIG.auth.enabled) {

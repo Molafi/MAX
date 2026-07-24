@@ -1,0 +1,16 @@
+{
+  "project_type": "Zero-dependency Node.js server + vanilla JS frontend (premium AI chat application)",
+  "language": "JavaScript (ES modules, Node 18+)",
+  "build_system": "None (zero dependencies, no build step)",
+  "test_framework": "None (no test files exist)",
+  "build_command": "env -u NODE_OPTIONS node --check server.js",
+  "test_command": "No tests exist",
+  "verification_instructions": "Run `node --check server.js` for syntax validation. No automated tests.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "cp .env.example .env && node server.js",
+  "environment_constraints": "INTEGRATIONS_ONLY network - cannot reach external services. Use env -u NODE_OPTIONS when running node.",
+  "contribution_requirements": "Zero-dependency project - no npm install needed. All code in server.js and public/.",
+  "key_patterns": "Single-file server (1900 lines), single-file frontend (4300 lines), IIFE pattern on frontend, streaming SSE proxy, file-based JSON persistence",
+  "relevant_files": ["server.js", "public/app.js", "public/styles.css", "public/index.html", "public/sw.js", "public/login.js", ".gitignore"],
+  "directory_structure": "MAX/ root: server.js (Node HTTP server), public/ (static frontend), max-chats/ (committed chat exports - should not be in git), data/ (gitignored runtime state)"
+}
