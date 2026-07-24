@@ -198,15 +198,17 @@ input, textarea, select { font-family: inherit; }
 
 .empty-hint { color: var(--text-faint); font-size: 13px; text-align: center; padding: 24px 12px; }
 
-.sidebar__foot { display: flex; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border); }
+.sidebar__foot { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border); }
+.sidebar__foot-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
 .foot-btn {
-  flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px;
-  padding: 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
-  background: transparent; color: var(--text-dim); font-size: 13px; font-weight: 500;
-  transition: background .16s, color .16s, border-color .16s;
+  display: grid; place-items: center; aspect-ratio: 1; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: transparent; color: var(--text-dim);
+  transition: background .16s, color .16s, border-color .16s, transform .12s;
 }
-.foot-btn:hover { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
-.foot-btn svg { width: 17px; height: 17px; }
+.foot-btn:hover { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); transform: translateY(-1px); }
+.foot-btn:active { transform: scale(.95); }
+.foot-btn svg { width: 18px; height: 18px; }
+.foot-btn__label { display: none; } /* labels removed — tooltips are enough */
 .ico-sun { display: none; }
 [data-theme="light"] .ico-moon { display: none; }
 [data-theme="light"] .ico-sun { display: block; }

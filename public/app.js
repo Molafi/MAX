@@ -40,6 +40,7 @@
   };
   const priceFor = (model) => PRICING[model] || { in: 5, out: 15 };
   const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+  const ALLOWED_TEXT_EXTS = new Set(["js", "ts", "jsx", "tsx", "py", "rb", "go", "rs", "java", "c", "cpp", "h", "cs", "swift", "kt", "php", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "sql", "html", "htm", "css", "scss", "sass", "less", "xml", "json", "jsonl", "yaml", "yml", "toml", "ini", "cfg", "env", "md", "mdx", "txt", "log", "csv", "tsv", "tex", "r", "m", "lua", "pl", "ex", "exs", "erl", "hs", "ml", "clj", "lisp", "el", "vim", "dockerfile", "makefile", "cmake", "gradle", "sbt", "tf", "hcl", "proto", "graphql", "gql", "vue", "svelte", "astro"]);
 
   const DEFAULT_MODELS = [
     { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
@@ -1524,17 +1525,36 @@
 
   function handleFiles(files) {
     for (const file of files) {
-      if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
-        toast("Use a JPEG, PNG, GIF, or WebP image.", "error");
+      // Images → visual attachment
+      if (ALLOWED_IMAGE_TYPES.has(file.type)) {
+        if (file.size > 5 * 1024 * 1024) { toast("Image too large (max 5MB)", "error"); continue; }
+        const reader = new FileReader();
+        reader.onload = () => {
+          state.attachments.push({ id: uid(), media_type: file.type, dataUrl: reader.result });
+          renderAttachments();
+        };
+        reader.readAsDataURL(file);
         continue;
       }
-      if (file.size > 5 * 1024 * 1024) { toast("Image too large (max 5MB)", "error"); continue; }
-      const reader = new FileReader();
-      reader.onload = () => {
-        state.attachments.push({ id: uid(), media_type: file.type, dataUrl: reader.result });
-        renderAttachments();
-      };
-      reader.readAsDataURL(file);
+      // Text/code files → inject into the message as context
+      const ext = (file.name.split(".").pop() || "").toLowerCase();
+      const isText = ALLOWED_TEXT_EXTS.has(ext) || file.type.startsWith("text/") || file.type === "application/json" || file.type === "application/xml" || file.name.toLowerCase() === "dockerfile" || file.name.toLowerCase() === "makefile";
+      if (isText) {
+        if (file.size > 512 * 1024) { toast(`${file.name} too large (max 512KB for text files)`, "error"); continue; }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const content = reader.result;
+          const input = $("#input");
+          const lang = ext || "";
+          const block = `\n\nFile \`${file.name}\`:\n\`\`\`${lang}\n${content}\n\`\`\`\n`;
+          input.value = (input.value + block).trimStart();
+          autoResize(input); updateCharCount(); updateSendState(); input.focus();
+          toast(`Added ${file.name} (${Math.round(file.size / 1024) || 1} KB)`, "success");
+        };
+        reader.readAsText(file);
+        continue;
+      }
+      toast(`${file.name}: unsupported file type. Upload images or text/code files.`, "error");
     }
   }
 
