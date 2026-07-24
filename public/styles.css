@@ -373,6 +373,9 @@ input, textarea, select { font-family: inherit; }
 @media (min-width: 900px) {
   .preview-overlay { padding: 20px; }
   .preview-panel { width: 80vw; max-width: 1200px; height: 80vh; margin: auto; border-radius: 16px; border: 1px solid var(--border-strong); box-shadow: var(--shadow); overflow: hidden; }
+  /* Fullscreen toggle: fill the whole viewport, drop the rounded frame. */
+  .preview-panel--full { width: 100vw; height: 100dvh; max-width: none; border-radius: 0; border: none; }
+  .preview-overlay:has(.preview-panel--full) { padding: 0; }
 }
 
 /* message actions */

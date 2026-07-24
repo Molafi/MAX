@@ -28,6 +28,9 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 **Rich rendering**
 - Markdown (bold, lists, tables, quotes, links)
 - Syntax‑highlighted code blocks with one‑click **Copy**
+- **Live preview panel** — click **▶ Run** on any HTML / SVG / CSS / React / Mermaid code
+  block to render it in a sandboxed iframe, go **fullscreen**, open in a new tab, download
+  the source, or **Save as PNG** (great for exporting a generated chart or diagram)
 - Copy any message, **regenerate** the last answer, **edit** a previous message & re‑run
 - Per‑message **token usage** (input / output)
 
