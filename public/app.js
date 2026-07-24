@@ -1243,10 +1243,26 @@
       if (m.role === "user" && m.images && m.images.length) {
         const content = [];
         for (const im of m.images) {
-          content.push({
-            type: "image",
-            source: { type: "base64", media_type: im.media_type, data: im.dataUrl.split(",")[1] },
-          });
+          if (im.media_type === "application/pdf") {
+            // PDF document — Claude supports this as a document block
+            content.push({
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: im.dataUrl.split(",")[1] },
+            });
+          } else if (im.media_type && im.media_type.startsWith("image/")) {
+            // Image — vision
+            content.push({
+              type: "image",
+              source: { type: "base64", media_type: im.media_type, data: im.dataUrl.split(",")[1] },
+            });
+          } else if (im.fileName) {
+            // Other binary file — include as a text note describing the attachment
+            // (most models can't process raw binary, so we describe it)
+            content.push({
+              type: "text",
+              text: `[Attached file: ${im.fileName} (${im.media_type || "unknown type"}, ${formatSize(im.fileSize || 0)}). The binary content is available but cannot be displayed as text.]`,
+            });
+          }
         }
         if (m.content) content.push({ type: "text", text: m.content });
         return { role: "user", content };
@@ -2154,20 +2170,44 @@
   /* ---------- attachments ---------- */
   function renderAttachments() {
     const box = $("#attachments");
-    box.innerHTML = state.attachments.map((a) =>
-      `<div class="attachment" data-id="${a.id}">
-        <img src="${a.dataUrl}" alt="attachment">
+    box.innerHTML = state.attachments.map((a) => {
+      if (a.media_type && a.media_type.startsWith("image/")) {
+        return `<div class="attachment" data-id="${a.id}">
+          <img src="${a.dataUrl}" alt="attachment">
+          <button class="attachment__remove" data-remove="${a.id}" title="Remove">×</button>
+        </div>`;
+      }
+      // Non-image file (PDF, ZIP, etc.) → show as a file chip
+      const name = a.fileName || "file";
+      const size = a.fileSize ? ` (${formatSize(a.fileSize)})` : "";
+      const icon = fileTypeIcon(a.media_type, name);
+      return `<div class="attachment attachment--file" data-id="${a.id}">
+        <span class="attachment__icon">${icon}</span>
+        <span class="attachment__name" title="${esc(name + size)}">${esc(name)}</span>
         <button class="attachment__remove" data-remove="${a.id}" title="Remove">×</button>
-      </div>`).join("");
+      </div>`;
+    }).join("");
     updateSendState();
+  }
+
+  function fileTypeIcon(mime, name) {
+    const ext = (name || "").split(".").pop().toLowerCase();
+    if (ext === "pdf" || mime === "application/pdf") return "📕";
+    if (["zip", "tar", "gz", "rar", "7z", "bz2"].includes(ext)) return "📦";
+    if (["doc", "docx"].includes(ext)) return "📝";
+    if (["xls", "xlsx"].includes(ext)) return "📊";
+    if (["ppt", "pptx"].includes(ext)) return "📽️";
+    if (["mp3", "wav", "ogg", "m4a"].includes(ext)) return "🎵";
+    if (["mp4", "mov", "avi", "mkv"].includes(ext)) return "🎬";
+    return "📎";
   }
   function clearAttachments() { state.attachments = []; renderAttachments(); }
 
   function handleFiles(files) {
     for (const file of files) {
-      // Images → visual attachment
-      if (ALLOWED_IMAGE_TYPES.has(file.type)) {
-        if (file.size > 5 * 1024 * 1024) { toast("Image too large (max 5MB)", "error"); continue; }
+      // Images → visual attachment (sent as base64 to the model for vision)
+      if (file.type.startsWith("image/")) {
+        if (file.size > 10 * 1024 * 1024) { toast(`${file.name} too large (max 10MB for images)`, "error"); continue; }
         const reader = new FileReader();
         reader.onload = () => {
           state.attachments.push({ id: uid(), media_type: file.type, dataUrl: reader.result });
@@ -2176,11 +2216,29 @@
         reader.readAsDataURL(file);
         continue;
       }
-      // Text/code files → inject into the message as context
+
+      // Determine if we can read this as text
       const ext = (file.name.split(".").pop() || "").toLowerCase();
-      const isText = ALLOWED_TEXT_EXTS.has(ext) || file.type.startsWith("text/") || file.type === "application/json" || file.type === "application/xml" || file.name.toLowerCase() === "dockerfile" || file.name.toLowerCase() === "makefile";
+      const isText = ALLOWED_TEXT_EXTS.has(ext) ||
+        file.type.startsWith("text/") ||
+        file.type === "application/json" ||
+        file.type === "application/xml" ||
+        file.type === "application/javascript" ||
+        file.type === "application/x-yaml" ||
+        file.type === "application/toml" ||
+        file.name.toLowerCase() === "dockerfile" ||
+        file.name.toLowerCase() === "makefile";
+
+      // PDF → read as text (extract what we can) or attach as reference
+      const isPdf = ext === "pdf" || file.type === "application/pdf";
+
+      // Archives and binary files → attach as a file reference with metadata
+      const maxSize = 20 * 1024 * 1024; // 20MB universal cap
+      if (file.size > maxSize) { toast(`${file.name} too large (max 20MB)`, "error"); continue; }
+
       if (isText) {
-        if (file.size > 512 * 1024) { toast(`${file.name} too large (max 512KB for text files)`, "error"); continue; }
+        // Text/code → read and inject as a fenced code block
+        if (file.size > 1024 * 1024) { toast(`${file.name} too large for inline text (max 1MB)`, "error"); continue; }
         const reader = new FileReader();
         reader.onload = () => {
           const content = reader.result;
@@ -2189,13 +2247,47 @@
           const block = `\n\nFile \`${file.name}\`:\n\`\`\`${lang}\n${content}\n\`\`\`\n`;
           input.value = (input.value + block).trimStart();
           autoResize(input); updateCharCount(); updateSendState(); input.focus();
-          toast(`Added ${file.name} (${Math.round(file.size / 1024) || 1} KB)`, "success");
+          toast(`Added ${file.name} (${formatSize(file.size)})`, "success");
         };
         reader.readAsText(file);
-        continue;
+      } else if (isPdf) {
+        // PDF → read as base64, attach as a document the model can read (Claude supports PDF)
+        const reader = new FileReader();
+        reader.onload = () => {
+          state.attachments.push({
+            id: uid(),
+            media_type: "application/pdf",
+            dataUrl: reader.result,
+            fileName: file.name,
+            fileSize: file.size,
+          });
+          renderAttachments();
+          toast(`Attached ${file.name} (${formatSize(file.size)})`, "success");
+        };
+        reader.readAsDataURL(file);
+      } else {
+        // Any other file (ZIP, binary, etc.) → read as base64, show as file attachment
+        const reader = new FileReader();
+        reader.onload = () => {
+          state.attachments.push({
+            id: uid(),
+            media_type: file.type || "application/octet-stream",
+            dataUrl: reader.result,
+            fileName: file.name,
+            fileSize: file.size,
+          });
+          renderAttachments();
+          toast(`Attached ${file.name} (${formatSize(file.size)})`, "success");
+        };
+        reader.readAsDataURL(file);
       }
-      toast(`${file.name}: unsupported file type. Upload images or text/code files.`, "error");
     }
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   }
 
   /* ============================================================

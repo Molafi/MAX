@@ -1019,6 +1019,12 @@ function isValidMessage(message) {
     if (block.type === "tool_result") {
       return typeof block.tool_use_id === "string";
     }
+    // Document blocks (e.g. PDF sent as base64)
+    if (block.type === "document") {
+      return block.source?.type === "base64" &&
+        typeof block.source.media_type === "string" &&
+        typeof block.source.data === "string" && block.source.data.length > 0;
+    }
     return block.type === "image" && block.source?.type === "base64" &&
       ALLOWED_IMAGE_TYPES.has(block.source.media_type) && typeof block.source.data === "string" &&
       block.source.data.length > 0;
