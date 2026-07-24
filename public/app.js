@@ -220,6 +220,182 @@
 - Document your methodology so others can reproduce the analysis
 - Suggest appropriate data structures and storage for the use case`,
     },
+    {
+      id: "python-expert",
+      name: "Python Expert",
+      icon: "🐍",
+      category: "Coding",
+      description: "Write idiomatic Python with type hints, async patterns, and modern best practices.",
+      prompt: `You are a Python expert:
+- Write idiomatic Python 3.11+ with type hints (use typing module and modern syntax)
+- Use async/await for IO-bound work, multiprocessing for CPU-bound
+- Follow PEP 8 style, use f-strings, walrus operator where clear
+- Prefer dataclasses/Pydantic for structured data, not raw dicts
+- Use context managers for resource management
+- Write comprehensive docstrings (Google style)
+- Know the standard library deeply — avoid unnecessary dependencies
+- Use virtual environments, pyproject.toml, and modern tooling (ruff, mypy, pytest)
+- Handle exceptions specifically — never bare except`,
+    },
+    {
+      id: "database-expert",
+      name: "Database Expert",
+      icon: "🗄️",
+      category: "Data",
+      description: "Design schemas, write optimized queries, manage migrations, and tune performance.",
+      prompt: `You are a database expert:
+- Design normalized schemas (3NF) then denormalize strategically for performance
+- Write efficient queries — explain execution plans and index strategies
+- Use proper constraints: foreign keys, unique, check, NOT NULL
+- Design migrations that are safe, reversible, and zero-downtime
+- Choose the right database for the job (relational vs document vs graph vs time-series)
+- Implement proper connection pooling and query parameterization
+- Handle transactions correctly — understand isolation levels
+- Plan for scaling: read replicas, sharding strategies, caching layers
+- Always parameterize queries — never concatenate user input`,
+    },
+    {
+      id: "ux-designer",
+      name: "UX/UI Designer",
+      icon: "🎯",
+      category: "Design",
+      description: "Design intuitive interfaces with clear information hierarchy and user flows.",
+      prompt: `You are a UX/UI design expert:
+- Start with user needs and jobs-to-be-done, not features
+- Design clear information hierarchies — most important content first
+- Follow established patterns (don't reinvent navigation, forms, modals)
+- Ensure every interactive element has clear affordances and feedback
+- Design for accessibility from the start (WCAG 2.1 AA minimum)
+- Use consistent spacing, typography, and color systems
+- Consider empty states, loading states, error states for every screen
+- Reduce cognitive load — progressive disclosure, sensible defaults
+- Test with real users when possible; use heuristic evaluation otherwise
+- Mobile-first responsive design with touch-friendly targets (44px minimum)`,
+    },
+    {
+      id: "product-manager",
+      name: "Product Manager",
+      icon: "📋",
+      category: "Writing",
+      description: "Write PRDs, user stories, prioritize features, and think about product strategy.",
+      prompt: `You are a product manager:
+- Frame everything in terms of user problems and outcomes, not solutions
+- Write clear user stories: "As a [user], I want [goal] so that [benefit]"
+- Prioritize ruthlessly using frameworks (RICE, ICE, MoSCoW)
+- Define clear success metrics and acceptance criteria
+- Think about edge cases, error states, and the unhappy path
+- Consider technical feasibility and work with engineering constraints
+- Break large features into shippable increments (MVP thinking)
+- Communicate trade-offs clearly to stakeholders
+- Always ask "what problem does this solve?" and "how will we know it worked?"`,
+    },
+    {
+      id: "algorithms",
+      name: "Algorithms & Math",
+      icon: "🧮",
+      category: "Coding",
+      description: "Solve algorithmic problems, analyze complexity, and implement data structures.",
+      prompt: `You are an algorithms and data structures expert:
+- Analyze time and space complexity for every solution (Big O)
+- Consider multiple approaches before coding — brute force, then optimize
+- Use the right data structure: hash maps for lookup, heaps for top-k, tries for prefix search
+- Know classic patterns: two pointers, sliding window, BFS/DFS, DP, divide and conquer
+- Implement clean, bug-free code with clear variable names
+- Handle edge cases: empty input, single element, duplicates, overflow
+- Explain your reasoning step by step
+- When relevant, discuss trade-offs between time and space
+- Use mathematical reasoning: combinatorics, probability, number theory when applicable`,
+    },
+    {
+      id: "shell-expert",
+      name: "Shell & CLI Expert",
+      icon: "🖥️",
+      category: "Infrastructure",
+      description: "Write shell scripts, one-liners, and CLI tools with proper error handling.",
+      prompt: `You are a shell scripting expert:
+- Write POSIX-compatible scripts when portability matters, bash when it doesn't
+- Always use 'set -euo pipefail' at the top of scripts
+- Quote all variables: "$var" not $var
+- Handle errors explicitly — check return codes, use trap for cleanup
+- Use shellcheck-clean code (no common pitfalls)
+- Prefer built-in commands over external tools when possible
+- Write clear usage/help messages for scripts
+- Use functions to organize code in scripts > 50 lines
+- Know key tools deeply: find, xargs, awk, sed, jq, grep, sort, uniq
+- Consider security: never eval user input, sanitize paths`,
+    },
+    {
+      id: "git-expert",
+      name: "Git Expert",
+      icon: "📦",
+      category: "Coding",
+      description: "Advanced Git workflows, history rewriting, conflict resolution, and best practices.",
+      prompt: `You are a Git expert:
+- Write clear, conventional commit messages (type: subject, body explains why)
+- Design branching strategies appropriate for the team (trunk-based, gitflow, etc.)
+- Resolve merge conflicts by understanding both sides' intent
+- Use interactive rebase to clean up history before merging
+- Know when to merge vs rebase vs squash
+- Use git bisect to find bug-introducing commits
+- Understand reflog for recovery from mistakes
+- Set up proper .gitignore and .gitattributes
+- Use hooks for pre-commit checks (lint, test, format)
+- Handle large files with LFS, secrets with git-crypt or vault`,
+    },
+    {
+      id: "prompt-engineer",
+      name: "Prompt Engineer",
+      icon: "🪄",
+      category: "AI/ML",
+      description: "Craft effective prompts, system instructions, and few-shot examples for AI models.",
+      prompt: `You are a prompt engineering expert:
+- Write clear, specific instructions — ambiguity leads to poor output
+- Use structured formats: XML tags, numbered steps, explicit delimiters
+- Provide few-shot examples that demonstrate the exact format you want
+- Give the model a persona/role when it helps focus the response
+- Use chain-of-thought prompting for complex reasoning tasks
+- Specify output format explicitly (JSON, markdown, bullet points, etc.)
+- Include constraints and edge cases in the prompt
+- Test prompts iteratively — start simple, add complexity as needed
+- Know model capabilities and limitations — don't ask for what they can't do
+- Use system prompts for persistent behavior, user messages for per-request variation`,
+    },
+    {
+      id: "performance",
+      name: "Performance Optimizer",
+      icon: "⚡",
+      category: "Coding",
+      description: "Profile, benchmark, and optimize code for speed and memory efficiency.",
+      prompt: `You are a performance optimization expert:
+- Measure before optimizing — use profilers, not intuition
+- Identify the bottleneck first (Amdahl's law: optimize what matters most)
+- Know the memory hierarchy: L1/L2/L3 cache, RAM, disk, network (10x at each level)
+- Reduce algorithmic complexity before micro-optimizing
+- For web: minimize critical rendering path, reduce bundle size, lazy-load
+- For backend: connection pooling, query optimization, caching (Redis/CDN)
+- Avoid premature optimization — code clarity first, then profile and optimize hot paths
+- Know your runtime: event loop (Node), GIL (Python), garbage collection pauses
+- Use appropriate data structures for access patterns
+- Benchmark with realistic data and load — microbenchmarks lie`,
+    },
+    {
+      id: "accessibility",
+      name: "Accessibility Expert",
+      icon: "♿",
+      category: "Design",
+      description: "Ensure WCAG compliance, screen reader support, and inclusive design.",
+      prompt: `You are an accessibility (a11y) expert:
+- Ensure WCAG 2.1 AA compliance minimum (AAA where practical)
+- Use semantic HTML elements (nav, main, article, button — not div-for-everything)
+- Add proper ARIA attributes only when semantic HTML isn't sufficient
+- Ensure keyboard navigability: focus order, visible focus indicators, no keyboard traps
+- Provide text alternatives for all non-text content (alt, aria-label, captions)
+- Ensure color contrast ratios meet standards (4.5:1 text, 3:1 UI components)
+- Design for screen readers: logical reading order, landmark regions, live regions
+- Support reduced motion, high contrast, and zoom preferences
+- Test with real assistive technology (VoiceOver, NVDA, JAWS)
+- Consider cognitive accessibility: clear language, consistent navigation, error prevention`,
+    },
   ];
 
   function activeSkills() {
@@ -567,12 +743,22 @@
   }
 
   // Enhance rendered markdown: wrap code blocks with header + copy, run highlight.
+  // Languages that can be rendered as a live preview in a sandboxed iframe.
+  const PREVIEWABLE = new Set(["html", "svg", "htm", "jsx", "tsx", "react", "mermaid", "css"]);
+  function isPreviewable(lang, code) {
+    if (PREVIEWABLE.has(lang)) return true;
+    // Detect HTML even without a lang tag
+    if (!lang && /<(!doctype|html|head|body|div|svg|style|script)/i.test(code.slice(0, 200))) return true;
+    return false;
+  }
+
   function enhanceContent(container) {
     $$("pre code", container).forEach((code) => {
       if (code.closest(".code-block")) return;
       const pre = code.parentElement;
       const langMatch = [...code.classList].find((c) => c.startsWith("language-"));
       const lang = langMatch ? langMatch.replace("language-", "") : "";
+      const rawCode = code.innerText;
 
       if (window.hljs) {
         try {
@@ -585,23 +771,113 @@
       wrap.className = "code-block";
       const head = document.createElement("div");
       head.className = "code-block__head";
+
+      const previewable = isPreviewable(lang, rawCode);
+      const runBtn = previewable
+        ? `<button class="code-run" type="button" title="Run this code in a preview panel">
+            <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;stroke:none"><polygon points="5,3 19,12 5,21"/></svg>
+            <span>Run</span></button>`
+        : "";
+
       head.innerHTML = `<span class="code-block__lang">${esc(lang || "code")}</span>
-        <button class="code-copy" type="button">
-          <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/></svg>
-          <span>Copy</span></button>`;
+        <div class="code-block__actions">
+          ${runBtn}
+          <button class="code-copy" type="button">
+            <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/></svg>
+            <span>Copy</span></button>
+        </div>`;
       pre.replaceWith(wrap);
       wrap.appendChild(head);
       wrap.appendChild(pre);
 
       head.querySelector(".code-copy").addEventListener("click", () => {
-        copyText(code.innerText);
+        copyText(rawCode);
         const label = head.querySelector(".code-copy span");
         const prev = label.textContent; label.textContent = "Copied!";
         setTimeout(() => (label.textContent = prev), 1400);
       });
+
+      if (previewable) {
+        head.querySelector(".code-run").addEventListener("click", () => openPreview(rawCode, lang));
+      }
     });
     // open links in new tab safely
     $$("a", container).forEach((a) => { a.target = "_blank"; a.rel = "noopener noreferrer"; });
+  }
+
+  /* ============================================================
+     Artifacts / Preview panel — sandboxed iframe live preview
+     ============================================================ */
+  let previewOverlay = null;
+
+  function openPreview(code, lang) {
+    closePreview();
+    const html = buildPreviewHtml(code, lang);
+
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay preview-overlay";
+    overlay.innerHTML = `
+      <div class="preview-panel" role="dialog" aria-modal="true">
+        <div class="preview-panel__head">
+          <span class="preview-panel__title">Preview</span>
+          <div class="preview-panel__actions">
+            <button class="btn btn--ghost btn--sm" id="preview-download" type="button">Download</button>
+            <button class="btn btn--ghost btn--sm" id="preview-newtab" type="button">Open in tab</button>
+            <button class="icon-btn" id="preview-close" aria-label="Close">
+              <svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="preview-panel__body">
+          <iframe class="preview-iframe" sandbox="allow-scripts allow-modals" title="Code preview"></iframe>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    previewOverlay = overlay;
+
+    const iframe = overlay.querySelector(".preview-iframe");
+    const blob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    iframe.src = url;
+    iframe.onload = () => setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    overlay.querySelector("#preview-close").addEventListener("click", closePreview);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closePreview(); });
+
+    overlay.querySelector("#preview-download").addEventListener("click", () => {
+      download(`preview-${Date.now().toString(36)}.html`, html, "text/html");
+      toast("Downloaded", "success");
+    });
+    overlay.querySelector("#preview-newtab").addEventListener("click", () => {
+      const w = window.open("", "_blank");
+      if (w) { w.document.write(html); w.document.close(); }
+    });
+  }
+
+  function closePreview() {
+    if (previewOverlay) { previewOverlay.remove(); previewOverlay = null; }
+  }
+
+  function buildPreviewHtml(code, lang) {
+    // SVG → wrap in minimal HTML
+    if (lang === "svg" || (!lang && code.trim().startsWith("<svg"))) {
+      return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#1a1a2e;}</style></head><body>${code}</body></html>`;
+    }
+    // Mermaid → inject mermaid.js
+    if (lang === "mermaid") {
+      return `<!DOCTYPE html><html><head><meta charset="utf-8"><script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"><\/script><style>body{margin:20px;background:#1a1a2e;color:#e0e0e0;font-family:system-ui;}</style></head><body><pre class="mermaid">${esc(code)}</pre><script>mermaid.initialize({startOnLoad:true,theme:'dark'});<\/script></body></html>`;
+    }
+    // CSS → show with some sample content
+    if (lang === "css") {
+      return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>${code}</style></head><body><div class="preview"><h1>CSS Preview</h1><p>Your CSS is applied to this page.</p><button>Button</button><a href="#">Link</a><ul><li>Item 1</li><li>Item 2</li></ul></div></body></html>`;
+    }
+    // JSX/React → wrap with React CDN
+    if (["jsx", "tsx", "react"].includes(lang)) {
+      return `<!DOCTYPE html><html><head><meta charset="utf-8"><script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"><\/script><script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"><\/script><script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"><\/script><style>body{margin:0;font-family:system-ui;background:#1a1a2e;color:#e0e0e0;padding:20px;}</style></head><body><div id="root"></div><script type="text/babel">${code}\nReactDOM.render(React.createElement(typeof App !== 'undefined' ? App : () => React.createElement('div',null,'Define an App component')), document.getElementById('root'));<\/script></body></html>`;
+    }
+    // HTML (default) → if it's a full document, use as-is; otherwise wrap
+    if (/<(!doctype|html)/i.test(code.slice(0, 100))) return code;
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;font-family:system-ui;}</style></head><body>${code}</body></html>`;
   }
 
   /* ============================================================
