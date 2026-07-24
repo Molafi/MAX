@@ -213,9 +213,20 @@ async function serveStatic(req, res) {
     if (info.isDirectory()) throw new Error("is dir");
     const data = await readFile(filePath);
     const ext = path.extname(filePath).toLowerCase();
+    // HTML and the service worker must always be revalidated so updates ship
+    // immediately; other static assets can be cached and revalidated cheaply
+    // with an ETag (browsers send If-None-Match → we can 304).
+    const revalidateOnly = ext === ".html" || filePath.endsWith("sw.js");
+    const etag = `W/"${info.size.toString(16)}-${info.mtimeMs.toString(16)}"`;
+    if (!revalidateOnly && req.headers["if-none-match"] === etag) {
+      res.writeHead(304, { ETag: etag, "Cache-Control": "public, max-age=0, must-revalidate" });
+      res.end();
+      return;
+    }
     res.writeHead(200, {
       "Content-Type": MIME[ext] || "application/octet-stream",
-      "Cache-Control": "no-cache",
+      "Cache-Control": revalidateOnly ? "no-cache" : "public, max-age=0, must-revalidate",
+      ...(revalidateOnly ? {} : { ETag: etag }),
     });
     res.end(data);
   } catch {
@@ -597,6 +608,11 @@ function handleHealth(req, res) {
 /*  Auth + admin endpoints                                             */
 /* ------------------------------------------------------------------ */
 const loginAttempts = new Map(); // ip -> { count, resetAt }
+// periodic cleanup so this map can't grow unbounded from unique IPs
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, b] of loginAttempts) if (now > b.resetAt) loginAttempts.delete(ip);
+}, 5 * 60_000).unref?.();
 function loginThrottled(ip) {
   const now = Date.now();
   let b = loginAttempts.get(ip);
