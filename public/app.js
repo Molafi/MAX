@@ -151,18 +151,26 @@
     syncConvosToServer();
   };
 
+  // Conversations touched since the last server sync. We only upload these
+  // rather than re-POSTing every conversation on every change.
+  const _dirtyConvos = new Set();
   let _syncDebounce = null;
   function syncConvosToServer() {
+    // Anything currently in state that has messages is a candidate; mark the
+    // active one (and any explicitly flagged) as dirty.
+    if (state.activeId) _dirtyConvos.add(state.activeId);
     clearTimeout(_syncDebounce);
     _syncDebounce = setTimeout(() => {
-      // Save each conversation with messages to the server
-      for (const c of state.conversations) {
-        if (!c.messages || !c.messages.length) continue;
+      const ids = [..._dirtyConvos];
+      _dirtyConvos.clear();
+      for (const id of ids) {
+        const c = state.conversations.find((x) => x.id === id);
+        if (!c || !c.messages || !c.messages.length) continue;
         fetch("/api/conversations", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(c),
-        }).catch(() => {}); // silent — localStorage is the primary store
+        }).catch(() => { _dirtyConvos.add(id); }); // re-queue on failure
       }
     }, 3000); // debounce 3s to batch rapid changes
   }
@@ -231,6 +239,7 @@
 
   function touchConvo(convo) {
     convo.updatedAt = Date.now();
+    if (convo && convo.id) _dirtyConvos.add(convo.id);
     // keep most-recent first
     state.conversations.sort((a, b) => b.updatedAt - a.updatedAt);
     saveConvos();
