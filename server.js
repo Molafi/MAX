@@ -454,13 +454,13 @@ function ensureSuperAdmin() {
 let BOOTSTRAP_NOTICE = "";
 
 /* ---------- session tokens (stateless, HMAC-signed) ---------- */
-// In-memory revocation set: stores { payloadHash, exp } for tokens revoked at logout.
-const _revokedTokens = new Set();
+// In-memory revocation map: key = payloadHash, value = exp timestamp.
+const _revokedTokens = new Map();
 // Periodically clean expired entries every 10 minutes.
 setInterval(() => {
   const now = Date.now();
-  for (const entry of _revokedTokens) {
-    if (now > entry.exp) _revokedTokens.delete(entry);
+  for (const [hash, exp] of _revokedTokens) {
+    if (now > exp) _revokedTokens.delete(hash);
   }
 }, 10 * 60_000).unref();
 
@@ -471,16 +471,13 @@ function _revokeToken(token) {
     const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     const exp = data.exp || Date.now() + CONFIG.auth.sessionTtlHours * 3600_000;
     const payloadHash = crypto.createHash("sha256").update(payload).digest("hex");
-    _revokedTokens.add({ payloadHash, exp });
+    _revokedTokens.set(payloadHash, exp);
   } catch {}
 }
 
 function _isTokenRevoked(payload) {
   const payloadHash = crypto.createHash("sha256").update(payload).digest("hex");
-  for (const entry of _revokedTokens) {
-    if (entry.payloadHash === payloadHash) return true;
-  }
-  return false;
+  return _revokedTokens.has(payloadHash);
 }
 
 function signSession(uid) {
@@ -519,7 +516,8 @@ function setSessionCookie(res, token) {
   res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`);
 }
 function clearSessionCookie(res) {
-  res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+  const secure = CONFIG.trustProxy ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`);
 }
 
 // Resolve the authenticated (non-disabled) user for a request, or null.

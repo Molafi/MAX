@@ -1,0 +1,23 @@
+{
+  "id": "FEAT-003",
+  "type": "fix",
+  "description": "Fix clearSessionCookie missing Secure flag and change revocation data structure from Set to Map for O(1) lookup",
+  "status": "in_progress",
+  "steps": [
+    "In clearSessionCookie, add the same conditional Secure flag that setSessionCookie uses when CONFIG.trustProxy is true",
+    "Change _revokedTokens from a Set to a Map keyed by payloadHash with exp timestamp as the value",
+    "Update _revokeToken to use Map.set(payloadHash, exp) instead of Set.add({payloadHash, exp})",
+    "Update _isTokenRevoked to use Map.has(payloadHash) for O(1) lookup instead of iterating",
+    "Update the cleanup interval to iterate Map entries and delete expired ones"
+  ],
+  "acceptance_criteria": [
+    "clearSessionCookie includes '; Secure' when CONFIG.trustProxy is true",
+    "_revokedTokens is a Map keyed by payloadHash",
+    "_isTokenRevoked performs O(1) lookup via Map.has()",
+    "Cleanup interval iterates entries and deletes expired keys",
+    "server.js passes node --check without errors"
+  ],
+  "verification": ["Run: env -u NODE_OPTIONS node --check server.js"],
+  "blocked_reason": null,
+  "findings": null
+}
