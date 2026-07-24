@@ -13,7 +13,7 @@
 
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
@@ -472,6 +472,91 @@ function touchSeen(u) {
   if (!u) return;
   const now = Date.now();
   if (!u.lastSeenAt || now - u.lastSeenAt > 60_000) { u.lastSeenAt = now; saveUsers(); }
+}
+
+/* ------------------------------------------------------------------ */
+/*  /api/conversations — server-side persistence (survives browser clear) */
+/* ------------------------------------------------------------------ */
+const CONVOS_DIR = path.join(DATA_DIR, "conversations");
+function ensureConvosDir() {
+  try { if (!existsSync(CONVOS_DIR)) mkdirSync(CONVOS_DIR, { recursive: true }); } catch {}
+}
+
+function handleConversationsList(req, res) {
+  ensureConvosDir();
+  const user = authUser(req);
+  const prefix = user ? `${user.id}_` : "";
+  try {
+    const files = readdirSync(CONVOS_DIR).filter((f) => f.endsWith(".json") && f.startsWith(prefix));
+    const convos = [];
+    for (const f of files) {
+      try {
+        const raw = readFileSync(path.join(CONVOS_DIR, f), "utf8");
+        const c = JSON.parse(raw);
+        // Return lightweight metadata (no full message bodies)
+        convos.push({ id: c.id, title: c.title, createdAt: c.createdAt, updatedAt: c.updatedAt, messageCount: (c.messages || []).length, repo: c.repo || null });
+      } catch {}
+    }
+    convos.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    return sendJson(res, 200, { conversations: convos });
+  } catch (err) {
+    return sendJson(res, 500, { error: { type: "server", message: "Could not list conversations." } });
+  }
+}
+
+function handleConversationGet(req, res, id) {
+  ensureConvosDir();
+  const user = authUser(req);
+  const prefix = user ? `${user.id}_` : "";
+  const file = path.join(CONVOS_DIR, `${prefix}${id}.json`);
+  try {
+    if (!existsSync(file)) return sendJson(res, 404, { error: { type: "not_found", message: "Conversation not found." } });
+    const raw = readFileSync(file, "utf8");
+    return sendJson(res, 200, JSON.parse(raw));
+  } catch {
+    return sendJson(res, 500, { error: { type: "server", message: "Could not read conversation." } });
+  }
+}
+
+async function handleConversationSave(req, res) {
+  ensureConvosDir();
+  let payload;
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON." } });
+  }
+  if (!payload || !payload.id || !Array.isArray(payload.messages)) {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Conversation must have 'id' and 'messages' array." } });
+  }
+  const user = authUser(req);
+  const prefix = user ? `${user.id}_` : "";
+  const safeId = String(payload.id).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+  if (!safeId) return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid conversation ID." } });
+  const file = path.join(CONVOS_DIR, `${prefix}${safeId}.json`);
+  try {
+    // Limit size: max 2MB per conversation
+    const json = JSON.stringify(payload);
+    if (Buffer.byteLength(json, "utf8") > 2 * 1024 * 1024) {
+      return sendJson(res, 413, { error: { type: "too_large", message: "Conversation is too large (max 2MB)." } });
+    }
+    writeFileSync(file, json, "utf8");
+    return sendJson(res, 200, { ok: true, id: safeId });
+  } catch (err) {
+    return sendJson(res, 500, { error: { type: "server", message: "Could not save conversation." } });
+  }
+}
+
+function handleConversationDelete(req, res, id) {
+  ensureConvosDir();
+  const user = authUser(req);
+  const prefix = user ? `${user.id}_` : "";
+  const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+  const file = path.join(CONVOS_DIR, `${prefix}${safeId}.json`);
+  try {
+    if (existsSync(file)) unlinkSync(file);
+    return sendJson(res, 200, { ok: true });
+  } catch {
+    return sendJson(res, 500, { error: { type: "server", message: "Could not delete conversation." } });
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1649,6 +1734,20 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/config" && req.method === "GET") {
       return handleConfig(req, res);
+    }
+    // ---- Conversation persistence ----
+    if (pathname === "/api/conversations" && req.method === "GET") {
+      return handleConversationsList(req, res);
+    }
+    if (pathname === "/api/conversations" && req.method === "POST") {
+      return await handleConversationSave(req, res);
+    }
+    let cm;
+    if ((cm = pathname.match(/^\/api\/conversations\/([^/]+)$/)) && req.method === "GET") {
+      return handleConversationGet(req, res, decodeURIComponent(cm[1]));
+    }
+    if ((cm = pathname.match(/^\/api\/conversations\/([^/]+)$/)) && req.method === "DELETE") {
+      return handleConversationDelete(req, res, decodeURIComponent(cm[1]));
     }
     if (pathname === "/api/chat" && req.method === "POST") {
       return await handleChat(req, res);

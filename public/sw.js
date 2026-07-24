@@ -1,8 +1,8 @@
 /* MAX service worker — installable app shell + offline static cache.
    Deliberately conservative: only GET, same-origin, non-API requests are cached.
    API calls (including the streaming /api/chat) always go straight to the network. */
-const CACHE = "max-shell-v1";
-const SHELL = ["/", "/index.html", "/styles.css", "/app.js", "/bg.js", "/favicon.svg", "/manifest.webmanifest"];
+const CACHE = "max-shell-v2";
+const SHELL = ["/", "/index.html", "/login.html", "/login.js", "/styles.css", "/app.js", "/bg.js", "/favicon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));

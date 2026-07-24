@@ -145,7 +145,57 @@
     } catch {}
     state.activeId = localStorage.getItem(LS.active) || null;
   }
-  const saveConvos = () => safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations), "Conversation history");
+  const saveConvos = () => {
+    safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations), "Conversation history");
+    // Auto-sync to server in the background (fire and forget)
+    syncConvosToServer();
+  };
+
+  let _syncDebounce = null;
+  function syncConvosToServer() {
+    clearTimeout(_syncDebounce);
+    _syncDebounce = setTimeout(() => {
+      // Save each conversation with messages to the server
+      for (const c of state.conversations) {
+        if (!c.messages || !c.messages.length) continue;
+        fetch("/api/conversations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(c),
+        }).catch(() => {}); // silent — localStorage is the primary store
+      }
+    }, 3000); // debounce 3s to batch rapid changes
+  }
+
+  async function loadConvosFromServer() {
+    try {
+      const res = await fetch("/api/conversations");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!Array.isArray(data.conversations) || !data.conversations.length) return;
+      // Merge server conversations that aren't already in localStorage
+      const localIds = new Set(state.conversations.map((c) => c.id));
+      let added = 0;
+      for (const meta of data.conversations) {
+        if (localIds.has(meta.id)) continue;
+        // Fetch the full conversation
+        try {
+          const full = await fetch(`/api/conversations/${encodeURIComponent(meta.id)}`);
+          if (!full.ok) continue;
+          const convo = await full.json();
+          if (convo && convo.id && Array.isArray(convo.messages)) {
+            state.conversations.push(convo);
+            added++;
+          }
+        } catch {}
+      }
+      if (added) {
+        state.conversations.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations));
+        renderConversations();
+      }
+    } catch {} // offline or server down — fine, just use localStorage
+  }
   const saveSettings = () => {
     // Deep-clone, then strip the two session-only secrets before persisting.
     const persistent = JSON.parse(JSON.stringify(state.settings));
@@ -322,6 +372,25 @@
 
   function showWelcome(show) {
     $("#welcome").style.display = show ? "" : "none";
+  }
+
+  function renderWelcomeStatus() {
+    const el = $("#welcome-status");
+    if (!el) return;
+    const hasKey = Boolean(state.settings.apiKey || state.config.hasServerKey);
+    const repo = activeRepo();
+    const hasGh = providerHasToken("github");
+    const items = [
+      { ok: hasKey, label: "AI provider", detail: hasKey ? currentModel() : "No key — add in Settings" },
+      { ok: hasGh, label: "GitHub", detail: hasGh ? (repo ? repo.fullName : "Connected") : "Not connected" },
+      { ok: Boolean(repo), label: "Working repo", detail: repo ? `${repo.fullName} (${repo.branch})` : "None selected" },
+    ];
+    el.innerHTML = `<div class="status-grid">${items.map((i) => `
+      <div class="status-item">
+        <span class="status-dot ${i.ok ? "status-dot--ok" : "status-dot--warn"}"></span>
+        <span class="status-label">${esc(i.label)}</span>
+        <span class="status-detail">${esc(i.detail)}</span>
+      </div>`).join("")}</div>`;
   }
 
   function renderMessages() {
@@ -1033,7 +1102,7 @@
           const b = blocks[evt.index];
           if (evt.delta?.type === "text_delta" && evt.delta.text) {
             if (b) b.text = (b.text || "") + evt.delta.text;
-            curText += evt.delta.text; rerender(); scrollToBottomIfNear();
+            curText += evt.delta.text; if (curText.length < 20) setStreamLabel("Writing…"); rerender(); scrollToBottomIfNear();
           } else if (evt.delta?.type === "thinking_delta" && evt.delta.thinking) {
             curThinking += evt.delta.thinking; rerender();
           } else if (evt.delta?.type === "input_json_delta" && evt.delta.partial_json != null && b) {
@@ -1130,10 +1199,17 @@
       let round = 0;
       for (; round <= MAX_TOOL_ROUNDS; round++) {
         if (state.abort.signal.aborted) break;
-        const turn = await runModelTurn(apiMessages, useModel, toolDefs, stream, {
-          priorText: finalText ? finalText + "\n\n" : "",
-          toolRuns,
-        });
+        let turn;
+        try {
+          turn = await runModelTurn(apiMessages, useModel, toolDefs, stream, {
+            priorText: finalText ? finalText + "\n\n" : "",
+            toolRuns,
+          });
+        } catch (turnErr) {
+          // If we already have some text, preserve it and break gracefully
+          if (finalText.trim() || toolRuns.length) break;
+          throw turnErr; // propagate to outer catch if nothing was produced
+        }
         usage = mergeUsage(usage, turn.usage);
         if (turn.thinking) finalThinking = turn.thinking;
         if (turn.text) finalText = finalText ? finalText + "\n\n" + turn.text : turn.text;
@@ -1151,14 +1227,24 @@
         const resultBlocks = [];
         for (const tu of turn.toolUses) {
           const run = toolRuns.find((r) => r.id === tu.id) || { id: tu.id, name: tu.name, input: tu.input, status: "running" };
+          setStreamLabel(describeToolRun(run));
           let result, ok = true;
           try { result = await executeTool(tu.name, tu.input); }
-          catch (e) { ok = false; result = "Error: " + (e?.message || e); }
+          catch (e) {
+            ok = false;
+            const msg = e?.message || String(e);
+            // Provide actionable error messages so the model can self-correct
+            if (/no.*token|connect.*first/i.test(msg)) result = `Error: ${msg} (The user needs to add a token in Settings → GitHub before this can work.)`;
+            else if (/not found|404|does not exist/i.test(msg)) result = `Error: ${msg} (The file or path may not exist — check the path and try again.)`;
+            else if (/too large|413/i.test(msg)) result = `Error: ${msg} (Try a smaller file or a narrower read.)`;
+            else result = `Error: ${msg}`;
+          }
           run.status = ok ? "done" : "error";
           run.result = result;
           stream.setAgent(finalText, true, finalThinking, toolRuns);
           resultBlocks.push({ type: "tool_result", tool_use_id: tu.id, content: String(result), ...(ok ? {} : { is_error: true }) });
         }
+        setStreamLabel("Thinking…");
         apiMessages.push({ role: "user", content: resultBlocks });
       }
 
@@ -1388,6 +1474,31 @@
     $("#stop-btn").hidden = !active;
     $("#send-btn").hidden = active;
     updateSendState();
+    // Streaming status indicator in topbar
+    const status = $("#stream-status");
+    if (status) {
+      status.hidden = !active;
+      if (active) {
+        state._streamStart = Date.now();
+        state._streamInterval = setInterval(updateStreamTimer, 1000);
+        setStreamLabel("Thinking…");
+      } else {
+        clearInterval(state._streamInterval);
+        state._streamInterval = null;
+      }
+    }
+  }
+
+  function updateStreamTimer() {
+    const el = $("#stream-timer");
+    if (!el || !state._streamStart) return;
+    const sec = Math.round((Date.now() - state._streamStart) / 1000);
+    el.textContent = sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${sec % 60}s`;
+  }
+
+  function setStreamLabel(text) {
+    const el = $("#stream-label");
+    if (el) el.textContent = text || "Working…";
   }
 
   /* ---------- attachments ---------- */
@@ -1964,6 +2075,107 @@
       const onDoc = (e) => { if (filesPickerEl && !filesPickerEl.contains(e.target) && !anchorBtn.contains(e.target)) { closeFilesPicker(); document.removeEventListener("mousedown", onDoc); } };
       document.addEventListener("mousedown", onDoc);
     }, 0);
+  }
+
+  /* ---------- file tree panel ---------- */
+  function openTreePanel() {
+    const r = activeRepo();
+    if (!r) { toast("Pick a repository first.", "error"); return; }
+    $("#tree-overlay").hidden = false;
+    $("#tree-title").textContent = `Files · ${r.fullName}`;
+    $("#tree-filter").value = "";
+    loadTreePanel();
+    setTimeout(() => $("#tree-filter").focus(), 30);
+  }
+  function closeTreePanel() { $("#tree-overlay").hidden = true; }
+
+  async function loadTreePanel() {
+    const content = $("#tree-content");
+    content.innerHTML = `<div class="repo-spinner" style="margin:30px auto"></div>`;
+    try {
+      const files = (await getTree()).filter((f) => !isBinaryPath(f.path));
+      renderTree(files, "");
+      $("#tree-filter").addEventListener("input", () => renderTree(files, $("#tree-filter").value.trim()));
+    } catch (err) {
+      content.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)}</div>`;
+    }
+  }
+
+  function renderTree(files, filter) {
+    const content = $("#tree-content");
+    const q = filter.toLowerCase();
+    const filtered = q ? files.filter((f) => f.path.toLowerCase().includes(q)) : files;
+
+    if (!filtered.length) { content.innerHTML = `<div class="repo-pop__msg">${q ? "No files match." : "Empty repository."}</div>`; return; }
+
+    // Build a nested tree structure
+    const root = {};
+    for (const f of filtered) {
+      const parts = f.path.split("/");
+      let node = root;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (!node[parts[i]]) node[parts[i]] = {};
+        node = node[parts[i]];
+      }
+      node[parts[parts.length - 1]] = null; // null = file leaf
+    }
+
+    const html = renderTreeNode(root, "", 0);
+    content.innerHTML = `<div class="file-tree">${html}</div>`;
+
+    // Wire up folder toggles
+    content.querySelectorAll(".tree-folder-toggle").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const li = btn.closest(".tree-folder");
+        li.classList.toggle("collapsed");
+      });
+    });
+
+    // Wire up file clicks (insert into chat)
+    content.querySelectorAll(".tree-file").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const path = btn.dataset.path;
+        closeTreePanel();
+        insertFileIntoChat(path);
+      });
+    });
+  }
+
+  function renderTreeNode(node, prefix, depth) {
+    let html = "";
+    const entries = Object.entries(node).sort(([a, va], [b, vb]) => {
+      // Directories first, then files
+      const aDir = va !== null ? 0 : 1;
+      const bDir = vb !== null ? 0 : 1;
+      if (aDir !== bDir) return aDir - bDir;
+      return a.localeCompare(b);
+    });
+
+    for (const [name, value] of entries) {
+      const fullPath = prefix ? `${prefix}/${name}` : name;
+      if (value === null) {
+        // File
+        const ext = (name.split(".").pop() || "").toLowerCase();
+        const icon = fileIcon(ext);
+        html += `<div class="tree-item tree-file" data-path="${esc(fullPath)}" style="padding-left:${12 + depth * 16}px" title="${esc(fullPath)}">
+          <span class="tree-icon">${icon}</span><span class="tree-name">${esc(name)}</span>
+        </div>`;
+      } else {
+        // Directory
+        html += `<div class="tree-folder" style="padding-left:${depth * 16}px">
+          <div class="tree-item tree-folder-toggle" style="padding-left:${12}px">
+            <span class="tree-arrow">▸</span><span class="tree-icon">📁</span><span class="tree-name">${esc(name)}</span>
+          </div>
+          <div class="tree-children">${renderTreeNode(value, fullPath, depth + 1)}</div>
+        </div>`;
+      }
+    }
+    return html;
+  }
+
+  function fileIcon(ext) {
+    const icons = { js: "📜", ts: "📘", jsx: "⚛️", tsx: "⚛️", py: "🐍", rb: "💎", go: "🔵", rs: "🦀", java: "☕", css: "🎨", html: "🌐", json: "📋", md: "📝", yml: "⚙️", yaml: "⚙️", toml: "⚙️", sh: "🖥️", sql: "🗃️", svg: "🖼️" };
+    return icons[ext] || "📄";
   }
 
   /* ---------- @file mention autocomplete ---------- */
@@ -2893,6 +3105,39 @@ a{color:#22d3ee}</style></head>
   }
 
   /* ============================================================
+     Keyboard shortcuts help
+     ============================================================ */
+  function openShortcutsHelp() {
+    const mod = navigator.platform.includes("Mac") ? "⌘" : "Ctrl";
+    const shortcuts = [
+      { keys: `${mod}+K`, desc: "Open command palette" },
+      { keys: `${mod}+F`, desc: "Find in conversation" },
+      { keys: `${mod}+Shift+O`, desc: "New chat" },
+      { keys: `${mod}+?`, desc: "Show this shortcuts help" },
+      { keys: "Enter", desc: "Send message" },
+      { keys: "Shift+Enter", desc: "New line in message" },
+      { keys: "Escape", desc: "Close any open modal or panel" },
+      { keys: "/command", desc: "Slash commands (type / in composer)" },
+      { keys: "@filename", desc: "Insert a repo file (type @ in composer)" },
+    ];
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `<div class="modal modal--sm" role="dialog" aria-modal="true">
+      <div class="modal__head"><h2>Keyboard shortcuts</h2><button class="icon-btn" data-x aria-label="Close"><svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+      <div class="modal__body" style="gap:4px">
+        ${shortcuts.map((s) => `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">
+          <span style="color:var(--text-dim);font-size:13.5px">${esc(s.desc)}</span>
+          <kbd style="font-family:var(--mono);font-size:12px;padding:3px 8px;border-radius:6px;background:var(--surface-2);border:1px solid var(--border-strong);color:var(--text);white-space:nowrap">${esc(s.keys)}</kbd>
+        </div>`).join("")}
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelectorAll("[data-x]").forEach((b) => b.addEventListener("click", () => overlay.remove()));
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
+  }
+
+  /* ============================================================
      Theme
      ============================================================ */
   function applyTheme(theme) {
@@ -3161,6 +3406,8 @@ a{color:#22d3ee}</style></head>
       saveActive();
     }
     saveConvos();
+    // Also delete from server
+    fetch(`/api/conversations/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
     renderConversations();
     renderMessages();
     updateModelPill();
@@ -3343,6 +3590,11 @@ a{color:#22d3ee}</style></head>
     $("#powers-btn").addEventListener("click", openPowers);
     $("#powers-close").addEventListener("click", closePowers);
     $("#powers-overlay").addEventListener("click", (e) => { if (e.target.id === "powers-overlay") closePowers(); });
+
+    // file tree panel
+    $("#tree-btn").addEventListener("click", openTreePanel);
+    $("#tree-close").addEventListener("click", closeTreePanel);
+    $("#tree-overlay").addEventListener("click", (e) => { if (e.target.id === "tree-overlay") closeTreePanel(); });
     $("#powers-search-input").addEventListener("input", renderPowers);
     $$(".powers-tab").forEach((t) => t.addEventListener("click", () => {
       powersScope = t.dataset.scope;
@@ -3377,10 +3629,12 @@ a{color:#22d3ee}</style></head>
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); closeAdmin(); }
+      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); closeAdmin(); closeTreePanel(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") { e.preventDefault(); toggleFindBar(true); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }
+      if (e.key === "/" && !e.ctrlKey && !e.metaKey && document.activeElement === document.body) { e.preventDefault(); openShortcutsHelp(); }
+      if ((e.metaKey || e.ctrlKey) && e.key === "?") { e.preventDefault(); openShortcutsHelp(); }
     });
 
     // find bar
@@ -3428,6 +3682,9 @@ a{color:#22d3ee}</style></head>
 
     loadState();
 
+    // Merge any server-persisted conversations not in localStorage (e.g. after browser clear)
+    await loadConvosFromServer();
+
     // fetch server config
     try {
       const res = await fetch("/api/config");
@@ -3460,6 +3717,7 @@ a{color:#22d3ee}</style></head>
     updateKeyStatus();
     updateAutoPill();
     updateRepoChip();
+    renderWelcomeStatus();
     renderConversations();
     renderMessages();
     updateCharCount();
