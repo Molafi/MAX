@@ -1,0 +1,23 @@
+{
+  "id": "FEAT-002",
+  "type": "fix",
+  "description": "Fix frontend bugs, UX issues, and improve robustness of the client-side code",
+  "status": "completed",
+  "steps": [
+    "Fix potential memory leak in the streaming timer (app.js): state._streamInterval is set via setInterval but clearInterval is only called in toggleStreamingUI(false). If the browser tab stays active across many messages, rapid toggling could leave orphan intervals. Add a guard to clear any existing interval before creating a new one.",
+    "Fix the LCS diff algorithm performance for large files (app.js diffLines function around line 2800): the O(n*m) DP table uses Int32Array but for files with thousands of lines this creates a huge matrix. Add a line count guard (e.g. skip full diff for files over 2000 lines and show a summary instead).",
+    "Fix potential XSS in tool run results display (app.js toolRunsHtml): tool results are escaped via esc() in a <pre> tag, but the 4000-char slice could still cause rendering issues. This is safe but ensure consistency - verify esc() handles all edge cases including backticks and null bytes.",
+    "Fix conversation search performance: renderConversations (app.js) does a full scan of all messages for the search query. For users with many conversations this will be slow. Add debouncing to the search input (it already has a handler but no debounce).",
+    "Fix the autonomous mode confirm dialog using native confirm(): this blocks the main thread and is jarring UX. Consider replacing with a non-blocking custom modal that matches the app's premium design.",
+    "Fix missing error boundary in the init() function: if loadConvosFromServer() or fetch('/api/config') fails with a non-network error (e.g. JSON parse error), the app could silently break. Add explicit try/catch with user-facing error messages."
+  ],
+  "acceptance_criteria": [
+    "No duplicate intervals can accumulate during streaming",
+    "Diff viewer handles files over 2000 lines gracefully without freezing the browser",
+    "Search input in the sidebar has debounce behavior",
+    "The app initializes without errors even when server returns malformed data"
+  ],
+  "verification": ["Run: env -u NODE_OPTIONS node --check public/app.js (syntax check)"],
+  "blocked_reason": null,
+  "findings": "All 4 acceptance criteria satisfied. (1) Streaming timer: clearInterval guard added before setInterval to prevent orphan intervals on rapid toggling. (2) Diff performance: files over 2000 lines skip LCS and show simplified all-del/all-add output. (3) Search debounce: 200ms timeout on sidebar search input. (4) Init robustness: try/catch around renderConversations/renderMessages with recovery path that clears corrupted state. Node --check passes for both server.js and public/app.js."
+}
