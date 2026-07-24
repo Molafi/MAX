@@ -6,6 +6,9 @@
 # Auth data (users, session secret) — never commit
 data/
 
+# User-generated chat exports
+max-chats/
+
 # Node
 node_modules/
 npm-debug.log*

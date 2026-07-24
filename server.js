@@ -273,7 +273,7 @@ function applySecurityHeaders(res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(self), geolocation=()");
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; " +
@@ -454,6 +454,35 @@ function ensureSuperAdmin() {
 let BOOTSTRAP_NOTICE = "";
 
 /* ---------- session tokens (stateless, HMAC-signed) ---------- */
+// In-memory revocation set: stores { payloadHash, exp } for tokens revoked at logout.
+const _revokedTokens = new Set();
+// Periodically clean expired entries every 10 minutes.
+setInterval(() => {
+  const now = Date.now();
+  for (const entry of _revokedTokens) {
+    if (now > entry.exp) _revokedTokens.delete(entry);
+  }
+}, 10 * 60_000).unref();
+
+function _revokeToken(token) {
+  if (!token || token.indexOf(".") === -1) return;
+  const [payload] = token.split(".");
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const exp = data.exp || Date.now() + CONFIG.auth.sessionTtlHours * 3600_000;
+    const payloadHash = crypto.createHash("sha256").update(payload).digest("hex");
+    _revokedTokens.add({ payloadHash, exp });
+  } catch {}
+}
+
+function _isTokenRevoked(payload) {
+  const payloadHash = crypto.createHash("sha256").update(payload).digest("hex");
+  for (const entry of _revokedTokens) {
+    if (entry.payloadHash === payloadHash) return true;
+  }
+  return false;
+}
+
 function signSession(uid) {
   const payload = b64url(JSON.stringify({ uid, exp: Date.now() + CONFIG.auth.sessionTtlHours * 3600_000 }));
   const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
@@ -465,6 +494,7 @@ function verifySessionToken(token) {
   const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
   const a = Buffer.from(sig || ""), b = Buffer.from(expected);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  if (_isTokenRevoked(payload)) return null;
   try {
     const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     if (!data.exp || Date.now() > data.exp) return null;
@@ -485,7 +515,8 @@ function parseCookies(req) {
 }
 function setSessionCookie(res, token) {
   const maxAge = CONFIG.auth.sessionTtlHours * 3600;
-  res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}`);
+  const secure = CONFIG.trustProxy ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`);
 }
 function clearSessionCookie(res) {
   res.setHeader("Set-Cookie", `${CONFIG.auth.cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
@@ -541,7 +572,9 @@ function handleConversationGet(req, res, id) {
   ensureConvosDir();
   const user = authUser(req);
   const prefix = user ? `${user.id}_` : "";
-  const file = path.join(CONVOS_DIR, `${prefix}${id}.json`);
+  const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+  if (!safeId) return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid conversation ID." } });
+  const file = path.join(CONVOS_DIR, `${prefix}${safeId}.json`);
   try {
     if (!existsSync(file)) return sendJson(res, 404, { error: { type: "not_found", message: "Conversation not found." } });
     const raw = readFileSync(file, "utf8");
@@ -662,6 +695,9 @@ async function handleLogin(req, res) {
 }
 
 function handleLogout(req, res) {
+  // Revoke the session token server-side so it cannot be replayed.
+  const token = parseCookies(req)[CONFIG.auth.cookieName];
+  if (token) _revokeToken(token);
   clearSessionCookie(res);
   sendJson(res, 200, { ok: true });
 }
@@ -1668,9 +1704,27 @@ async function handlePowerFetch(req, res) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20_000);
   try {
-    const r = await fetch(url.href, { redirect: "follow", headers: { "User-Agent": "MAX-chat web-fetch", Accept: "text/html,text/plain,application/json,*/*" }, signal: controller.signal });
+    const fetchOpts = { redirect: "manual", headers: { "User-Agent": "MAX-chat web-fetch", Accept: "text/html,text/plain,application/json,*/*" }, signal: controller.signal };
+    let r = await fetch(url.href, fetchOpts);
+    // Follow redirects manually, validating each hop against blocked hosts (max 5 redirects).
+    let redirectsLeft = 5;
+    while (redirectsLeft > 0 && [301, 302, 303, 307, 308].includes(r.status)) {
+      const location = r.headers.get("location");
+      if (!location) break;
+      let nextUrl;
+      try { nextUrl = new URL(location, url.href); } catch { break; }
+      if (nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") {
+        return sendJson(res, 403, { error: { type: "blocked", message: "Redirect to a disallowed protocol." } });
+      }
+      if (isBlockedHost(nextUrl.hostname)) {
+        return sendJson(res, 403, { error: { type: "blocked", message: "Redirect to a blocked host is not allowed." } });
+      }
+      r = await fetch(nextUrl.href, fetchOpts);
+      redirectsLeft--;
+    }
     const type = r.headers.get("content-type") || "";
-    if (!r.ok) return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: `Fetch failed (HTTP ${r.status}).` } });
+    if (!r.ok && ![301, 302, 303, 307, 308].includes(r.status)) return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: `Fetch failed (HTTP ${r.status}).` } });
+    if ([301, 302, 303, 307, 308].includes(r.status)) return sendJson(res, 502, { error: { type: "network", message: "Too many redirects." } });
     const buf = Buffer.from(await r.arrayBuffer());
     if (buf.length > MAX_FETCH_BYTES) return sendJson(res, 413, { error: { type: "too_large", message: "Page is too large to fetch." } });
     let text = buf.toString("utf8");

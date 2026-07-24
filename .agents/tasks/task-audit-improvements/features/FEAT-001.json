@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Fix security vulnerabilities, bugs, and code quality issues identified during the project audit",
+  "status": "in_progress",
+  "steps": [
+    "Fix path traversal vulnerability in handleConversationGet (server.js line 540-549): the id parameter is not sanitized unlike the save/delete handlers. Apply the same sanitization pattern: String(id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)",
+    "Fix SSRF bypass via redirect in handlePowerFetch (server.js line ~1671): the fetch uses redirect:'follow' but only checks isBlockedHost on the initial URL. After a redirect to an internal host, the request would proceed. Add redirect:'manual' and validate redirect Location, or use redirect:'error' and let the user retry with the final URL.",
+    "Fix missing Secure flag on session cookies (server.js line 488): when deployed behind HTTPS (production), cookies should have the Secure flag. Add conditional Secure flag when behind a reverse proxy or when the request is HTTPS.",
+    "Fix Permissions-Policy blocking microphone (server.js line 276): the header sets microphone=() which blocks the voice input feature. Change to microphone=(self) to allow the app's own voice input to work.",
+    "Add max-chats/ to .gitignore: the directory contains user-generated content (chat exports) that should not be in the repository.",
+    "Fix missing CSRF protection: POST endpoints like /api/chat, /api/github/push, etc. do not validate Origin/Referer headers. Add basic origin checking for state-changing API endpoints when auth is enabled.",
+    "Fix race condition in file-based user store (server.js saveUsers/loadUsers): concurrent requests can cause lost writes since the JSON file is read into memory once and written back without file locking. Add a simple write queue or use atomic file writes (write to temp then rename).",
+    "Fix stateless session tokens that cannot be revoked on logout (server.js handleLogout): logout only clears the cookie client-side but the HMAC-signed token remains valid until expiry. Add a server-side deny list (in-memory set of revoked token hashes) checked in verifySessionToken."
+  ],
+  "acceptance_criteria": [
+    "handleConversationGet sanitizes the id parameter identically to handleConversationSave and handleConversationDelete",
+    "The web fetch power does not follow redirects to blocked/private hosts",
+    "Session cookies include Secure flag when TRUST_PROXY is enabled",
+    "Permissions-Policy allows microphone for self origin",
+    "max-chats/ is in .gitignore",
+    "server.js passes node --check without errors"
+  ],
+  "verification": ["Run: env -u NODE_OPTIONS node --check server.js"],
+  "blocked_reason": null,
+  "findings": ""
+}
