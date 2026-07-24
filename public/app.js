@@ -2129,6 +2129,7 @@
       status.hidden = !active;
       if (active) {
         state._streamStart = Date.now();
+        if (state._streamInterval) clearInterval(state._streamInterval);
         state._streamInterval = setInterval(updateStreamTimer, 1000);
         setStreamLabel("Thinking…");
       } else {
@@ -2926,6 +2927,13 @@
   function diffLines(oldStr, newStr) {
     const a = (oldStr || "").split("\n");
     const b = (newStr || "").split("\n");
+    // Guard: skip full LCS for large files to avoid freezing the browser
+    if (a.length > 2000 || b.length > 2000) {
+      const out = [];
+      for (let i = 0; i < a.length; i++) out.push({ type: "del", text: a[i] });
+      for (let j = 0; j < b.length; j++) out.push({ type: "add", text: b[j] });
+      return out;
+    }
     const n = a.length, mm = b.length;
     const dp = Array.from({ length: n + 1 }, () => new Int32Array(mm + 1));
     for (let i = n - 1; i >= 0; i--)
@@ -4208,7 +4216,10 @@ a{color:#22d3ee}</style></head>
     $("#conversation-list").addEventListener("keydown", (e) => {
       if (e.key === "Enter") { const conv = e.target.closest(".conv"); if (conv) selectConversation(conv.dataset.id); }
     });
-    $("#search-input").addEventListener("input", renderConversations);
+    $("#search-input").addEventListener("input", () => {
+      clearTimeout(state._searchDebounce);
+      state._searchDebounce = setTimeout(renderConversations, 200);
+    });
 
     // suggestions
     $("#suggestions").addEventListener("click", (e) => {
@@ -4433,8 +4444,18 @@ a{color:#22d3ee}</style></head>
     updateRepoChip();
     renderWelcomeStatus();
     updateSkillsBadge();
-    renderConversations();
-    renderMessages();
+    try {
+      renderConversations();
+      renderMessages();
+    } catch (e) {
+      console.error("Corrupted conversation state, resetting:", e);
+      state.conversations = [];
+      state.activeId = null;
+      safeStorageSet(localStorage, LS.convos, "[]");
+      renderConversations();
+      renderMessages();
+      toast("Chat history was corrupted and has been reset.", "error");
+    }
     updateCharCount();
     updateSendState();
     updateUsagePill();
