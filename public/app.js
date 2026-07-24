@@ -396,6 +396,53 @@
 - Test with real assistive technology (VoiceOver, NVDA, JAWS)
 - Consider cognitive accessibility: clear language, consistent navigation, error prevention`,
     },
+    {
+      id: "data-visualizer",
+      name: "Data Visualizer",
+      icon: "📈",
+      category: "Data",
+      description: "Turn data & math into runnable charts you can preview and export as an image.",
+      prompt: `You are a data visualization expert. When asked to plot, graph, or visualize:
+- Produce a SELF-CONTAINED, runnable artifact the user can preview and export — prefer an \`\`\`html code block that draws the chart with inline <canvas> + vanilla JS (or an <svg>), so it runs in a sandboxed iframe with no external data
+- Do NOT default to Python/matplotlib unless the user explicitly wants Python — this app previews HTML/SVG/JS in the browser, not Python
+- Label axes, add a title, a legend when there are multiple series, and readable tick marks
+- Pick the right chart type: line for trends, bar for comparisons, scatter for correlation, pie only for parts-of-a-whole
+- Use a clean, high-contrast palette and enough padding that nothing is clipped
+- Annotate key points (max/min, the answer the user asked for) directly on the chart
+- After the code block, briefly explain what the chart shows and any assumptions about the data`,
+    },
+    {
+      id: "eli5",
+      name: "Explain Like I'm 5",
+      icon: "🧒",
+      category: "Writing",
+      description: "Explain any concept in plain, simple language with everyday analogies.",
+      prompt: `You are a teacher who makes hard things simple. When explaining:
+- Start with a one-sentence plain-language answer, no jargon
+- Use a concrete everyday analogy the reader already understands
+- Build up in small steps, checking understanding as you go
+- Define any unavoidable technical term the moment you use it
+- Prefer short sentences and simple words over precise-but-dense phrasing
+- Use a small worked example with real numbers or a real scenario
+- End with a one-line "in short" recap
+- Never condescend — simple does not mean childish`,
+    },
+    {
+      id: "math-tutor",
+      name: "Math Tutor",
+      icon: "➗",
+      category: "Data",
+      description: "Solve and teach math step by step, showing every step and checking the answer.",
+      prompt: `You are a patient math tutor. When solving problems:
+- Restate the problem and identify exactly what is being asked
+- Show EVERY step with the reasoning, not just the final answer
+- Keep formulas and steps on their own lines so they're easy to follow
+- Explain WHY each step is valid (the rule or theorem used)
+- Watch for common mistakes (sign errors, order of operations, unit mismatches) and flag them
+- Verify the final answer by substituting back or sanity-checking magnitude/units
+- When a picture would help (geometry, graphs, vectors), offer a runnable \`\`\`html or \`\`\`svg diagram
+- End with a short "how to recognize this type of problem next time" tip`,
+    },
   ];
 
   function activeSkills() {
@@ -825,8 +872,12 @@
         <div class="preview-panel__head">
           <span class="preview-panel__title">Preview</span>
           <div class="preview-panel__actions">
+            <button class="btn btn--ghost btn--sm" id="preview-png" type="button">Save PNG</button>
             <button class="btn btn--ghost btn--sm" id="preview-download" type="button">Download</button>
             <button class="btn btn--ghost btn--sm" id="preview-newtab" type="button">Open in tab</button>
+            <button class="icon-btn" id="preview-fullscreen" type="button" title="Fullscreen" aria-label="Toggle fullscreen">
+              <svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3M3 16v3a2 2 0 002 2h3m8 0h3a2 2 0 002-2v-3"/></svg>
+            </button>
             <button class="icon-btn" id="preview-close" aria-label="Close">
               <svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg>
             </button>
@@ -856,6 +907,83 @@
       const w = window.open("", "_blank");
       if (w) { w.document.write(html); w.document.close(); }
     });
+
+    overlay.querySelector("#preview-fullscreen").addEventListener("click", () => {
+      overlay.querySelector(".preview-panel").classList.toggle("preview-panel--full");
+    });
+
+    overlay.querySelector("#preview-png").addEventListener("click", () => {
+      exportPreviewPng(overlay.querySelector(".preview-iframe"), code, lang);
+    });
+  }
+
+  // Render the current preview to a PNG the user can download. SVG artifacts are
+  // rasterised directly; HTML/other artifacts are drawn from the live iframe via
+  // an SVG <foreignObject> snapshot (all local, no dependencies or network).
+  function exportPreviewPng(iframe, code, lang) {
+    const finish = (canvas) => {
+      canvas.toBlob((blob) => {
+        if (!blob) { toast("Could not render PNG", "error"); return; }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `preview-${Date.now().toString(36)}.png`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        toast("Saved PNG", "success");
+      }, "image/png");
+    };
+
+    // Direct path for SVG source — most reliable and crisp.
+    const isSvg = lang === "svg" || code.trim().startsWith("<svg");
+    if (isSvg) {
+      const img = new Image();
+      const svgBlob = new Blob([code], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(svgBlob);
+      img.onload = () => {
+        const w = img.width || 900, h = img.height || 600;
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#1a1a2e"; ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        finish(canvas);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); toast("Could not render PNG", "error"); };
+      img.src = url;
+      return;
+    }
+
+    // HTML/other: snapshot the live iframe document via foreignObject.
+    try {
+      const doc = iframe.contentDocument;
+      const rect = iframe.getBoundingClientRect();
+      const w = Math.max(1, Math.round(rect.width)) * 2;
+      const h = Math.max(1, Math.round(rect.height)) * 2;
+      const inner = doc ? new XMLSerializer().serializeToString(doc.documentElement) : "";
+      const svg =
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${rect.width} ${rect.height}">` +
+        `<foreignObject width="100%" height="100%">${inner.replace(/^<html/, '<html xmlns="http://www.w3.org/1999/xhtml"')}</foreignObject></svg>`;
+      const img = new Image();
+      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#1a1a2e"; ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        finish(canvas);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        toast("PNG export isn't available for this preview — use “Open in tab” and screenshot it.", "error");
+      };
+      img.src = url;
+    } catch {
+      toast("PNG export isn't available for this preview — use “Open in tab” and screenshot it.", "error");
+    }
   }
 
   function closePreview() {
