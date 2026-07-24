@@ -627,7 +627,7 @@
     let sys = state.settings.system || "";
     const repo = activeRepo();
     if (repo) {
-      sys += `\n\n[Working repository] The user has selected the ${repo.provider} repository ${repo.fullName} (branch ${repo.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo.fullName}.`;
+      sys += `\n\n[Working repository] The user has selected the ${repo.provider} repository ${repo.fullName} (branch ${repo.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo.fullName}. The user can switch to a different repository at any time using the repository chip — all tools automatically target whichever repo is currently selected.`;
       sys += `\n\n[Reading the repo] You can read this repository YOURSELF using tools — do not ask the user to paste files. Use \`list_repo_files\` to see the layout, \`search_repo\` to find files by name, and \`read_repo_file\` to read a file's contents. Always inspect the real files before answering questions about the code or proposing changes.`;
       sys += `\n\n[Editing the repo] You can edit this repository like a coding agent using tools: \`write_file\` (create or fully overwrite a file), \`edit_file\` (replace an exact snippet — preferred for small, precise changes), and \`delete_file\`. Always read a file before editing it so your \`old_str\` matches exactly. Make real edits with these tools instead of pasting whole files into the chat.`;
       sys += `\n\n[Committing & pushing] You CAN push to the repository yourself — never tell the user you are unable to push. Edits are first STAGED, then when the user asks you to commit or push, call \`commit_changes\`: by default it pushes directly to the working branch, or pass open_pr:true to push to a new branch and open a pull request. If the user doesn't ask you to push, leave the changes staged so they can review the diff. After editing, briefly summarize what you changed.`;
@@ -1818,13 +1818,13 @@
     if (r) {
       lbl.textContent = r.fullName;
       chip.classList.add("selected");
-      chip.title = `MAX is working in ${r.fullName} (${r.provider}, branch ${r.branch || "main"})`;
+      chip.title = `Working in ${r.fullName} (${r.provider}, ${r.branch || "main"}) — click to switch repos`;
       clear.hidden = false;
       if (filesBtn) filesBtn.hidden = false;
     } else {
       lbl.textContent = "Add repository";
       chip.classList.remove("selected");
-      chip.title = "Choose a repository for MAX to work in";
+      chip.title = "Pick a repository — MAX can then read, edit & push to it";
       clear.hidden = true;
       if (filesBtn) filesBtn.hidden = true;
     }
@@ -1844,6 +1844,8 @@
     c.repo = bind;
     touchConvo(c);
     state.settings.lastRepo = bind;
+    // Keep Settings in sync so the fields always reflect the active repo.
+    // This means: pick a repo from the chip → Settings auto-updates → no confusion.
     if (provider === "github") {
       state.settings.github.owner = repo.owner;
       state.settings.github.repo = repo.name;
@@ -1854,7 +1856,7 @@
     renderConversations();
     treeCache = null; // invalidate cached file tree
     clearPendingEdits(); // staged edits belong to the previous repo
-    toast(`MAX is now working in ${repo.fullName}`, "success");
+    toast(`Switched to ${repo.fullName} — MAX can now read, edit & push here`, "success");
   }
 
   function clearRepo() {
@@ -1929,7 +1931,8 @@
     pop.setAttribute("role", "dialog");
     pop.innerHTML = `
       <div class="repo-pop__head">
-        <div class="repo-pop__title">Add repository</div>
+        <div class="repo-pop__title">Switch repository</div>
+        <div class="repo-pop__hint">Pick any repo — MAX reads, edits &amp; pushes to it instantly</div>
         <div class="repo-pop__tabs">
           <button class="repo-tab" data-tab="github" type="button">GitHub</button>
           <button class="repo-tab" data-tab="gitlab" type="button">GitLab</button>

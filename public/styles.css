@@ -449,6 +449,7 @@ input, textarea, select { font-family: inherit; }
 }
 .repo-pop__head { padding: 12px 14px 8px; }
 .repo-pop__title { font-size: 12px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: var(--text-faint); }
+.repo-pop__hint { font-size: 11.5px; color: var(--text-faint); margin-top: 3px; font-weight: 400; letter-spacing: 0; text-transform: none; }
 .repo-pop__tabs { display: flex; gap: 6px; margin-top: 8px; background: var(--surface-2); padding: 4px; border-radius: 10px; }
 .repo-tab { flex: 1; padding: 7px; border-radius: 7px; border: none; background: transparent; color: var(--text-dim); font-size: 13px; font-weight: 600; }
 .repo-tab.active { background: var(--surface-solid); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.2); }
