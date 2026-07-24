@@ -139,6 +139,9 @@
         </div>
         <div class="topbar__right">
           <span class="usage-pill" id="usage-pill" title="Token usage / estimated cost" hidden></span>
+          <button class="icon-btn" id="skills-btn" title="Skills — toggle Claude's expertise">
+            <svg viewBox="0 0 24 24"><path d="M12 2l2.4 7.4h7.6l-6.2 4.5 2.4 7.4L12 16.7l-6.2 4.6 2.4-7.4L2 9.4h7.6z"/></svg>
+          </button>
           <button class="icon-btn" id="find-btn" title="Find in conversation (Ctrl/⌘+F)" aria-label="Find in conversation">
             <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
           </button>
@@ -499,6 +502,22 @@
   <input type="file" id="import-input" accept="application/json,.json" hidden />
 
   <!-- Toast host -->
+  <!-- ============================ Skills modal ============================ -->
+  <div class="modal-overlay" id="skills-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="skills-title" style="max-width:640px">
+      <div class="modal__head">
+        <h2 id="skills-title">Skills</h2>
+        <button class="icon-btn" id="skills-close" aria-label="Close">
+          <svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal__body" style="gap:12px">
+        <p class="field__help" style="margin:0">Toggle skills to give Claude specialized expertise. Active skills are injected into the system prompt.</p>
+        <div id="skills-grid"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- ============================ File Tree panel ============================ -->
   <div class="modal-overlay" id="tree-overlay" hidden>
     <div class="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="tree-title">

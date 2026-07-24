@@ -18,6 +18,234 @@
   let GL_SESSION_KEY = "max.glToken.session.v1";
   const DONE_MARKER = "[[MAX_DONE]]";
 
+  /* ---------- Skills catalog ---------- */
+  const SKILLS_CATALOG = [
+    {
+      id: "senior-engineer",
+      name: "Senior Engineer",
+      icon: "👨‍💻",
+      category: "Coding",
+      description: "Write production-grade code with best practices, error handling, types, and tests.",
+      prompt: `You are a senior software engineer with 15+ years of experience. Follow these principles:
+- Write clean, production-ready code with proper error handling, types, and edge cases
+- Follow SOLID principles, DRY, and separation of concerns
+- Include JSDoc/docstrings for public APIs
+- Suggest tests when writing new functions
+- Prefer composition over inheritance
+- Use meaningful variable/function names that serve as documentation
+- Handle errors gracefully — never silently swallow them
+- Consider performance, security, and maintainability in every decision`,
+    },
+    {
+      id: "code-reviewer",
+      name: "Code Reviewer",
+      icon: "🔍",
+      category: "Coding",
+      description: "Review code for bugs, security issues, performance, and best practices.",
+      prompt: `You are an expert code reviewer. When reviewing code:
+- Look for bugs, logic errors, and edge cases
+- Identify security vulnerabilities (injection, XSS, auth issues, secrets in code)
+- Check for performance problems (N+1 queries, unnecessary re-renders, memory leaks)
+- Suggest improvements to readability and maintainability
+- Verify error handling is comprehensive
+- Check for proper input validation
+- Note missing tests or test coverage gaps
+- Rate severity: 🔴 Critical / 🟡 Important / 🟢 Suggestion
+- Be specific: quote the problematic line and explain why + how to fix`,
+    },
+    {
+      id: "debugger",
+      name: "Debugger",
+      icon: "🐛",
+      category: "Coding",
+      description: "Systematically diagnose and fix bugs with root cause analysis.",
+      prompt: `You are an expert debugger. When diagnosing issues:
+- Ask clarifying questions about the symptoms, environment, and steps to reproduce
+- Form hypotheses ranked by likelihood, then systematically test each
+- Read the actual code (use tools) before guessing — never assume
+- Trace the data flow from input to the point of failure
+- Check for common culprits: off-by-one, null/undefined, race conditions, stale state, wrong types
+- When you find the root cause, explain WHY it fails (not just what to change)
+- Suggest a fix AND a way to prevent the same class of bug in the future
+- If relevant, suggest adding a regression test`,
+    },
+    {
+      id: "architect",
+      name: "System Architect",
+      icon: "🏗️",
+      category: "Coding",
+      description: "Design scalable systems with clear architecture decisions and trade-offs.",
+      prompt: `You are a system architect. When designing systems:
+- Start with requirements: functional, non-functional (scale, latency, availability)
+- Propose clear component boundaries with well-defined interfaces
+- Explain trade-offs explicitly (consistency vs availability, complexity vs flexibility)
+- Consider failure modes and how the system degrades gracefully
+- Draw on proven patterns: event sourcing, CQRS, saga, circuit breaker, etc.
+- Think about observability: logging, metrics, tracing from day one
+- Plan for evolution: how will this change in 6 months? 2 years?
+- Keep it as simple as possible — add complexity only when justified by requirements`,
+    },
+    {
+      id: "frontend-expert",
+      name: "Frontend Expert",
+      icon: "🎨",
+      category: "Coding",
+      description: "Build beautiful, accessible, performant UIs with modern best practices.",
+      prompt: `You are a frontend expert specializing in modern web development:
+- Write semantic HTML with proper ARIA attributes for accessibility
+- Use CSS best practices: custom properties, logical properties, container queries
+- Optimize performance: minimize layout thrashing, lazy-load, use will-change sparingly
+- Follow responsive design principles (mobile-first)
+- Handle loading, error, and empty states for every UI component
+- Use proper animation (prefer CSS transforms, respect prefers-reduced-motion)
+- Consider keyboard navigation and screen reader experience
+- Write components that are composable and testable`,
+    },
+    {
+      id: "api-designer",
+      name: "API Designer",
+      icon: "🔌",
+      category: "Coding",
+      description: "Design clean, consistent, well-documented REST/GraphQL APIs.",
+      prompt: `You are an API design expert:
+- Follow RESTful conventions: proper HTTP methods, status codes, resource naming
+- Design for consistency: naming patterns, pagination, error format, versioning
+- Include comprehensive error responses with actionable messages
+- Think about rate limiting, authentication, and authorization from the start
+- Design for backward compatibility — additive changes only
+- Document every endpoint clearly: parameters, responses, examples
+- Consider idempotency for mutations
+- Use proper validation with clear error messages for invalid input`,
+    },
+    {
+      id: "technical-writer",
+      name: "Technical Writer",
+      icon: "📝",
+      category: "Writing",
+      description: "Write clear documentation, READMEs, guides, and technical content.",
+      prompt: `You are a technical writer who produces clear, well-structured documentation:
+- Lead with the most important information (inverted pyramid)
+- Use headers, bullet points, and code blocks for scannability
+- Include practical examples for every concept
+- Write for your audience's level — don't over-explain or under-explain
+- Keep sentences short and direct. Avoid jargon unless defining it
+- Include a TL;DR or summary at the top for long documents
+- Add "Prerequisites" and "Next steps" sections where appropriate
+- Test instructions mentally — would a reader actually be able to follow them?`,
+    },
+    {
+      id: "refactorer",
+      name: "Refactoring Expert",
+      icon: "♻️",
+      category: "Coding",
+      description: "Safely refactor code: reduce complexity, improve readability, eliminate duplication.",
+      prompt: `You are a refactoring expert:
+- Make changes in small, safe steps that each maintain correctness
+- Identify code smells: long methods, deep nesting, feature envy, god objects
+- Extract reusable functions/modules with clear interfaces
+- Reduce cyclomatic complexity — prefer early returns and guard clauses
+- Eliminate duplication with the "Rule of Three"
+- Improve naming to make code self-documenting
+- Preserve existing behavior — refactoring changes structure, not functionality
+- Suggest which refactorings to do first (highest value, lowest risk)
+- Always read the code first to understand the full context before changing anything`,
+    },
+    {
+      id: "security-auditor",
+      name: "Security Auditor",
+      icon: "🔒",
+      category: "Security",
+      description: "Find security vulnerabilities and suggest hardening measures.",
+      prompt: `You are a security auditor:
+- Check for OWASP Top 10: injection, broken auth, sensitive data exposure, XSS, CSRF
+- Look for hardcoded secrets, tokens, or credentials
+- Verify input validation and output encoding
+- Check authentication and authorization at every endpoint
+- Look for insecure dependencies and outdated packages
+- Verify proper use of cryptography (no custom crypto, proper key management)
+- Check for information leakage in error messages and headers
+- Suggest security headers, CSP, and other defense-in-depth measures
+- Rate findings by severity and exploitability
+- Provide concrete remediation steps, not just observations`,
+    },
+    {
+      id: "test-engineer",
+      name: "Test Engineer",
+      icon: "🧪",
+      category: "Testing",
+      description: "Write comprehensive tests: unit, integration, E2E, with good coverage.",
+      prompt: `You are a test engineering expert:
+- Write tests that are readable, maintainable, and fast
+- Follow Arrange-Act-Assert (AAA) pattern
+- Test behavior, not implementation details
+- Cover happy paths, edge cases, error conditions, and boundary values
+- Use descriptive test names that explain what's being tested and expected
+- Mock external dependencies but test real integration points
+- Aim for high confidence, not just high coverage numbers
+- Write tests that fail for the right reasons and pass for the right reasons
+- Consider property-based testing for complex logic
+- Include both unit tests (isolated) and integration tests (end-to-end flows)`,
+    },
+    {
+      id: "devops",
+      name: "DevOps Engineer",
+      icon: "🚀",
+      category: "Infrastructure",
+      description: "CI/CD, Docker, Kubernetes, infrastructure as code, and deployment.",
+      prompt: `You are a DevOps engineer:
+- Design CI/CD pipelines that are fast, reliable, and secure
+- Write Dockerfiles following best practices: multi-stage builds, minimal images, non-root
+- Use infrastructure as code (Terraform, Pulumi, CloudFormation)
+- Implement proper secret management — never hardcode credentials
+- Design for observability: structured logging, metrics, distributed tracing
+- Implement blue/green or canary deployments for zero-downtime releases
+- Set up proper health checks, readiness probes, and graceful shutdown
+- Automate everything that's done more than twice
+- Plan for disaster recovery: backups, runbooks, incident response`,
+    },
+    {
+      id: "data-analyst",
+      name: "Data Analyst",
+      icon: "📊",
+      category: "Data",
+      description: "Analyze data, write SQL, create visualizations, and derive insights.",
+      prompt: `You are a data analyst:
+- Write efficient, readable SQL with proper indexing considerations
+- Clean and validate data before analysis — never trust raw input
+- Use appropriate statistical methods and explain assumptions
+- Create clear visualizations that tell a story
+- Distinguish correlation from causation
+- Provide actionable insights, not just numbers
+- Consider data privacy and anonymization requirements
+- Document your methodology so others can reproduce the analysis
+- Suggest appropriate data structures and storage for the use case`,
+    },
+  ];
+
+  function activeSkills() {
+    return (state.settings.skills || [])
+      .map((id) => SKILLS_CATALOG.find((s) => s.id === id))
+      .filter(Boolean);
+  }
+
+  function skillsSystemNote() {
+    const active = activeSkills();
+    if (!active.length) return "";
+    return "\n\n[Active skills]\n" + active.map((s) => s.prompt).join("\n\n");
+  }
+
+  function isSkillActive(id) { return (state.settings.skills || []).includes(id); }
+  function toggleSkill(id) {
+    if (!state.settings.skills) state.settings.skills = [];
+    if (isSkillActive(id)) {
+      state.settings.skills = state.settings.skills.filter((s) => s !== id);
+    } else {
+      state.settings.skills.push(id);
+    }
+    saveSettings();
+    renderSkills();
+  }
+
   function applyScope(uid) {
     if (!uid) return;
     SCOPE = "u_" + uid + ".";
@@ -138,6 +366,7 @@
       state.settings.github = Object.assign(githubDefaults(), state.settings.github || {});
       state.settings.gitlab = Object.assign({ token: "", branch: "main" }, state.settings.gitlab || {});
       if (!Array.isArray(state.settings.personas)) state.settings.personas = [];
+      if (!Array.isArray(state.settings.skills)) state.settings.skills = [];
       if (!state.settings.powers || !Array.isArray(state.settings.powers.installed)) state.settings.powers = { installed: [] };
       if (state.settings.provider !== "gitlab") state.settings.provider = "github";
       state.settings.apiKey = sessionStorage.getItem(SESSION_KEY) || "";
@@ -637,6 +866,7 @@
       sys += `\n\n[Tools] You have tools available. Call them when they help (for example to read repository files or fetch a web page) instead of guessing. Keep going until you can fully answer, then give your final answer as normal text.`;
     }
     sys += powersSystemNote();
+    sys += skillsSystemNote();
     if (state.settings.autonomous) {
       sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line.`;
     }
@@ -3137,6 +3367,54 @@ a{color:#22d3ee}</style></head>
   }
 
   /* ============================================================
+     Skills UI
+     ============================================================ */
+  function openSkills() { $("#skills-overlay").hidden = false; renderSkills(); }
+  function closeSkills() { $("#skills-overlay").hidden = true; }
+
+  function renderSkills() {
+    const grid = $("#skills-grid");
+    if (!grid) return;
+    const categories = [...new Set(SKILLS_CATALOG.map((s) => s.category))];
+    let html = "";
+    for (const cat of categories) {
+      const skills = SKILLS_CATALOG.filter((s) => s.category === cat);
+      html += `<div class="skills-category"><div class="skills-cat-label">${esc(cat)}</div>`;
+      html += skills.map((s) => {
+        const active = isSkillActive(s.id);
+        return `<div class="skill-card ${active ? "skill-card--active" : ""}">
+          <button class="skill-toggle" data-id="${esc(s.id)}" type="button" title="${active ? "Deactivate" : "Activate"} ${esc(s.name)}">
+            <span class="skill-icon">${s.icon}</span>
+            <div class="skill-info">
+              <div class="skill-name">${esc(s.name)}</div>
+              <div class="skill-desc">${esc(s.description)}</div>
+            </div>
+            <span class="skill-check">${active ? "✓" : ""}</span>
+          </button>
+        </div>`;
+      }).join("");
+      html += `</div>`;
+    }
+    // Show active count
+    const activeCount = activeSkills().length;
+    const badge = activeCount ? `<span class="skills-badge">${activeCount} active</span>` : "";
+    grid.innerHTML = badge + html;
+    grid.querySelectorAll(".skill-toggle").forEach((btn) => {
+      btn.addEventListener("click", () => toggleSkill(btn.dataset.id));
+    });
+    // Update topbar button badge
+    updateSkillsBadge();
+  }
+
+  function updateSkillsBadge() {
+    const btn = $("#skills-btn");
+    if (!btn) return;
+    const count = activeSkills().length;
+    btn.title = count ? `Skills (${count} active)` : "Skills — toggle Claude's expertise";
+    btn.classList.toggle("skills-active", count > 0);
+  }
+
+  /* ============================================================
      Keyboard shortcuts help
      ============================================================ */
   function openShortcutsHelp() {
@@ -3627,6 +3905,11 @@ a{color:#22d3ee}</style></head>
     $("#tree-btn").addEventListener("click", openTreePanel);
     $("#tree-close").addEventListener("click", closeTreePanel);
     $("#tree-overlay").addEventListener("click", (e) => { if (e.target.id === "tree-overlay") closeTreePanel(); });
+
+    // skills modal
+    $("#skills-btn").addEventListener("click", openSkills);
+    $("#skills-close").addEventListener("click", closeSkills);
+    $("#skills-overlay").addEventListener("click", (e) => { if (e.target.id === "skills-overlay") closeSkills(); });
     $("#powers-search-input").addEventListener("input", renderPowers);
     $$(".powers-tab").forEach((t) => t.addEventListener("click", () => {
       powersScope = t.dataset.scope;
@@ -3661,7 +3944,7 @@ a{color:#22d3ee}</style></head>
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); closeAdmin(); closeTreePanel(); }
+      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); closeAdmin(); closeTreePanel(); closeSkills(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") { e.preventDefault(); toggleFindBar(true); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }
@@ -3750,6 +4033,7 @@ a{color:#22d3ee}</style></head>
     updateAutoPill();
     updateRepoChip();
     renderWelcomeStatus();
+    updateSkillsBadge();
     renderConversations();
     renderMessages();
     updateCharCount();

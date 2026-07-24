@@ -579,6 +579,25 @@ pre.diff { margin: 0; padding: 8px 0; font-family: var(--mono); font-size: 12.5p
 /* mic recording state */
 #mic-btn.recording { color: var(--accent-3); animation: autopulse 1.3s ease-in-out infinite; }
 
+/* ============================================================
+   Skills
+   ============================================================ */
+.skills-category { margin-bottom: 16px; }
+.skills-cat-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-faint); padding: 4px 0 8px; }
+.skill-card { margin-bottom: 6px; }
+.skill-toggle { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); text-align: left; transition: border-color .2s, background .2s, transform .12s; }
+.skill-toggle:hover { border-color: var(--border-strong); background: var(--surface-2); transform: translateY(-1px); }
+.skill-card--active .skill-toggle { border-color: var(--accent-1); background: rgba(124,92,255,.08); }
+.skill-icon { font-size: 22px; flex-shrink: 0; width: 36px; text-align: center; }
+.skill-info { flex: 1; min-width: 0; }
+.skill-name { font-size: 14px; font-weight: 700; margin-bottom: 2px; }
+.skill-desc { font-size: 12.5px; color: var(--text-dim); line-height: 1.4; }
+.skill-check { width: 22px; height: 22px; flex-shrink: 0; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 800; color: #fff; background: var(--accent-grad); opacity: 0; transition: opacity .15s; }
+.skill-card--active .skill-check { opacity: 1; }
+.skills-badge { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 3px 10px; border-radius: 999px; background: var(--accent-grad); color: #fff; margin-bottom: 12px; }
+#skills-btn.skills-active { color: var(--accent-1); }
+#skills-btn.skills-active svg { fill: var(--accent-1); stroke: var(--accent-1); fill-opacity: .15; }
+
 /* File tree panel */
 .file-tree { font-size: 13px; }
 .tree-item { display: flex; align-items: center; gap: 7px; padding: 5px 12px; cursor: pointer; border-radius: 6px; margin: 1px 8px; transition: background .12s; }
