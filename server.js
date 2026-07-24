@@ -169,6 +169,8 @@ const MODELS = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8 — recommended" },
   { id: "glm-5.2", label: "GLM 5.2" },
   { id: "gpt-5.5", label: "GPT-5.5" },
+  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+  { id: "kimi-k3", label: "Kimi K3" },
 ];
 
 /* ------------------------------------------------------------------ */

@@ -441,6 +441,8 @@
     "claude-opus-4-6": { in: 15, out: 75 },
     "glm-5.2": { in: 0.6, out: 2.2 },
     "gpt-5.5": { in: 5, out: 15 },
+    "gpt-5.6-sol": { in: 5, out: 15 },
+    "kimi-k3": { in: 1, out: 4 },
   };
   const priceFor = (model) => PRICING[model] || { in: 5, out: 15 };
   const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
@@ -452,6 +454,8 @@
     { id: "claude-opus-4-8", label: "Claude Opus 4.8 — recommended" },
     { id: "glm-5.2", label: "GLM 5.2" },
     { id: "gpt-5.5", label: "GPT-5.5" },
+    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+    { id: "kimi-k3", label: "Kimi K3" },
   ];
 
   const LS = {
