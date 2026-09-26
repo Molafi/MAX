@@ -22,6 +22,7 @@ import {
   openAICompletionToSse, openAICompletionToAnthropic, normalizeEffort, sse,
 } from "./lib/providers.js";
 import { buildCatalog } from "./lib/models.js";
+import { createVideoService } from "./lib/video.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -683,6 +684,7 @@ function handleConfig(req, res) {
       hasServerToken: Boolean(CONFIG.gitlab.token),
       allowClientToken: CONFIG.gitlab.allowClientToken,
     },
+    video: video.publicConfig(),
   });
 }
 
@@ -2063,6 +2065,27 @@ async function handlePowerSearch(req, res) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  AI video generation (lib/video.js)                                 */
+/* ------------------------------------------------------------------ */
+const GATEWAY_BASE = (process.env.VIDEO_GATEWAY_BASE_URL || PROVIDERS.codecraft.baseUrl).replace(/\/+$/, "");
+const GATEWAY_IS_CODECRAFT = GATEWAY_BASE === PROVIDERS.codecraft.baseUrl;
+const video = createVideoService({
+  dataDir: DATA_DIR,
+  allowClientKey: CONFIG.allowClientKey,
+  sendJson,
+  readBody,
+  rateLimit: (req) => checkRateLimit(clientIp(req)),
+  openrouter: { key: process.env.OPENROUTER_API_KEY || "", base: process.env.OPENROUTER_BASE_URL },
+  google: { key: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "", base: process.env.GEMINI_BASE_URL },
+  gateway: {
+    base: GATEWAY_BASE,
+    key: process.env.VIDEO_GATEWAY_API_KEY || (GATEWAY_IS_CODECRAFT ? PROVIDERS.codecraft.key : ""),
+    label: process.env.VIDEO_GATEWAY_LABEL || (GATEWAY_IS_CODECRAFT ? "CodeCraft API (video)" : "OpenAI-compatible gateway"),
+    keyUrl: GATEWAY_IS_CODECRAFT ? PROVIDERS.codecraft.keyUrl : "",
+  },
+});
+
+/* ------------------------------------------------------------------ */
 /*  Router                                                             */
 /* ------------------------------------------------------------------ */
 const server = http.createServer(async (req, res) => {
@@ -2187,6 +2210,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/gitlab/mr" && req.method === "POST") {
       return await handleGitlabMr(req, res);
     }
+    if (pathname.startsWith("/api/video/")) {
+      if (await video.route(req, res, pathname, authUser(req)?.id || "")) return;
+    }
     if (pathname === "/api/powers" && req.method === "GET") {
       return handlePowers(req, res);
     }
@@ -2254,6 +2280,7 @@ server.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`│  ${p.label.padEnd(15)}: ${p.key ? "key loaded ✓" : "no server key (paste in Settings)"} → ${providerEndpoint(p)}`);
   }
   console.log(`│  Default model  : ${CONFIG.defaultModel} (${CONFIG.defaultProvider})`);
+  console.log(`│  Video          : ${video.summary()}`);
   console.log(`│  Rate limit     : ${CONFIG.rateLimitPerMin || "off"} req/min per IP`);
   console.log(`│  Timeout        : ${CONFIG.upstreamTimeoutMs} ms`);
   console.log(`│  GitHub token   : ${CONFIG.github.token ? "loaded ✓" : "not set (add in Settings, or .env)"}`);

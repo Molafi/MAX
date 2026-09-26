@@ -543,6 +543,7 @@
       jsonMode: false,
       perfMode: false,   // disable the animated background
       customModels: [],  // [{id, provider}] discovered via "Refresh models"
+      video: null,       // video generation preferences (see videoDefaults)
       system: "You are MAX, a helpful, friendly and concise AI assistant. Use Markdown for formatting when helpful.",
       maxTokens: 8192,
       temperature: 1.0,
@@ -569,6 +570,9 @@
     basket: [], // staged repo files: {path, content}
     pendingEdits: {}, // staged repo edits by path: {content, deleted, isNew, original}
     user: null, // signed-in user (when auth is enabled)
+    videoMode: false,  // composer generates videos instead of chatting
+    videoKeys: { openrouter: "", google: "", gateway: "" }, // session/remembered secrets
+    videoCatalog: { models: [], providers: [], errors: {}, fetchedAt: 0 },
   };
 
   const githubDefaults = () => ({ token: "", owner: "", repo: "", branch: "main", pathPrefix: "max-chats" });
@@ -621,6 +625,9 @@
       if (!EFFORTS.some((e) => e.id === state.settings.effort)) state.settings.effort = "medium";
       state.settings.apiKey = secretGet(SESSION_KEY);
       state.settings.ccKey = secretGet(CC_SESSION_KEY);
+      state.settings.video = Object.assign(videoDefaults(), state.settings.video || {});
+      if (!Array.isArray(state.settings.video.custom)) state.settings.video.custom = [];
+      loadVideoKeys();
       state.settings.github.token = secretGet(GH_SESSION_KEY);
       state.settings.gitlab.token = secretGet(GL_SESSION_KEY);
     } catch {}
@@ -909,7 +916,7 @@
       }
     });
     // open links in new tab safely
-    $$("a", container).forEach((a) => { a.target = "_blank"; a.rel = "noopener noreferrer"; });
+    $$("a", container).forEach((a) => { if (a.closest(".vcard")) return; a.target = "_blank"; a.rel = "noopener noreferrer"; });
   }
 
   /* ============================================================
@@ -1157,6 +1164,11 @@
       { ok: hasKey, label: providerInfo(currentProvider()).label, detail: hasKey ? modelLabel(currentModel(), currentProvider()) : "No key — add in Settings" },
       { ok: hasGh && !gh?.error, label: "GitHub", detail: ghDetail },
       { ok: Boolean(repo), label: "Working repo", detail: repo ? `${repo.fullName} (${repo.branch})` : "None selected" },
+      (() => {
+        const n = usableVideoModels().length;
+        const provs = videoProviders().filter((p) => videoProviderReady(p.id)).map((p) => p.label.replace(/ \(.*\)$/, ""));
+        return { ok: n > 0, label: "Video", detail: n ? `${n} models · ${provs.join(", ")}` : "Not connected — add a key in Settings" };
+      })(),
     ];
     el.innerHTML = `<div class="status-grid">${items.map((i) => `
       <div class="status-item">
@@ -1177,6 +1189,7 @@
     showWelcome(false);
     convo.messages.forEach((m, i) => box.appendChild(renderMessage(m, i === convo.messages.length - 1)));
     scrollToBottom(true);
+    ensureVideoTicker();
   }
 
   function avatarFor(role) {
@@ -1200,7 +1213,7 @@
         ? `<details class="thinking-box"><summary>Thinking…</summary><div class="thinking-body">${esc(m.thinking)}</div></details>`
         : "";
       const tools = m.toolRuns && m.toolRuns.length ? toolRunsHtml(m.toolRuns) : "";
-      bubble.innerHTML = think + tools + renderMarkdown(m.content);
+      bubble.innerHTML = m.kind === "video" ? videosHtml(m) : think + tools + renderMarkdown(m.content) + videosHtml(m);
       enhanceContent(bubble);
     } else {
       // user: show images + text (escaped, preserve newlines)
@@ -1208,6 +1221,7 @@
       if (m.images && m.images.length) {
         inner += `<div class="attachments attachments--msg">` + m.images.map((a) => attachmentChipHtml(a, false)).join("") + `</div>`;
       }
+      if (m.videoRequest) inner += `<div class="vreq-tag">🎬 Video request</div>`;
       inner += `<div>${esc(m.content).replace(/\n/g, "<br>")}</div>`;
       bubble.innerHTML = inner;
     }
@@ -1230,8 +1244,12 @@
     actions.className = "msg__actions";
 
     const copyBtn = actionBtn("copy", `<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/>`, "Copy");
-    copyBtn.addEventListener("click", () => { copyText(m.content); toast("Copied to clipboard", "success"); });
+    copyBtn.addEventListener("click", () => {
+      copyText(m.kind === "video" ? (m.videos || []).map((v) => v.prompt).join("\n\n") : m.content);
+      toast("Copied to clipboard", "success");
+    });
     actions.appendChild(copyBtn);
+    if (m.kind === "video") return actions; // video cards carry their own actions
 
     const branchBtn = actionBtn("branch", `<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M6 15c0-5 4-6 9.5-6.6"/>`, "Branch");
     branchBtn.title = "Fork a new conversation from this point";
@@ -1451,6 +1469,12 @@
         out.push({ role: "user", content });
         continue;
       }
+      if (m.role === "assistant" && m.videos?.length) {
+        const note = m.videos.map((v) => `[Video generated with ${v.label}: "${String(v.prompt || "").slice(0, 400)}" — ${v.status}${v.error ? ` (${String(v.error).slice(0, 160)})` : ""}]`).join("\n");
+        const text = m.kind === "video" ? note : `${m.content || ""}\n\n${note}`.trim();
+        out.push({ role: "assistant", content: text });
+        continue;
+      }
       if (!m.content && m.role === "assistant") continue; // never send empty assistant turns
       out.push({ role: m.role, content: m.content || "(empty)" });
     }
@@ -1513,6 +1537,12 @@
     if (toolsAvailable()) {
       sys += `\n\n[Tools] You have tools available. Call them when they help (for example to read repository files or fetch a web page) instead of guessing. Keep going until you can fully answer, then give your final answer as normal text.`;
     }
+    if (anyVideoReady()) {
+      const names = [...new Set(usableVideoModels().filter((m) => !/sora/i.test(m.id)).sort((a, b) => videoNote(b.id).q - videoNote(a.id).q).map((m) => m.label))].slice(0, 8);
+      sys += `\n\n[Video generation] You can create REAL AI videos with the \`generate_video\` tool (models include ${names.join(", ")}). When the user asks for a video, clip, animation, ad or shot, call it — don't write code, don't refuse, don't say you can't make videos. Choose the model that fits (e.g. Veo for realism + native sound, Kling for character motion, Seedance/Wan for long takes, fast/lite models for quick drafts) or omit \`model\` to auto-choose, and write a detailed cinematic prompt. If an image is attached and the user wants it animated, the video starts from that image.`;
+    } else {
+      sys += `\n\n[Video generation] No video model is connected yet. If the user asks for an AI-generated video, tell them to add an OpenRouter or Google Gemini key in Settings → Video generation (or type /motion for a code-drawn motion-graphics animation).`;
+    }
     sys += powersSystemNote();
     sys += skillsSystemNote();
     if (state.settings.autonomous) {
@@ -1541,12 +1571,25 @@
     text = text.trim();
     let video = null;
     const vm = text.match(/^\/video(?:\s+([\s\S]*))?$/i);
-    if (vm) {
+    if (vm) { // real AI video models
       const prompt = (vm[1] || "").trim();
-      if (!prompt) { $("#input").value = "/video "; focusInputEnd(); toast("Describe the video you want, e.g. /video 8 second neon logo reveal"); return; }
+      if (!prompt && !currentVideoImage()) {
+        setVideoMode(true);
+        const input = $("#input"); input.value = ""; autoResize(input); updateCharCount(); updateSendState(); input.focus();
+        toast("🎬 Video mode — describe the video you want, then press Enter");
+        return;
+      }
+      return runVideoRequest(prompt);
+    }
+    const mm = text.match(/^\/motion(?:\s+([\s\S]*))?$/i);
+    if (mm) { // code-drawn motion graphics, recorded in the browser
+      const prompt = (mm[1] || "").trim();
+      if (!prompt) { $("#input").value = "/motion "; focusInputEnd(); toast("Describe the animation, e.g. /motion 8 second neon logo reveal"); return; }
       const sm = prompt.match(/(\d{1,2})\s*(?:s\b|sec|second)/i);
       video = { seconds: Math.max(2, Math.min(60, sm ? parseInt(sm[1], 10) : 8)) };
-      text = `🎬 Make a video: ${prompt}`;
+      text = `🎞 Motion graphics: ${prompt}`;
+    } else if (state.videoMode && !text.startsWith("/")) {
+      return runVideoRequest(text);
     } else if (text && handleSlashSend(text)) return;
     if (state.attachments.some((a) => a.pending)) { toast("Still reading your files — one moment…"); return; }
     const imgs = state.attachments.slice();
@@ -1652,6 +1695,7 @@
     commit_changes:  { icon: "🚀", verb: "Committing & pushing" },
     web_fetch:       { icon: "🌐", verb: "Fetching web page" },
     web_search:      { icon: "🔍", verb: "Searching the web" },
+    generate_video:  { icon: "🎬", verb: "Generating a video" },
   };
 
   // Tool definitions advertised to the model (Anthropic tool schema).
@@ -1736,6 +1780,7 @@
     }
     if (isInstalled("web-fetch") || activeRepo()) defs.push(TOOL_DEFS.web_fetch);
     if (isInstalled("web-search") && getPowerKey("web-search")) defs.push(TOOL_DEFS.web_search);
+    if (anyVideoReady()) defs.push(videoToolDef());
     return defs;
   }
   const toolsAvailable = () => availableToolDefs().length > 0;
@@ -1753,6 +1798,7 @@
       case "commit_changes": return inp.open_pr ? "Pushing to a new branch & opening a PR" : "Committing & pushing changes";
       case "web_fetch": return `Fetching ${inp.url || "page"}`;
       case "web_search": return `Searching the web for "${inp.query || "…"}"`;
+      case "generate_video": return `Generating a video${inp.model ? ` with ${String(inp.model).split("::").pop()}` : ""}: "${String(inp.prompt || "…").slice(0, 70)}${String(inp.prompt || "").length > 70 ? "…" : ""}"`;
       default: return (TOOL_META[run.name]?.verb) || run.name;
     }
   }
@@ -1801,7 +1847,7 @@
   }
 
   // Execute one tool locally and return a string result for the model.
-  async function executeTool(name, input) {
+  async function executeTool(name, input, ctx = {}) {
     input = input || {};
     switch (name) {
       case "list_repo_files": {
@@ -1913,6 +1959,8 @@
         (data.results || []).forEach((r, i) => parts.push(`${i + 1}. ${r.title}\n${r.url}\n${(r.content || "").slice(0, 500)}`));
         return parts.join("\n\n") || "No results.";
       }
+      case "generate_video":
+        return await runVideoTool(input, ctx);
       default:
         return `Error: unknown tool "${name}".`;
     }
@@ -2121,6 +2169,7 @@
     // kept here only; the persisted conversation stores just the final text).
     const apiMessages = buildApiMessages(convo);
     const toolRuns = [];    // display + persistence
+    const turnVideos = [];  // videos started by generate_video during this turn
     let finalText = "";
     let finalThinking = "";
     let usage = null;
@@ -2164,7 +2213,7 @@
           const run = toolRuns.find((r) => r.id === tu.id) || { id: tu.id, name: tu.name, input: tu.input, status: "running" };
           setStreamLabel(describeToolRun(run));
           let result, ok = true;
-          try { result = await executeTool(tu.name, tu.input); }
+          try { result = await executeTool(tu.name, tu.input, { videos: turnVideos, convo }); }
           catch (e) {
             ok = false;
             const msg = e?.message || String(e);
@@ -2220,12 +2269,14 @@
           result: typeof r.result === "string" ? r.result.slice(0, 8000) : r.result,
         })) : undefined,
         stagedEdits: pending.length ? pending : undefined,
+        videos: turnVideos.length ? turnVideos : undefined,
       };
       convo.messages.push(aiMsg);
       touchConvo(convo);
       renderMessages();
       renderConversations();
       updateUsagePill();
+      for (const v of turnVideos) { looseVideos.delete(v.jobId); trackVideo(v.jobId); }
       logRequest({ model: useModel, ok: true, ms: Date.now() - startedAt, tokens: usage?.output_tokens });
       if (opts.video) setTimeout(() => autoRenderVideo(aiMsg), 250);
 
@@ -2242,7 +2293,8 @@
       const aborted = err.name === "AbortError" || state.abort?.signal.aborted;
       if (aborted && (finalText || toolRuns.length)) {
         stream.setAgent(finalText, false, finalThinking, toolRuns);
-        convo.messages.push({ id: uid(), role: "assistant", content: finalText || "_(stopped)_", usage, stopped: true, toolRuns: toolRuns.length ? toolRuns : undefined });
+        convo.messages.push({ id: uid(), role: "assistant", content: finalText || "_(stopped)_", usage, stopped: true, toolRuns: toolRuns.length ? toolRuns : undefined, videos: turnVideos.length ? turnVideos : undefined });
+        for (const v of turnVideos) { looseVideos.delete(v.jobId); trackVideo(v.jobId); }
         touchConvo(convo);
         renderMessages();
       } else if (aborted) {
@@ -2478,6 +2530,7 @@
   function renderAttachments() {
     $("#attachments").innerHTML = state.attachments.map((a) => attachmentChipHtml(a, true)).join("");
     updateSendState();
+    if (state.videoMode) renderVideoControls(); // an image can change the auto-chosen model
   }
   function clearAttachments() { state.attachments = []; renderAttachments(); }
 
@@ -2582,6 +2635,7 @@
       lines.push(`## ${who}`, "");
       if (m.images && m.images.length) lines.push(`_(${m.images.length} image attachment${m.images.length > 1 ? "s" : ""})_`, "");
       lines.push((m.content || "").trim(), "");
+      for (const v of m.videos || []) lines.push(`> 🎬 **Video** (${v.label}, ${v.status}): ${String(v.prompt || "").replace(/\n/g, " ")}`, "");
     }
     return lines.join("\n").trim() + "\n";
   }
@@ -3578,8 +3632,9 @@
   function conversationToHtml(convo) {
     const rows = convo.messages.filter((m) => m.role === "user" || m.role === "assistant").map((m) => {
       const who = m.auto ? "Auto" : (m.role === "user" ? "You" : "MAX");
-      const html = window.marked && window.DOMPurify
-        ? DOMPurify.sanitize(marked.parse(m.content || "")) : `<pre>${esc(m.content)}</pre>`;
+      const html = (window.marked && window.DOMPurify
+        ? DOMPurify.sanitize(marked.parse(m.content || "")) : `<pre>${esc(m.content)}</pre>`) +
+        (m.videos || []).map((v) => `<p>🎬 <b>Video</b> — ${esc(v.label)} (${esc(v.status)}): <i>${esc(v.prompt)}</i></p>`).join("");
       return `<div class="m ${m.role}"><div class="r">${who}</div><div class="c">${html}</div></div>`;
     }).join("\n");
     return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3991,6 +4046,8 @@ a{color:#22d3ee}</style></head>
     { cmd: "/explain", desc: "Explain the pasted code", run: () => { $("#input").value = "Explain the following code clearly:\n\n"; focusInputEnd(); } },
     { cmd: "/test", desc: "Write tests for the pasted code", run: () => { $("#input").value = "Write thorough unit tests for the following code:\n\n"; focusInputEnd(); } },
     { cmd: "/share", desc: "Export this chat as shareable HTML", run: () => { $("#input").value = ""; const c = activeConvo(); if (c) shareConversation(c.id); } },
+    { cmd: "/video", desc: "Generate an AI video (Veo, Kling, Seedance…) — opens Video mode", run: () => { $("#input").value = ""; setVideoMode(true); focusInputEnd(); } },
+    { cmd: "/motion", desc: "Code-drawn motion graphics, recorded to a video (no video key needed)", run: () => { $("#input").value = "/motion "; focusInputEnd(); } },
     { cmd: "/clear", desc: "Clear the current conversation", run: () => { $("#input").value = ""; const c = activeConvo(); if (c) { c.messages = []; c.title = "New chat"; touchConvo(c); renderMessages(); renderConversations(); } } },
   ];
   function focusInputEnd() { const i = $("#input"); autoResize(i); updateCharCount(); updateSendState(); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
@@ -4203,6 +4260,9 @@ a{color:#22d3ee}</style></head>
       { label: "Share current chat (.html)", run: () => { const c = activeConvo(); if (c) shareConversation(c.id); } },
       { label: "View request log", run: openRequestLog },
       { label: "Open Powers (integrations)", run: openPowers },
+      { label: state.videoMode ? "Turn OFF Video mode" : "Turn ON Video mode (generate AI videos)", run: () => setVideoMode(!state.videoMode) },
+      { label: "Choose video model", run: () => { setVideoMode(true); setTimeout(() => { const b = $('#video-controls [data-vc="model"]'); if (b) openVideoModelPicker(b, {}); }, 30); } },
+      { label: "Video generation settings (keys)", run: () => openSettings("video") },
       { label: "Open Settings", run: openSettings },
       ...(state.user ? [{ label: "Change my password", run: changeOwnPassword }] : []),
       ...(state.user?.role === "superadmin" ? [{ label: "Manage users (admin)", run: openAdmin }] : []),
@@ -4364,12 +4424,20 @@ a{color:#22d3ee}</style></head>
 
   let popEl = null;
   function closePop() { if (popEl) { popEl.remove(); popEl = null; } }
+  // Position a popover next to its anchor. Flips to the side with more room and
+  // caps its height so it never runs off-screen (e.g. when opened near the bottom).
   function placePop(pop, anchor, where = "below") {
     const r = anchor.getBoundingClientRect();
-    const w = pop.offsetWidth;
+    const w = pop.offsetWidth, h = pop.offsetHeight;
     pop.style.left = `${Math.max(10, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - 10))}px`;
+    const below = window.innerHeight - r.bottom - 18, above = r.top - 18;
+    if (where === "below" && h > below && above > below) where = "above";
+    else if (where === "above" && h > above && below > above) where = "below";
+    pop.style.top = pop.style.bottom = "";
     if (where === "above") pop.style.bottom = `${Math.max(10, window.innerHeight - r.top + 8)}px`;
     else pop.style.top = `${r.bottom + 8}px`;
+    const room = Math.max(160, where === "above" ? above : below);
+    if (h > room) pop.style.maxHeight = `${room}px`;
   }
   function dismissOnOutside(pop, anchor) {
     setTimeout(() => {
@@ -4557,9 +4625,10 @@ a{color:#22d3ee}</style></head>
       ["Fix a bug", "debug the code I paste", "Find and fix the bug in this code, and explain the root cause:\n\n"],
     ],
     video: [
-      ["Logo reveal", "8s neon logo animation", "/video An 8 second neon logo reveal for the word MAX with glowing particles and a light sweep."],
-      ["Data story", "animated bar chart race", "/video A 10 second animated bar chart showing smartphone market share growing from 2015 to 2025, with labels."],
-      ["Space scene", "flying through a starfield", "/video A 10 second cinematic flight through a colorful starfield with a planet rising into view."],
+      ["Cinematic shot", "drone over misty mountains", "/video Cinematic drone shot gliding over misty mountain peaks at sunrise, golden light breaking through the clouds, slow push forward, epic orchestral swell"],
+      ["Vertical ad", "9:16 sneaker commercial", "/video Vertical 9:16 commercial: a glowing white running shoe spins above a wet neon-lit street at night, slow-motion water splash, bold bass hit on the logo"],
+      ["Animate a photo", "attach an image first", "/video Bring this photo to life with gentle natural motion and a slow cinematic push-in"],
+      ["Motion graphics", "code-drawn logo reveal", "/motion An 8 second neon logo reveal for the word MAX with glowing particles and a light sweep"],
     ],
   };
   function renderSuggestions(cat = "create") {
@@ -4570,6 +4639,905 @@ a{color:#22d3ee}</style></head>
         <span><b>${esc(title)}</b>${esc(sub)}</span>
       </button>`).join("");
     $$(".welcome-tab").forEach((t) => t.classList.toggle("active", t.dataset.cat === cat));
+  }
+
+  /* ============================================================
+     AI video generation — real video models
+     OpenRouter (Veo 3.1 · Kling 3.0 · Seedance · Wan · Hailuo…), Google Veo 3.1,
+     and OpenAI-compatible gateways. Jobs run on the MAX server; the chat shows a
+     live card that turns into a player when the video is ready.
+     ============================================================ */
+  const VIDEO_PROVIDER_IDS = ["openrouter", "google", "gateway"];
+  const videoDefaults = () => ({ model: "auto", priority: "balanced", duration: "auto", aspectRatio: "auto", resolution: "auto", audio: true, enhance: true, custom: [] });
+  const vKeyName = (p) => `${SCOPE}max.videoKey.${p}.v1`;
+  const VIDEO_PRIORITIES = {
+    quality: { label: "Best quality", hint: "Flagship models, higher resolution", w: { q: 0.75, c: 0.1, s: 0.15 } },
+    balanced: { label: "Balanced", hint: "Great results at a sensible price", w: { q: 0.45, c: 0.35, s: 0.2 } },
+    fast: { label: "Fast & cheap", hint: "Quick drafts and previews", w: { q: 0.15, c: 0.45, s: 0.4 } },
+  };
+  // Curated quality priors + one-line strengths (used by Auto and shown to the chat model).
+  const VIDEO_NOTES = [
+    [/veo-3\.1-lite/, 0.62, "cheapest Veo, native audio"],
+    [/veo-3\.1-fast/, 0.8, "near-flagship Veo quality, fast, native audio"],
+    [/veo-3\.1/, 0.96, "best photorealism & physics, native audio and dialogue"],
+    [/veo/, 0.78, "realistic video"],
+    [/kling.*o1/, 0.86, "strong prompt following and editing"],
+    [/kling.*(std|standard)/, 0.76, "good motion at a lower price"],
+    [/kling.*3/, 0.92, "excellent character motion, multi-shot, up to 15s"],
+    [/kling/, 0.8, "dynamic motion"],
+    [/seedance-2\.5/, 0.9, "long cinematic takes (up to 30s), multi-shot"],
+    [/seedance-2\.0-(fast|mini)/, 0.66, "quick, cheap drafts"],
+    [/seedance-2/, 0.86, "sharp high-res video, smooth multi-shot"],
+    [/seedance-1/, 0.72, "video + audio in one pass"],
+    [/hailuo-3-max|h3-max/, 0.92, "top-tier physics, 2K"],
+    [/hailuo-3/, 0.86, "vivid motion, 2K with audio"],
+    [/hailuo/, 0.74, "dynamic action shots, good value"],
+    [/wan-3\.0-prime/, 0.88, "long 30s shots, premium quality"],
+    [/wan-3/, 0.82, "up to 30s, image & reference inputs"],
+    [/wan-2\.7/, 0.74, "flexible image/reference-to-video"],
+    [/wan/, 0.66, "budget-friendly"],
+    [/sora/, 0.4, "retired by OpenAI (Sept 2026)"],
+  ];
+  const VSTATUS = {
+    preparing: "Preparing…", enhancing: "✨ Enhancing your prompt…", submitting: "Sending to the model…",
+    queued: "Queued at the provider…", running: "Generating video…", downloading: "Saving your video…",
+    interrupted: "Paused — the MAX server restarted",
+  };
+  const VIDEO_TERMINAL = new Set(["completed", "failed", "cancelled"]);
+  const VIDEO_PLACEHOLDER = "Describe the video — subject, action, camera, mood, style… (attach an image to animate it)";
+
+  function videoNote(id) {
+    for (const [re, q, note] of VIDEO_NOTES) if (re.test(String(id).toLowerCase())) return { q, note };
+    return { q: 0.6, note: "" };
+  }
+  function loadVideoKeys() { for (const p of VIDEO_PROVIDER_IDS) state.videoKeys[p] = secretGet(vKeyName(p)); }
+  function saveVideoKeys() { for (const p of VIDEO_PROVIDER_IDS) secretPut(vKeyName(p), state.videoKeys[p]); }
+
+  function videoProviders() {
+    const c = state.videoCatalog.providers;
+    return c && c.length ? c : (state.config.video?.providers || []);
+  }
+  function videoProviderInfo(id) { return videoProviders().find((p) => p.id === id) || { id, label: id }; }
+  function videoKey(provider) {
+    const k = state.videoKeys[provider] || "";
+    if (k) return k;
+    // The gateway defaults to CodeCraft's API, so the CodeCraft chat key is reused.
+    if (provider === "gateway" && /codecraftapi\.com/i.test(videoProviderInfo("gateway").base || "")) return state.settings.ccKey || "";
+    return "";
+  }
+  function videoProviderReady(id) {
+    const p = videoProviders().find((x) => x.id === id);
+    return Boolean(p && (videoKey(id) || p.hasServerKey));
+  }
+  function videoModels() {
+    const list = (state.videoCatalog.models || []).slice();
+    for (const c of state.settings.video.custom || []) {
+      if (c && c.id && !list.some((m) => m.provider === c.provider && m.id === c.id)) {
+        list.push({ provider: c.provider, id: c.id, label: c.id, family: "Custom", description: "", durations: null, resolutions: null, aspectRatios: null, frameImages: null, audio: null, pricing: null, custom: true });
+      }
+    }
+    return list;
+  }
+  const usableVideoModels = () => videoModels().filter((m) => videoProviderReady(m.provider));
+  const anyVideoReady = () => usableVideoModels().length > 0;
+  const videoModelKey = (m) => `${m.provider}::${m.id}`;
+  function findVideoModel(key) {
+    if (!key || key === "auto") return null;
+    const [prov, ...rest] = String(key).split("::");
+    const id = rest.join("::");
+    if (!id) { // bare id (e.g. from the chat model) — match any provider, preferring ready ones
+      const hits = videoModels().filter((m) => m.id === prov || m.id.endsWith("/" + prov));
+      return hits.find((m) => videoProviderReady(m.provider)) || hits[0] || null;
+    }
+    return videoModels().find((m) => m.provider === prov && m.id === id) || { provider: prov, id, label: id, family: "Custom", custom: true };
+  }
+
+  async function loadVideoCatalog(force) {
+    if (state.videoCatalog._p && !force) return state.videoCatalog._p;
+    const p = fetch("/api/video/models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh: Boolean(force), keys: { gateway: videoKey("gateway") || undefined } }),
+    }).then((r) => r.json()).then((d) => {
+      if (d && d.ok) Object.assign(state.videoCatalog, { models: d.models || [], providers: d.providers || [], errors: d.errors || {}, fetchedAt: Date.now() });
+    }).catch(() => {}).finally(() => {
+      state.videoCatalog._p = null;
+      renderVideoControls();
+      renderWelcomeStatus();
+    });
+    state.videoCatalog._p = p;
+    return p;
+  }
+
+  /* ---------- capability fitting ---------- */
+  function vResRank(r) {
+    const s = String(r || "").toLowerCase();
+    const m = s.match(/^(\d{3,4})p$/);
+    if (m) { const n = +m[1]; return n >= 2160 ? 6 : n >= 1440 ? 5 : n >= 1080 ? 4 : n >= 720 ? 3 : n >= 480 ? 2 : 1; }
+    return { "1k": 4, "2k": 5, "4k": 6 }[s] || 0;
+  }
+  const orient = (a) => { const [w, h] = String(a || "16:9").split(":").map(Number); return Math.sign((w || 16) - (h || 9)); };
+  const nearestNum = (list, t) => list.slice().sort((a, b) => Math.abs(a - t) - Math.abs(b - t) || a - b)[0];
+  function supportsImage(m) {
+    if (!m) return false;
+    if (m.provider === "google") return true;
+    if (!Array.isArray(m.frameImages)) return null; // unknown
+    return m.frameImages.includes("first_frame");
+  }
+  function autoAspect(att) {
+    const w = att?.meta?.width, h = att?.meta?.height;
+    if (!w || !h) return "16:9";
+    const r = w / h;
+    return r > 1.2 ? "16:9" : r < 0.83 ? "9:16" : "1:1";
+  }
+  function fitVideoParams(m, want = {}) {
+    const notes = [];
+    const out = {};
+    const desiredRes = want.resolution && want.resolution !== "auto" ? want.resolution : (want.priority === "quality" ? "1080p" : "720p");
+    if (m.resolutions?.length) {
+      const exact = m.resolutions.find((r) => r.toLowerCase() === String(desiredRes).toLowerCase());
+      if (exact) out.resolution = exact;
+      else {
+        const t = vResRank(desiredRes);
+        const sorted = m.resolutions.slice().sort((a, b) => vResRank(a) - vResRank(b));
+        out.resolution = sorted.filter((r) => vResRank(r) <= t).pop() || sorted[0];
+        if (want.resolution && want.resolution !== "auto") notes.push(`${desiredRes} → ${out.resolution}`);
+      }
+    } else if (want.resolution && want.resolution !== "auto") out.resolution = want.resolution;
+
+    let durations = m.durations && m.durations.length ? m.durations : null;
+    const byRes = m.durationsByResolution && out.resolution ? m.durationsByResolution[out.resolution.toLowerCase()] : null;
+    if (byRes) durations = byRes;
+    const target = Number(want.duration) || (want.priority === "fast" ? 5 : 8);
+    if (durations) {
+      out.duration = nearestNum(durations, target);
+      if (want.duration && Number(want.duration) !== out.duration) notes.push(`${want.duration}s → ${out.duration}s${byRes ? ` (${out.resolution} clips are ${byRes.join("/")}s)` : ""}`);
+    } else if (want.duration) out.duration = Number(want.duration);
+
+    const ar = !want.aspectRatio || want.aspectRatio === "auto" ? autoAspect(want.imageAtt) : want.aspectRatio;
+    if (m.aspectRatios?.length && !m.aspectRatios.includes(ar)) {
+      out.aspectRatio = m.aspectRatios.find((a) => orient(a) === orient(ar)) || m.aspectRatios[0];
+      notes.push(`${ar} → ${out.aspectRatio}`);
+    } else out.aspectRatio = ar;
+
+    if (m.audioAlways) out.audio = true;
+    else if (m.audio === true) out.audio = want.audio !== false;
+    else if (m.audio === false) out.silent = true;
+    return { ...out, notes };
+  }
+  function estimateVideoCost(m, fit) {
+    const ps = m?.pricing?.perSecond;
+    if (!ps || !fit?.duration) return null;
+    const r = String(fit.resolution || "").toLowerCase();
+    let v;
+    if (fit.audio === false) v = ps[`${r}:noaudio`] ?? ps["default:noaudio"];
+    if (v == null) v = ps[r] ?? ps.default;
+    if (v == null) { const vals = Object.values(ps).filter(Number.isFinite); v = vals.length ? Math.min(...vals) : null; }
+    return Number.isFinite(v) ? v * fit.duration : null;
+  }
+  function speedScore(id) {
+    const s = String(id).toLowerCase();
+    if (/fast|turbo|flash|lightning|mini/.test(s)) return 1;
+    if (/lite|std|standard/.test(s)) return 0.8;
+    if (/pro|max|prime|ultra|o1/.test(s)) return 0.35;
+    return /veo-3\.1(-generate)?(-preview)?$/.test(s) ? 0.4 : 0.55;
+  }
+  /** Auto mode: filter by hard requirements, then score quality/cost/speed (weights per priority). */
+  function chooseVideoModel(want) {
+    const pr = VIDEO_PRIORITIES[want.priority] || VIDEO_PRIORITIES.balanced;
+    let cands = usableVideoModels().filter((m) => !/sora/i.test(m.id));
+    if (!cands.length) return { model: null, ranked: [] };
+    if (want.image) { const i2v = cands.filter((m) => supportsImage(m) !== false); if (i2v.length) cands = i2v; }
+    const scored = cands.map((m) => { const fit = fitVideoParams(m, want); return { m, fit, cost: estimateVideoCost(m, fit) }; });
+    const costs = scored.map((s) => s.cost).filter(Number.isFinite);
+    const lo = costs.length ? Math.min(...costs) : 0, hi = costs.length ? Math.max(...costs) : 0;
+    const maxRes = Math.max(1, ...scored.map((s) => Math.max(0, ...(s.m.resolutions || []).map(vResRank))));
+    for (const s of scored) s.q = 0.7 * videoNote(s.m.id).q + 0.3 * (s.m.resolutions?.length ? Math.max(...s.m.resolutions.map(vResRank)) / maxRes : 0.6);
+    const qlo = Math.min(...scored.map((s) => s.q)), qhi = Math.max(...scored.map((s) => s.q));
+    for (const s of scored) {
+      const q = qhi > qlo ? (s.q - qlo) / (qhi - qlo) : 1; // normalized like cost, so weights mean what they say
+      const c = Number.isFinite(s.cost) ? (hi > lo ? 1 - (s.cost - lo) / (hi - lo) : 1) : 0.45;
+      let score = pr.w.q * q + pr.w.c * c + pr.w.s * speedScore(s.m.id);
+      if (want.wantsAudio && (s.m.audio === true || s.m.audioAlways)) score += 0.05;
+      if (want.wantsAudio && s.m.audio === false) score -= 0.06;
+      if (want.duration && s.m.durations?.length) {
+        const maxD = Math.max(...s.m.durations);
+        if (maxD < want.duration) score -= 0.15 * Math.min(1, ((want.duration - maxD) / want.duration) * 2);
+      }
+      if (want.image && supportsImage(s.m) === null) score -= 0.05;
+      if (s.m.custom) score -= 0.1;
+      s.score = score;
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return { model: scored[0].m, fit: scored[0].fit, cost: scored[0].cost, ranked: scored };
+  }
+  function currentVideoImage() {
+    return state.attachments.find((a) => !a.pending && a.kind === "image" && a.dataUrl) || null;
+  }
+  function videoWant(extra = {}) {
+    const vs = state.settings.video;
+    const imageAtt = "imageAtt" in extra ? extra.imageAtt : currentVideoImage();
+    return {
+      priority: vs.priority, duration: vs.duration === "auto" ? null : Number(vs.duration), aspectRatio: vs.aspectRatio,
+      resolution: vs.resolution, audio: vs.audio !== false, wantsAudio: vs.audio !== false, imageAtt, image: Boolean(imageAtt), ...extra,
+    };
+  }
+  function resolveVideoSelection(extra = {}) {
+    const want = videoWant(extra);
+    const vs = state.settings.video;
+    if (vs.model && vs.model !== "auto") {
+      const m = findVideoModel(vs.model);
+      if (m) { const fit = fitVideoParams(m, want); return { auto: false, model: m, fit, cost: estimateVideoCost(m, fit), want }; }
+    }
+    const pick = chooseVideoModel(want);
+    return { auto: true, model: pick.model, fit: pick.fit, cost: pick.cost, ranked: pick.ranked, want };
+  }
+  function expectedVideoSecs(e) {
+    const id = String(e.model || "").toLowerCase();
+    let s = /fast|lite|mini|turbo|flash/.test(id) ? 60 : /pro|max|prime|o1/.test(id) ? 150 : /veo-3\.1/.test(id) ? 110 : 90;
+    if (vResRank(e.params?.resolution) >= 5) s += 40;
+    if ((e.params?.duration || 0) > 8) s += (e.params.duration - 8) * 6;
+    return s;
+  }
+
+  /* ---------- images for image-to-video ---------- */
+  async function toVideoImage(att) {
+    if (!att?.dataUrl) return null;
+    if (/^data:image\/(png|jpeg);base64,/.test(att.dataUrl) && att.dataUrl.length < 8_000_000) return att.dataUrl;
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error("image decode failed")); i.src = att.dataUrl; });
+    const c = document.createElement("canvas");
+    c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
+    c.getContext("2d").drawImage(img, 0, 0);
+    return c.toDataURL("image/jpeg", 0.92);
+  }
+  // The image the user attached most recently (within the last few turns, before `beforeMsg`).
+  function latestUserImage(convo, beforeMsg) {
+    if (!convo) return null;
+    let msgs = convo.messages;
+    if (beforeMsg) { const i = msgs.indexOf(beforeMsg); if (i > 0) msgs = msgs.slice(0, i); }
+    let seen = 0;
+    for (let i = msgs.length - 1; i >= 0 && seen < 3; i--) {
+      const m = msgs[i];
+      if (m.role !== "user" || m.auto) continue;
+      seen++;
+      const img = (m.images || []).find((a) => (a.kind === "image" || (!a.kind && String(a.media_type || "").startsWith("image/"))) && a.dataUrl);
+      if (img) return img;
+    }
+    return null;
+  }
+
+  /* ---------- jobs ---------- */
+  function newVideoEntry({ model, fit, prompt, originalPrompt, enhancedBy, auto, priority, hasImage }) {
+    const params = { duration: fit.duration, resolution: fit.resolution, aspectRatio: fit.aspectRatio, audio: fit.audio, silent: fit.silent || undefined };
+    return {
+      uid: uid(), jobId: null, status: "preparing", provider: model.provider, providerLabel: videoProviderInfo(model.provider).label,
+      model: model.id, label: model.label || model.id, prompt, originalPrompt: originalPrompt || prompt, enhancedBy: enhancedBy || null,
+      params, estCost: estimateVideoCost(model, fit), cost: null, auto: Boolean(auto), priority: priority || state.settings.video.priority,
+      hasImage: Boolean(hasImage), notes: (fit.notes || []).slice(), error: null, url: null, progress: null, createdAt: Date.now(),
+    };
+  }
+  function applyJob(entry, job) {
+    if (!job) return;
+    entry.jobId = job.id;
+    entry.status = job.status;
+    entry.progress = job.progress;
+    entry.error = job.error || null;
+    entry.url = job.url || null;
+    entry.size = job.size || null;
+    if (job.cost != null) entry.cost = job.cost;
+    if (job.providerLabel) entry.providerLabel = job.providerLabel;
+    if (job.params) entry.params = { ...entry.params, ...job.params };
+    const extra = (job.notes || []).filter((n) => !(entry.notes || []).includes(n));
+    if (extra.length) entry.notes = [...(entry.notes || []), ...extra];
+    entry.startedAt = job.startedAt || entry.startedAt;
+    entry.finishedAt = job.finishedAt || null;
+  }
+  async function startVideoJob(convo, entry, imgAtt) {
+    entry.status = "submitting";
+    updateVideoCard(entry);
+    try {
+      const image = entry.hasImage && imgAtt ? await toVideoImage(imgAtt) : null;
+      const res = await fetch("/api/video/generate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: entry.provider, model: entry.model, label: entry.label, prompt: entry.prompt,
+          duration: entry.params.duration, resolution: entry.params.resolution, aspectRatio: entry.params.aspectRatio,
+          audio: entry.params.audio, image: image || undefined, apiKey: videoKey(entry.provider) || undefined,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      applyJob(entry, data.job);
+      trackVideo(entry.jobId);
+    } catch (err) {
+      entry.status = "failed";
+      entry.error = err instanceof TypeError ? "Can't reach the MAX server." : err.message;
+    }
+    if (convo) _dirtyConvos.add(convo.id);
+    saveConvos();
+    updateVideoCard(entry);
+    return entry;
+  }
+
+  // Poll the MAX server (cheap, local) for every video that is still being made.
+  const videoWatch = new Set();
+  const videoResumeTried = new Set();
+  const looseVideos = new Map(); // jobId -> entry started by the chat tool whose message isn't saved yet
+  let videoPollTimer = null;
+  function findVideos(pred) {
+    const out = [];
+    for (const c of state.conversations) for (const m of c.messages || []) for (const v of m.videos || []) if (pred(v)) out.push({ convo: c, msg: m, entry: v });
+    return out;
+  }
+  function trackVideo(jobId) {
+    if (!jobId) return;
+    videoWatch.add(jobId);
+    clearTimeout(videoPollTimer);
+    videoPollTimer = setTimeout(pollVideos, 1500);
+  }
+  async function pollVideos() {
+    if (!videoWatch.size) return;
+    const ids = [...videoWatch];
+    let data;
+    try {
+      const r = await fetch("/api/video/jobs/status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
+      data = await r.json();
+    } catch {
+      videoPollTimer = setTimeout(pollVideos, 8000);
+      return;
+    }
+    const dirty = new Set();
+    for (const id of ids) {
+      const job = data?.jobs ? data.jobs[id] : undefined;
+      if (job === undefined) continue;
+      const hits = findVideos((v) => v.jobId === id);
+      if (!hits.length) {
+        const loose = looseVideos.get(id);
+        if (loose && job) applyJob(loose, job);
+        if (!loose || job === null || VIDEO_TERMINAL.has(job?.status)) videoWatch.delete(id);
+        continue;
+      }
+      if (job && job.status === "interrupted" && !videoResumeTried.has(id)) { videoResumeTried.add(id); resumeVideo(hits[0].entry); }
+      for (const h of hits) {
+        const before = `${h.entry.status}|${h.entry.progress}|${h.entry.url}`;
+        const wasDone = h.entry.status === "completed";
+        if (job === null) { h.entry.status = "failed"; h.entry.error = "This video job no longer exists on the MAX server."; }
+        else applyJob(h.entry, job);
+        if (`${h.entry.status}|${h.entry.progress}|${h.entry.url}` !== before) {
+          dirty.add(h.convo.id);
+          updateVideoCard(h.entry);
+          if (!wasDone && h.entry.status === "completed" && h === hits[0]) toast(`🎬 Your video is ready — ${h.entry.label}`, "success");
+          if (h.entry.status === "failed" && h === hits[0]) toast(`Video failed: ${String(h.entry.error || "").slice(0, 140)}`, "error");
+        }
+      }
+      if (job === null || VIDEO_TERMINAL.has(job.status)) videoWatch.delete(id);
+    }
+    if (dirty.size) { dirty.forEach((id) => _dirtyConvos.add(id)); saveConvos(); }
+    if (videoWatch.size) videoPollTimer = setTimeout(pollVideos, document.hidden ? 10000 : 3000);
+  }
+  async function resumeVideo(entry) {
+    try {
+      const r = await fetch(`/api/video/jobs/${encodeURIComponent(entry.jobId)}/resume`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: videoKey(entry.provider) || undefined }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.job) { applyJob(entry, d.job); updateVideoCard(entry); trackVideo(entry.jobId); }
+    } catch {}
+  }
+  function resumeVideoTracking() {
+    for (const h of findVideos((v) => !VIDEO_TERMINAL.has(v.status))) {
+      if (h.entry.jobId) videoWatch.add(h.entry.jobId);
+      else { h.entry.status = "failed"; h.entry.error = "Interrupted before the video was submitted — press Retry."; _dirtyConvos.add(h.convo.id); }
+    }
+    if (videoWatch.size) { clearTimeout(videoPollTimer); videoPollTimer = setTimeout(pollVideos, 800); }
+  }
+
+  /* ---------- prompt enhancer (uses your chat model) ---------- */
+  async function enhanceVideoPrompt(idea, model, fit, imgAtt) {
+    if (!providerReady()) return null;
+    const audio = fit.audio === true || model.audioAlways;
+    const ask = `Target video model: ${model.label}${fit.duration ? `, ${fit.duration} seconds` : ""}${fit.aspectRatio ? `, ${fit.aspectRatio}` : ""}, ${audio ? "generates native audio" : "silent video"}.` +
+      (imgAtt ? " The video STARTS from the attached image — describe the motion that should happen, keep the subject and style consistent." : "") +
+      `\nWrite ONE production-ready prompt: subject and the action beats in order, setting, camera (shot size and movement), lighting, color and mood, visual style${audio ? ", plus sound design and any dialogue in quotes" : ""}. Keep the user's intent and any on-screen text. 60–120 words, present tense, in English (keep dialogue/on-screen text in the user's language). Output only the prompt — no preamble, no markdown.\n\nIdea: ${idea}`;
+    const content = [];
+    if (imgAtt?.dataUrl && modelInfo().caps?.vision !== false && /^data:image\/(png|jpeg|gif|webp);base64,/.test(imgAtt.dataUrl)) {
+      content.push({ type: "image", source: { type: "base64", media_type: imgAtt.dataUrl.slice(5, imgAtt.dataUrl.indexOf(";")), data: imgAtt.dataUrl.split(",")[1] } });
+    }
+    content.push({ type: "text", text: ask });
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 45000);
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
+        body: JSON.stringify({
+          provider: currentProvider(), model: currentModel(), apiKey: providerKey() || undefined, stream: false, max_tokens: 800,
+          system: "You are an award-winning film director and prompt engineer for AI video models.",
+          messages: [{ role: "user", content }],
+        }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json().catch(() => null);
+      const text = (data?.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+      if (!text || text.length < 15) return null;
+      return text.replace(/^(?:video )?prompt\s*:\s*/i, "").replace(/^["“](.*)["”]$/s, "$1").trim().slice(0, 3500);
+    } catch { return null; } finally { clearTimeout(t); }
+  }
+
+  /* ---------- sending a video request (Video mode, /video) ---------- */
+  async function runVideoRequest(text) {
+    if (state.attachments.some((a) => a.pending)) { toast("Still reading your files — one moment…"); return; }
+    if (!state.videoCatalog.fetchedAt) await loadVideoCatalog();
+    if (!anyVideoReady()) {
+      toast("Connect a video model first: add an OpenRouter or Google Gemini key in Settings → Video generation. (Tip: /motion makes code-drawn animations without a key.)", "error");
+      openSettings("video");
+      return;
+    }
+    const imgAtt = currentVideoImage();
+    const prompt = String(text || "").trim() || (imgAtt ? "Bring this image to life with natural, cinematic motion and a slow camera push-in." : "");
+    if (!prompt) { $("#input").focus(); return; }
+    const sel = resolveVideoSelection({ imageAtt: imgAtt, image: Boolean(imgAtt) });
+    if (!sel.model) { toast("No video model is available.", "error"); return; }
+    if (!videoProviderReady(sel.model.provider)) {
+      toast(`Add a ${videoProviderInfo(sel.model.provider).label} key in Settings to use ${sel.model.label}.`, "error");
+      openSettings("video");
+      return;
+    }
+    const useImage = Boolean(imgAtt) && supportsImage(sel.model) !== false;
+    if (imgAtt && !useImage) toast(`${sel.model.label} can't start from an image — generating from your text only.`, "");
+
+    let convo = activeConvo();
+    if (!convo) convo = newConversation();
+    const userMsg = { id: uid(), role: "user", content: prompt, images: state.attachments.map((a) => ({ ...a })), videoRequest: true };
+    const entry = newVideoEntry({ model: sel.model, fit: sel.fit, prompt, auto: sel.auto, hasImage: useImage });
+    const aiMsg = { id: uid(), role: "assistant", kind: "video", content: "", videos: [entry], model: sel.model.label };
+    convo.messages.push(userMsg, aiMsg);
+    autoTitle(convo);
+    touchConvo(convo);
+    clearAttachments();
+    const input = $("#input");
+    input.value = ""; autoResize(input); updateCharCount(); updateSendState();
+    renderMessages();
+    renderConversations();
+
+    if (state.settings.video.enhance && providerReady()) {
+      entry.status = "enhancing";
+      updateVideoCard(entry);
+      const better = await enhanceVideoPrompt(prompt, sel.model, sel.fit, useImage ? imgAtt : null);
+      if (better) { entry.prompt = better; entry.enhancedBy = modelLabel(currentModel(), currentProvider()); }
+    }
+    await startVideoJob(convo, entry, useImage ? imgAtt : null);
+  }
+
+  async function regenerateVideo(hit, modelKey) {
+    const { convo, msg, entry } = hit;
+    const img = entry.hasImage ? latestUserImage(convo, msg) : null;
+    const want = {
+      priority: entry.priority || state.settings.video.priority, duration: entry.params?.duration, aspectRatio: entry.params?.aspectRatio,
+      resolution: entry.params?.resolution, audio: entry.params?.audio !== false, wantsAudio: entry.params?.audio !== false, imageAtt: img, image: Boolean(img),
+    };
+    let model, fit, auto = false;
+    if (modelKey === "auto") { const pick = chooseVideoModel(want); model = pick.model; fit = pick.fit; auto = true; }
+    else { model = findVideoModel(modelKey || `${entry.provider}::${entry.model}`); fit = model ? fitVideoParams(model, want) : null; }
+    if (!model) { toast("No video model is available — add a key in Settings → Video generation.", "error"); return; }
+    if (!videoProviderReady(model.provider)) { toast(`Add a ${videoProviderInfo(model.provider).label} key first.`, "error"); openSettings("video"); return; }
+    const e2 = newVideoEntry({ model, fit, prompt: entry.prompt, originalPrompt: entry.originalPrompt, enhancedBy: entry.enhancedBy, auto, priority: want.priority, hasImage: Boolean(img) && supportsImage(model) !== false });
+    msg.videos.push(e2);
+    _dirtyConvos.add(convo.id);
+    saveConvos();
+    const cards = document.querySelector(`.msg[data-id="${CSS.escape(msg.id)}"] .vcards`);
+    if (cards) { cards.insertAdjacentHTML("beforeend", videoCardHtml(e2)); ensureVideoTicker(); } else renderMessages();
+    await startVideoJob(convo, e2, img);
+  }
+
+  /* ---------- chat tool: the chat model decides to make a video ---------- */
+  function videoCapsLine(m) {
+    const bits = [];
+    if (m.durations?.length) { const lo = Math.min(...m.durations), hi = Math.max(...m.durations); bits.push(lo === hi ? `${lo}s` : `${lo}–${hi}s`); }
+    if (m.resolutions?.length) bits.push(m.resolutions.slice().sort((a, b) => vResRank(b) - vResRank(a))[0].replace(/k$/, "K"));
+    if (m.audio === true || m.audioAlways) bits.push("🔊");
+    if (supportsImage(m)) bits.push("🖼");
+    return bits.join(" · ");
+  }
+  function videoToolDef() {
+    const models = usableVideoModels().filter((m) => !/sora/i.test(m.id))
+      .sort((a, b) => videoNote(b.id).q - videoNote(a.id).q).slice(0, 16);
+    const lines = models.map((m) => {
+      const est = estimateVideoCost(m, fitVideoParams(m, { priority: "balanced" }));
+      return `- ${videoModelKey(m)} — ${m.label}${videoNote(m.id).note ? `: ${videoNote(m.id).note}` : ""} [${videoCapsLine(m) || "caps unknown"}${est != null ? `, ~$${(est / (fitVideoParams(m, {}).duration || 1)).toFixed(2)}/s` : ""}]`;
+    }).join("\n");
+    return {
+      name: "generate_video",
+      description: "Generate a REAL AI video with a video-generation model (text-to-video, or image-to-video from an image the user attached). Use it whenever the user asks to create, make, generate or animate a video, clip, scene, shot, trailer, ad or animation. It returns right away with a job id; the finished video appears in the chat automatically (usually 1–3 minutes). Choose the model that best fits the request, or omit `model` to let MAX auto-choose using the user's priority.\nAvailable models:\n" + lines,
+      input_schema: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "Rich, specific shot description in English: subject, action beats in order, setting, camera shot & movement, lighting, mood, style; for audio models also sound/music and any dialogue in quotes." },
+          model: { type: "string", description: "Optional model id from the list (provider::id). Omit to auto-choose." },
+          priority: { type: "string", enum: ["quality", "balanced", "fast"], description: "Used when auto-choosing. Defaults to the user's setting." },
+          duration_seconds: { type: "integer", description: "Desired length in seconds (snapped to what the model supports)." },
+          aspect_ratio: { type: "string", description: "16:9 (landscape), 9:16 (vertical / shorts / reels), 1:1 (square)…" },
+          resolution: { type: "string", description: "480p, 720p, 1080p or 4k (snapped to what the model supports)." },
+          audio: { type: "boolean", description: "Generate sound (models with native audio only). Default true." },
+          use_attached_image: { type: "boolean", description: "Start from the image the user attached (image-to-video). Default true when an image was attached." },
+        },
+        required: ["prompt"],
+      },
+    };
+  }
+  async function runVideoTool(input, ctx) {
+    if (!state.videoCatalog.fetchedAt) await loadVideoCatalog();
+    if (!anyVideoReady()) return "Error: no video model is connected. Tell the user to add an OpenRouter or Google Gemini key in Settings → Video generation.";
+    const prompt = String(input.prompt || "").trim();
+    if (!prompt) return "Error: 'prompt' is required.";
+    const convo = ctx?.convo || activeConvo();
+    const vs = state.settings.video;
+    const imgAtt = input.use_attached_image === false ? null : latestUserImage(convo);
+    const want = videoWant({
+      priority: VIDEO_PRIORITIES[input.priority] ? input.priority : vs.priority,
+      duration: Number(input.duration_seconds) || (vs.duration === "auto" ? null : Number(vs.duration)),
+      aspectRatio: typeof input.aspect_ratio === "string" && /^\d{1,2}:\d{1,2}$/.test(input.aspect_ratio) ? input.aspect_ratio : vs.aspectRatio,
+      resolution: typeof input.resolution === "string" && input.resolution ? input.resolution : vs.resolution,
+      audio: input.audio !== undefined ? input.audio !== false : vs.audio !== false,
+      imageAtt: imgAtt, image: Boolean(imgAtt),
+    });
+    want.wantsAudio = want.audio;
+    let model = input.model ? findVideoModel(String(input.model).trim()) : null;
+    let fit, auto = false, note = "";
+    if (model && (!videoProviderReady(model.provider) || model.custom)) {
+      note = ` (${input.model} isn't available, so MAX auto-chose instead)`;
+      model = null;
+    }
+    if (!model) {
+      const pick = chooseVideoModel(want);
+      if (!pick.model) return "Error: no usable video model.";
+      model = pick.model; fit = pick.fit; auto = true;
+    } else fit = fitVideoParams(model, want);
+    const useImage = Boolean(imgAtt) && supportsImage(model) !== false;
+    const entry = newVideoEntry({ model, fit, prompt, auto, priority: want.priority, hasImage: useImage });
+    ctx?.videos?.push(entry);
+    await startVideoJob(convo, entry, useImage ? imgAtt : null);
+    if (entry.jobId) looseVideos.set(entry.jobId, entry);
+    if (entry.status === "failed") return `Error starting the video: ${entry.error}`;
+    const p = entry.params;
+    const bits = [p.duration && `${p.duration}s`, p.aspectRatio, p.resolution, p.audio ? "with audio" : "", useImage ? "from the attached image" : ""].filter(Boolean).join(", ");
+    return `Started video ${entry.jobId} with ${model.label} via ${entry.providerLabel}${auto ? ` (auto-chosen for "${VIDEO_PRIORITIES[want.priority].label}")` : ""}${note} — ${bits}` +
+      `${entry.estCost != null ? `, estimated $${entry.estCost.toFixed(2)}` : ""}${entry.notes.length ? `. Adjusted: ${entry.notes.join("; ")}` : ""}. ` +
+      `It renders in the chat automatically when ready (~${Math.round(expectedVideoSecs(entry) / 60) || 1} min). Tell the user briefly what you're generating and which model you picked (and why). Do not include links.`;
+  }
+
+  /* ---------- video cards ---------- */
+  const arCss = (a) => { const [w, h] = String(a || "16:9").split(":").map(Number); return w && h ? `${w} / ${h}` : "16 / 9"; };
+  function videoCardHtml(v) {
+    const p = v.params || {};
+    const pending = !VIDEO_TERMINAL.has(v.status) && v.status !== "interrupted";
+    const chips = [p.duration && `${p.duration}s`, p.aspectRatio, p.resolution && String(p.resolution).replace(/k$/, "K"),
+      p.audio === true ? "🔊 audio" : p.silent ? "🔇 silent" : "", v.hasImage ? "🖼 from image" : ""].filter(Boolean);
+    const cost = v.cost != null ? `$${Number(v.cost).toFixed(2)}` : v.estCost != null ? `~$${Number(v.estCost).toFixed(2)}` : "";
+    const portrait = orient(p.aspectRatio) < 0;
+    let body;
+    if (v.status === "completed" && v.url) {
+      body = `<video class="vcard__video" controls playsinline preload="metadata" src="${esc(v.url)}"></video>`;
+    } else if (v.status === "failed" || v.status === "cancelled") {
+      body = `<div class="vcard__error">⚠ ${esc(v.error || (v.status === "cancelled" ? "Cancelled." : "Generation failed."))}</div>`;
+    } else {
+      const exp = expectedVideoSecs(v);
+      body = `<div class="vcard__stage" style="aspect-ratio:${arCss(p.aspectRatio)}">
+        <div class="vcard__shimmer"></div>
+        <div class="vcard__center"><div class="vcard__label">${v.status === "interrupted" ? "⏸" : '<span class="tool-run__spin"></span>'} ${esc(VSTATUS[v.status] || "Working…")}</div>
+        <div class="vcard__meta"><span class="vcard__time">0:00</span> · usually ~${Math.max(1, Math.round(exp / 60))} min${v.progress != null ? ` · ${Math.round(v.progress)}%` : ""}</div></div>
+        <div class="vcard__progress"><span></span></div></div>`;
+    }
+    const actions = [];
+    if (v.status === "completed" && v.url) {
+      actions.push(`<a class="vcard__btn vcard__btn--primary" href="${esc(v.url)}?download=1" download>⬇ Download</a>`);
+      actions.push(`<button type="button" class="vcard__btn" data-vact="regen">↻ Regenerate</button>`);
+      actions.push(`<button type="button" class="vcard__btn" data-vact="other">⇄ Other model</button>`);
+      actions.push(`<button type="button" class="vcard__btn" data-vact="remix">✎ Remix</button>`);
+    } else if (v.status === "failed" || v.status === "cancelled") {
+      actions.push(`<button type="button" class="vcard__btn vcard__btn--primary" data-vact="regen">↻ Retry</button>`);
+      actions.push(`<button type="button" class="vcard__btn" data-vact="other">⇄ Other model</button>`);
+      actions.push(`<button type="button" class="vcard__btn" data-vact="remix">✎ Edit prompt</button>`);
+      if (/key|credit|401|402|403/i.test(v.error || "")) actions.push(`<button type="button" class="vcard__btn" data-vact="setup">⚙ Settings</button>`);
+    } else if (v.status === "interrupted") {
+      actions.push(`<button type="button" class="vcard__btn vcard__btn--primary" data-vact="resume">▶ Resume</button>`);
+    } else if (v.jobId) {
+      actions.push(`<button type="button" class="vcard__btn" data-vact="cancel">✕ Cancel</button>`);
+    }
+    actions.push(`<button type="button" class="vcard__btn" data-vact="copy">⧉ Prompt</button>`);
+    const orig = v.enhancedBy && v.originalPrompt && v.originalPrompt !== v.prompt ? `<div class="vcard__orig">Your idea: ${esc(v.originalPrompt)}</div>` : "";
+    return `<div class="vcard${pending ? " vcard--pending" : ""}${portrait ? " vcard--portrait" : ""} vcard--${esc(v.status)}" data-vid="${esc(v.uid)}"
+      data-since="${Number(v.startedAt || v.createdAt) || Date.now()}" data-expected="${expectedVideoSecs(v)}" data-progress="${v.progress != null ? Math.round(v.progress) : ""}">
+      <div class="vcard__head"><span class="vcard__model">🎬 ${esc(v.label)}</span>
+        <span class="vcard__prov">${esc(v.providerLabel || v.provider)}${v.auto ? " · auto-chosen" : ""}</span>
+        <span class="vcard__chips">${chips.map((c) => `<span class="vcard__chip">${esc(c)}</span>`).join("")}${cost ? `<span class="vcard__chip vcard__cost" title="${v.cost != null ? "Actual cost reported by the provider" : "Estimate from list prices"}">${esc(cost)}</span>` : ""}</span></div>
+      ${body}
+      <details class="vcard__prompt"><summary>${v.enhancedBy ? `✨ Prompt (enhanced by ${esc(v.enhancedBy)})` : "Prompt"}</summary><div>${esc(v.prompt)}</div>${orig}</details>
+      ${v.notes?.length ? `<div class="vcard__notes">ℹ ${esc(v.notes.join(" · "))}</div>` : ""}
+      <div class="vcard__actions">${actions.join("")}</div>
+    </div>`;
+  }
+  function videosHtml(m) {
+    return m.videos?.length ? `<div class="vcards">${m.videos.map(videoCardHtml).join("")}</div>` : "";
+  }
+  function updateVideoCard(entry) {
+    const el = document.querySelector(`.vcard[data-vid="${CSS.escape(entry.uid)}"]`);
+    if (!el) return;
+    if (entry.status === "completed" && el.querySelector("video")?.getAttribute("src") === entry.url) return; // keep playback
+    const open = el.querySelector(".vcard__prompt")?.open;
+    el.outerHTML = videoCardHtml(entry);
+    if (open) document.querySelector(`.vcard[data-vid="${CSS.escape(entry.uid)}"] .vcard__prompt`)?.setAttribute("open", "");
+    ensureVideoTicker();
+  }
+  let vTicker = null;
+  function tickVideoCards() {
+    const els = $$(".vcard--pending");
+    if (!els.length) { clearInterval(vTicker); vTicker = null; return; }
+    const now = Date.now();
+    for (const el of els) {
+      const secs = Math.max(0, Math.round((now - (+el.dataset.since || now)) / 1000));
+      const t = el.querySelector(".vcard__time");
+      if (t) t.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+      const bar = el.querySelector(".vcard__progress span");
+      const exp = +el.dataset.expected || 90;
+      if (bar) bar.style.width = `${el.dataset.progress !== "" ? el.dataset.progress : Math.round(95 * (1 - Math.exp(-secs / exp)))}%`;
+    }
+  }
+  function ensureVideoTicker() {
+    if (!vTicker && document.querySelector(".vcard--pending")) { vTicker = setInterval(tickVideoCards, 1000); tickVideoCards(); }
+  }
+  async function handleVideoCardAction(action, card, btn) {
+    const hit = findVideos((v) => v.uid === card.dataset.vid)[0];
+    if (!hit) return;
+    const e = hit.entry;
+    if (action === "copy") { copyText(e.prompt); toast("Prompt copied", "success"); return; }
+    if (action === "setup") { openSettings("video"); return; }
+    if (action === "remix") {
+      setVideoMode(true);
+      const input = $("#input");
+      input.value = e.originalPrompt || e.prompt;
+      autoResize(input); updateCharCount(); updateSendState(); input.focus();
+      return;
+    }
+    if (action === "regen") return regenerateVideo(hit, null);
+    if (action === "other") return openVideoModelPicker(btn, { onPick: (key) => regenerateVideo(hit, key), title: "Regenerate with…" });
+    if (action === "resume") return resumeVideo(e);
+    if (action === "cancel") {
+      if (!confirm("Stop waiting for this video? The provider may still charge for it.")) return;
+      try {
+        const r = await fetch(`/api/video/jobs/${encodeURIComponent(e.jobId)}/cancel`, { method: "POST" });
+        const d = await r.json().catch(() => ({}));
+        if (d.job) applyJob(e, d.job);
+      } catch {}
+      videoWatch.delete(e.jobId);
+      _dirtyConvos.add(hit.convo.id);
+      saveConvos();
+      updateVideoCard(e);
+    }
+  }
+
+  /* ---------- Video mode (composer) ---------- */
+  function setVideoMode(on) {
+    state.videoMode = Boolean(on);
+    if (state.videoMode && !state.videoCatalog.fetchedAt) loadVideoCatalog();
+    renderVideoControls();
+    updateSendState();
+  }
+  function renderVideoControls() {
+    const box = $("#video-controls");
+    if (!box) return;
+    const on = Boolean(state.videoMode);
+    box.hidden = !on;
+    $("#composer")?.classList.toggle("composer--video", on);
+    const tog = $("#video-toggle");
+    if (tog) { tog.classList.toggle("on", on); tog.setAttribute("aria-pressed", String(on)); }
+    const input = $("#input");
+    if (input) input.placeholder = on ? VIDEO_PLACEHOLDER : (state._chatPlaceholder || input.placeholder);
+    $("#send-btn").title = on ? "Generate video (Enter)" : "Send (Enter)";
+    if (!on) return;
+    if (!anyVideoReady()) {
+      box.innerHTML = `<button type="button" class="vc-pill vc-setup" data-vc="setup">🎬 Connect a video model →</button>
+        <span class="vc-hint">${state.videoCatalog.fetchedAt ? "Add an OpenRouter or Google Gemini key" : "Loading video models…"}</span>`;
+      return;
+    }
+    const vs = state.settings.video;
+    const sel = resolveVideoSelection();
+    const m = sel.model;
+    const f = sel.fit || {};
+    const name = sel.auto ? `<b>Auto</b>${m ? ` → ${esc(m.label)}` : ""}` : esc(m ? m.label : "Choose model");
+    const audioBtn = m && (m.audioAlways || m.audio === true)
+      ? `<button type="button" class="vc-pill vc-toggle${f.audio ? " on" : ""}" data-vc="audio" ${m.audioAlways ? "disabled" : ""} title="${m.audioAlways ? "This model always generates audio" : "Generate sound"}">${f.audio ? "🔊" : "🔇"}</button>`
+      : `<button type="button" class="vc-pill vc-toggle" data-vc="audio" disabled title="This model makes silent video">🔇</button>`;
+    const notes = (f.notes || []).join(" · ");
+    box.innerHTML = `
+      <button type="button" class="vc-pill vc-model" data-vc="model" title="${esc(sel.auto ? `MAX chooses the best model (${VIDEO_PRIORITIES[vs.priority]?.label || ""})` : `${m?.label} · ${videoProviderInfo(m?.provider).label}`)}">🎬 ${name} <span class="vc-chev">▾</span></button>
+      <button type="button" class="vc-pill" data-vc="duration" title="Length">⏱ ${f.duration ? `${f.duration}s` : "auto"}</button>
+      <button type="button" class="vc-pill" data-vc="aspect" title="Aspect ratio">${orient(f.aspectRatio) < 0 ? "▯" : orient(f.aspectRatio) > 0 ? "▭" : "□"} ${esc(f.aspectRatio || "auto")}</button>
+      <button type="button" class="vc-pill" data-vc="resolution" title="Resolution">${esc(String(f.resolution || "auto").replace(/k$/, "K"))}</button>
+      ${audioBtn}
+      <button type="button" class="vc-pill vc-toggle${vs.enhance ? " on" : ""}" data-vc="enhance" title="${vs.enhance ? "✨ Enhance ON — your chat model turns short ideas into detailed shot descriptions" : "✨ Enhance OFF — your prompt is sent as-is"}">✨</button>
+      ${sel.cost != null ? `<span class="vc-cost" title="Estimated from list prices">~$${sel.cost.toFixed(2)}</span>` : ""}
+      ${notes ? `<span class="vc-note" title="${esc(notes)}">ℹ</span>` : ""}`;
+  }
+  function openOptionPop(anchor, title, options, current, onPick) {
+    if (popEl && popEl.dataset.for === title) { closePop(); return; }
+    closePop();
+    const pop = document.createElement("div");
+    pop.className = "effort-pop opt-pop";
+    pop.dataset.for = title;
+    pop.innerHTML = `<div class="effort-pop__head">${esc(title)}</div>` + options.map((o) => {
+      const on = String(o.value) === String(current);
+      return `<button type="button" class="effort-opt${on ? " active" : ""}" data-v="${esc(String(o.value))}">
+        <span class="effort-opt__label">${esc(o.label)}</span>${o.hint ? `<span class="effort-opt__hint">${esc(o.hint)}</span>` : ""}
+        ${on ? `<svg class="effort-opt__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>` : ""}</button>`;
+    }).join("");
+    document.body.appendChild(pop);
+    popEl = pop;
+    placePop(pop, anchor, "above");
+    pop.querySelectorAll(".effort-opt").forEach((b) => b.addEventListener("click", () => { closePop(); onPick(b.dataset.v); }));
+    dismissOnOutside(pop, anchor);
+  }
+  function onVideoControl(kind, btn) {
+    const vs = state.settings.video;
+    const sel = resolveVideoSelection();
+    const m = sel.model || {};
+    const done = () => { saveSettings(); renderVideoControls(); };
+    if (kind === "setup") return openSettings("video");
+    if (kind === "model") return openVideoModelPicker(btn, {});
+    if (kind === "enhance") { vs.enhance = !vs.enhance; done(); toast(vs.enhance ? "✨ Prompt enhancement on" : "Prompt enhancement off"); return; }
+    if (kind === "audio") { vs.audio = !vs.audio; done(); return; }
+    if (kind === "duration") {
+      const list = m.durationsByResolution?.[String(sel.fit?.resolution || "").toLowerCase()] || m.durations || [4, 5, 6, 8, 10, 12, 15];
+      return openOptionPop(btn, "Length", [{ value: "auto", label: "Auto", hint: "Best fit for the model" }, ...list.map((d) => ({ value: d, label: `${d} seconds` }))],
+        vs.duration, (v) => { vs.duration = v === "auto" ? "auto" : Number(v); done(); });
+    }
+    if (kind === "aspect") {
+      const all = [["16:9", "Landscape"], ["9:16", "Vertical — Shorts / Reels / TikTok"], ["1:1", "Square"], ["4:3", "Classic"], ["3:4", "Portrait"], ["21:9", "Cinema wide"]];
+      const list = m.aspectRatios?.length ? all.filter(([a]) => m.aspectRatios.includes(a)) : all.slice(0, 3);
+      return openOptionPop(btn, "Aspect ratio", [{ value: "auto", label: "Auto", hint: "Match the attached image, else 16:9" }, ...list.map(([a, h]) => ({ value: a, label: a, hint: h }))],
+        vs.aspectRatio, (v) => { vs.aspectRatio = v; done(); });
+    }
+    if (kind === "resolution") {
+      const all = ["480p", "720p", "1080p", "4k"];
+      const list = m.resolutions?.length ? m.resolutions.slice().sort((a, b) => vResRank(a) - vResRank(b)) : all;
+      return openOptionPop(btn, "Resolution", [{ value: "auto", label: "Auto", hint: "720p (1080p for Best quality)" }, ...list.map((r) => ({ value: r, label: String(r).replace(/k$/, "K") }))],
+        vs.resolution, (v) => { vs.resolution = v; done(); });
+    }
+  }
+
+  /* ---------- video model picker ---------- */
+  function openVideoModelPicker(anchor, { onPick, title } = {}) {
+    if (popEl && popEl.classList.contains("vmodel-pop")) { closePop(); return; }
+    closePop();
+    const pop = document.createElement("div");
+    pop.className = "model-pop vmodel-pop";
+    let tab = "all";
+    const provs = () => videoProviders();
+    pop.innerHTML = `
+      ${title ? `<div class="vmp-title">${esc(title)}</div>` : ""}
+      <div class="model-pop__search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input type="text" placeholder="Search video models…" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="model-pop__tabs"></div>
+      <div class="model-pop__list" role="listbox"></div>
+      <div class="model-pop__foot">
+        <input type="text" class="mp-custom" placeholder="Custom video model id…" spellcheck="false" />
+        <select class="mp-custom-prov"></select>
+        <button type="button" class="btn btn--ghost btn--sm mp-custom-use">Use</button>
+      </div>`;
+    document.body.appendChild(pop);
+    popEl = pop;
+    const input = pop.querySelector("input");
+    const listEl = pop.querySelector(".model-pop__list");
+    const pick = (key) => {
+      closePop();
+      if (onPick) return onPick(key);
+      state.settings.video.model = key;
+      saveSettings();
+      renderVideoControls();
+      const m = findVideoModel(key);
+      toast(key === "auto" ? `Auto — MAX picks the best model (${VIDEO_PRIORITIES[state.settings.video.priority].label})` : `Video model: ${m?.label || key}`, "success");
+    };
+    const renderTabs = () => {
+      pop.querySelector(".model-pop__tabs").innerHTML = `<button type="button" class="mp-tab${tab === "all" ? " active" : ""}" data-t="all">All</button>` +
+        provs().map((p) => `<button type="button" class="mp-tab${tab === p.id ? " active" : ""}" data-t="${esc(p.id)}">${esc(p.label.replace(/ \(.*\)$/, ""))}${videoProviderReady(p.id) ? "" : ' <span class="mp-nokey" title="No key yet">•</span>'}</button>`).join("") +
+        `<button type="button" class="icon-btn vmp-refresh" title="Refresh the live model list" aria-label="Refresh">↻</button>`;
+      pop.querySelectorAll(".mp-tab").forEach((t) => t.addEventListener("click", () => { tab = t.dataset.t; renderTabs(); render(); }));
+      pop.querySelector(".vmp-refresh").addEventListener("click", async (e) => {
+        e.currentTarget.classList.add("spinning");
+        await loadVideoCatalog(true);
+        if (popEl === pop) { renderTabs(); render(); toast(`Video models refreshed — ${videoModels().length} available`); }
+      });
+      pop.querySelector(".mp-custom-prov").innerHTML = provs().map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("");
+    };
+    const render = () => {
+      const q = input.value.trim().toLowerCase();
+      const cur = onPick ? "" : state.settings.video.model;
+      const want = videoWant();
+      let html = "";
+      if (!q && tab === "all") {
+        const auto = chooseVideoModel(want);
+        html += `<div class="vmp-auto${cur === "auto" ? " selected" : ""}">
+          <button type="button" class="mp-item" data-key="auto"><span class="mp-item__main"><span class="mp-item__label">✨ Auto — MAX chooses</span>
+          <span class="mp-item__id">${auto.model ? `Right now: ${esc(auto.model.label)} (${esc(videoProviderInfo(auto.model.provider).label)})` : "Add a video key to enable"}</span></span>
+          ${cur === "auto" ? `<svg class="mp-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>` : ""}</button>
+          <div class="vmp-prio">${Object.entries(VIDEO_PRIORITIES).map(([k, p]) => `<button type="button" class="vmp-prio__b${state.settings.video.priority === k ? " on" : ""}" data-prio="${k}" title="${esc(p.hint)}">${esc(p.label)}</button>`).join("")}</div>
+        </div>`;
+      }
+      const models = videoModels().filter((m) => (tab === "all" || m.provider === tab) &&
+        (!q || [m.label, m.id, m.family, videoNote(m.id).note].join(" ").toLowerCase().includes(q)))
+        .sort((a, b) => (videoProviderReady(b.provider) - videoProviderReady(a.provider)) ||
+          (VIDEO_PROVIDER_IDS.indexOf(a.provider) - VIDEO_PROVIDER_IDS.indexOf(b.provider)) || (videoNote(b.id).q - videoNote(a.id).q));
+      let group = "";
+      for (const m of models) {
+        const g = videoProviderInfo(m.provider).label;
+        if (g !== group) {
+          group = g;
+          const err = state.videoCatalog.errors?.[m.provider];
+          html += `<div class="mp-group">${esc(g)}${videoProviderReady(m.provider) ? "" : ` <button type="button" class="mp-addkey" data-addkey="1">add key</button>`}</div>` +
+            (err ? `<div class="vmp-err">${esc(err)}</div>` : "");
+        }
+        const key = videoModelKey(m);
+        const fit = fitVideoParams(m, want);
+        const est = estimateVideoCost(m, fit);
+        const sel = key === cur;
+        html += `<button type="button" class="mp-item${sel ? " selected" : ""}${videoProviderReady(m.provider) ? "" : " mp-item--off"}" data-key="${esc(key)}">
+          <span class="mp-item__main"><span class="mp-item__label">${esc(m.label)}${m.live === false && m.provider === "openrouter" ? ' <span class="mp-badge mp-badge--dim">offline list</span>' : ""}</span>
+          <span class="mp-item__id">${esc(m.id)}${videoNote(m.id).note ? ` · ${esc(videoNote(m.id).note)}` : ""}</span></span>
+          <span class="vmp-caps">${esc(videoCapsLine(m))}${est != null ? `<span class="vmp-cost">~$${est.toFixed(2)}</span>` : ""}</span>
+          ${sel ? `<svg class="mp-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>` : ""}
+        </button>`;
+      }
+      if (!models.length) html += `<div class="repo-pop__msg">${state.videoCatalog.fetchedAt ? "No video models match." : '<div class="repo-spinner"></div>'}</div>`;
+      listEl.innerHTML = html;
+      listEl.querySelectorAll("[data-key]").forEach((b) => b.addEventListener("click", () => {
+        const key = b.dataset.key;
+        const m = key === "auto" ? null : findVideoModel(key);
+        if (m && !videoProviderReady(m.provider)) { closePop(); toast(`Add a ${videoProviderInfo(m.provider).label} key to use ${m.label}.`); openSettings("video"); return; }
+        pick(key);
+      }));
+      listEl.querySelectorAll("[data-prio]").forEach((b) => b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.settings.video.priority = b.dataset.prio;
+        saveSettings(); renderVideoControls(); render();
+      }));
+      listEl.querySelectorAll("[data-addkey]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); closePop(); openSettings("video"); }));
+    };
+    input.addEventListener("input", render);
+    input.addEventListener("keydown", (e) => { if (e.key === "Escape") closePop(); });
+    const useCustom = () => {
+      const id = pop.querySelector(".mp-custom").value.trim();
+      if (!id) return;
+      const provider = pop.querySelector(".mp-custom-prov").value;
+      const custom = state.settings.video.custom || (state.settings.video.custom = []);
+      if (!custom.some((c) => c.provider === provider && c.id === id)) custom.push({ provider, id });
+      saveSettings();
+      pick(`${provider}::${id}`);
+    };
+    pop.querySelector(".mp-custom-use").addEventListener("click", useCustom);
+    pop.querySelector(".mp-custom").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); useCustom(); } });
+    renderTabs();
+    render();
+    placePop(pop, anchor, anchor.closest(".composer-wrap") ? "above" : "below");
+    setTimeout(() => input.focus(), 20);
+    dismissOnOutside(pop, anchor);
+    if (!state.videoCatalog.fetchedAt) loadVideoCatalog().then(() => { if (popEl === pop) { renderTabs(); render(); } });
+  }
+
+  async function testVideoProvider(provider, btn, out) {
+    setBtnBusy(btn, true);
+    out.textContent = "Checking…"; out.style.color = "";
+    try {
+      const field = { openrouter: "#set-orkey", google: "#set-gkey", gateway: "#set-gwkey" }[provider];
+      const res = await fetch("/api/video/test", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, apiKey: $(field)?.value.trim() || videoKey(provider) || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      out.textContent = "✓ " + data.message; out.style.color = "#34d399";
+    } catch (err) {
+      out.textContent = "✗ " + (err instanceof TypeError ? "Can't reach the MAX server." : err.message); out.style.color = "#ff6b8a";
+    } finally { setBtnBusy(btn, false); }
   }
 
   function applyPerfMode() {
@@ -4656,6 +5624,22 @@ a{color:#22d3ee}</style></head>
     $("#set-cckey").value = s.ccKey || "";
     $("#set-remember").checked = !!s.rememberKeys;
     $("#set-perf").checked = !!s.perfMode;
+    $("#set-orkey").value = state.videoKeys.openrouter || "";
+    $("#set-gkey").value = state.videoKeys.google || "";
+    $("#set-gwkey").value = state.videoKeys.gateway || "";
+    $("#set-vpriority").value = s.video.priority;
+    $("#set-venhance").checked = s.video.enhance !== false;
+    ["#or-test-result", "#g-test-result", "#gw-test-result"].forEach((id) => { $(id).textContent = ""; });
+    const vp = (id) => videoProviders().find((p) => p.id === id);
+    const serverNote = (id) => (vp(id)?.hasServerKey ? " A server key is configured — leave blank to use it." : "");
+    $("#orkey-help").innerHTML = `Get one at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">openrouter.ai/keys</a>.${serverNote("openrouter")}`;
+    $("#gkey-help").innerHTML = `Get one at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com/apikey</a> (Veo needs a paid-tier key).${serverNote("google")}`;
+    const gw = vp("gateway");
+    $("#gwkey-field").style.display = gw ? "" : "none";
+    if (gw) {
+      $("#gw-label").textContent = gw.label;
+      $("#gw-help").textContent = `Base URL: ${gw.base}. MAX lists the gateway's models and uses any video models it offers.${gw.hasServerKey ? " A server key is configured." : ""}`;
+    }
     $("#cc-test-result").textContent = ""; $("#ar-test-result").textContent = "";
     $("#set-system").value = s.system || "";
     $("#set-maxtokens").value = s.maxTokens;
@@ -4706,6 +5690,10 @@ a{color:#22d3ee}</style></head>
       : `Get a key at <a href="${esc(cc.keyUrl)}" target="_blank" rel="noopener noreferrer">codecraftapi.com</a> → API Keys.`;
     $("#settings-note").textContent = "";
     $("#settings-overlay").hidden = false;
+    if (section === "video") setTimeout(() => {
+      $("#video-section")?.scrollIntoView({ block: "start" });
+      (state.videoKeys.openrouter ? $("#set-gkey") : $("#set-orkey")).focus();
+    }, 40);
     if (section === "providers") setTimeout(() => { $("#providers-section")?.scrollIntoView({ block: "start" }); (s.ccKey || cc.hasServerKey ? $("#set-apikey") : $("#set-cckey")).focus(); }, 40);
   }
   function closeSettings() { $("#settings-overlay").hidden = true; }
@@ -4722,6 +5710,10 @@ a{color:#22d3ee}</style></head>
     }
     state.settings.perfMode = $("#set-perf").checked;
     applyPerfMode();
+    const gwBefore = videoKey("gateway");
+    state.videoKeys = { openrouter: $("#set-orkey").value.trim(), google: $("#set-gkey").value.trim(), gateway: $("#set-gwkey").value.trim() };
+    state.settings.video.priority = $("#set-vpriority").value;
+    state.settings.video.enhance = $("#set-venhance").checked;
     state.settings.system = $("#set-system").value;
     state.settings.maxTokens = Math.max(256, Math.min(64000, parseInt($("#set-maxtokens").value, 10) || 4096));
     state.settings.temperature = parseFloat($("#set-temp").value);
@@ -4744,6 +5736,8 @@ a{color:#22d3ee}</style></head>
     };
 
     saveSettings();
+    saveVideoKeys();
+    if (videoKey("gateway") !== gwBefore) loadVideoCatalog(true); else renderVideoControls();
     updateModelPill();
     updateKeyStatus();
     updateAutoPill();
@@ -4984,6 +5978,12 @@ a{color:#22d3ee}</style></head>
       if (!btn) return;
       const prompt = btn.dataset.prompt;
       if (prompt === "/summarize") { input.value = ""; summarizeRepo(); return; }
+      if (prompt.startsWith("/video ")) {
+        setVideoMode(true);
+        input.value = prompt.slice(7); autoResize(input); updateCharCount(); updateSendState(); input.focus();
+        if (/this photo|this image/i.test(prompt) && !currentVideoImage()) { toast("Attach a photo first (📎), then press Enter"); $("#file-input").click(); }
+        return;
+      }
       input.value = prompt; autoResize(input); updateCharCount(); updateSendState(); input.focus();
       input.setSelectionRange(input.value.length, input.value.length);
     });
@@ -5016,6 +6016,29 @@ a{color:#22d3ee}</style></head>
       else if (cap === "tools") { if (!activeRepo()) openRepoPicker($("#repo-chip")); else toast("Tools are on — MAX can read, edit & push this repo, and fetch web pages."); }
     });
     $("#branch-chip").addEventListener("click", (e) => openBranchPicker(e.currentTarget));
+    // 🎬 Video mode, its option pills, and the video cards in the chat
+    $("#video-toggle").addEventListener("click", () => {
+      setVideoMode(!state.videoMode);
+      toast(state.videoMode ? "🎬 Video mode on — your message becomes a video" : "Video mode off");
+      $("#input").focus();
+    });
+    $("#video-controls").addEventListener("click", (e) => {
+      const b = e.target.closest("[data-vc]");
+      if (b && !b.disabled) onVideoControl(b.dataset.vc, b);
+    });
+    $("#messages").addEventListener("click", (e) => {
+      const b = e.target.closest("[data-vact]");
+      const card = b && b.closest(".vcard");
+      if (card) { e.preventDefault(); handleVideoCardAction(b.dataset.vact, card, b); }
+    });
+    $$("[data-reveal]").forEach((b) => b.addEventListener("click", () => {
+      const el = document.getElementById(b.dataset.reveal);
+      if (el) el.type = el.type === "password" ? "text" : "password";
+    }));
+    $("#or-test").addEventListener("click", (e) => testVideoProvider("openrouter", e.currentTarget, $("#or-test-result")));
+    $("#g-test").addEventListener("click", (e) => testVideoProvider("google", e.currentTarget, $("#g-test-result")));
+    $("#gw-test").addEventListener("click", (e) => testVideoProvider("gateway", e.currentTarget, $("#gw-test-result")));
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && videoWatch.size) { clearTimeout(videoPollTimer); pollVideos(); } });
     $("#gh-status").addEventListener("click", () => { if (state.ghStatus?.error) openSettings(); else refreshGithubStatus(true).then(() => toast("GitHub connection refreshed", "success")); });
     $("#reveal-cckey").addEventListener("click", () => { const el = $("#set-cckey"); el.type = el.type === "password" ? "text" : "password"; });
     $("#cc-test").addEventListener("click", (e) => testProvider("codecraft", e.currentTarget, $("#cc-test-result")));
@@ -5219,8 +6242,11 @@ a{color:#22d3ee}</style></head>
     }
     applyPerfMode();
 
+    state.videoCatalog.providers = state.config.video?.providers || [];
+    state._chatPlaceholder = $("#input").placeholder;
     bindEvents();
     renderSuggestions("create");
+    loadVideoCatalog();
 
     // sidebar default state on mobile
     if (window.innerWidth <= 820) setSidebarHidden(true);
@@ -5263,6 +6289,8 @@ a{color:#22d3ee}</style></head>
     }
 
     refreshGithubStatus(true);
+    resumeVideoTracking(); // videos still generating from earlier sessions
+    ensureVideoTicker();
 
     // first-run nudge if the selected provider has no key
     if (!providerReady()) {
