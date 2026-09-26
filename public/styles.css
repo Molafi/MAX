@@ -948,3 +948,91 @@ body.drag-over::after {
 .perf .sidebar, .perf .topbar, .perf .composer, .perf .modal-overlay, .perf .find-bar, .perf .preview-panel__head { backdrop-filter: none; }
 .perf .sidebar, .perf .topbar, .perf .composer { background: var(--surface-solid); }
 .perf .msg, .perf .tool-run { animation: none; }
+
+
+/* ============================================================
+   v2.1 — AI video generation (Video mode, model picker, cards)
+   ============================================================ */
+.video-toggle { position: relative; }
+.video-toggle svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; }
+.video-toggle.on { color: #fff; background: linear-gradient(135deg, var(--accent-3), var(--accent-1)); box-shadow: 0 4px 14px -6px var(--accent-3); }
+.composer--video { border-color: rgba(255,95,162,.55); box-shadow: 0 0 0 3px rgba(255,95,162,.12), var(--shadow); }
+.composer--video .effort-pill, .composer--video .cap-chips { display: none !important; }
+.composer--video .send-btn { background: linear-gradient(135deg, var(--accent-3), var(--accent-1)); }
+
+.video-controls { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; }
+.vc-pill { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--text-dim); font-size: 12px; font-weight: 600; white-space: nowrap; transition: color .15s, border-color .15s, background .15s; }
+.vc-pill:hover:not(:disabled) { color: var(--text); border-color: var(--accent-3); }
+.vc-pill:disabled { opacity: .45; cursor: not-allowed; }
+.vc-pill b { color: var(--text); font-weight: 700; }
+.vc-model { max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: var(--text); border-color: rgba(255,95,162,.45); }
+.vc-chev { opacity: .6; font-size: 10px; }
+.vc-toggle.on { color: #fff; background: rgba(255,95,162,.22); border-color: rgba(255,95,162,.6); }
+.vc-cost { font-size: 11.5px; font-weight: 700; color: #34d399; padding: 0 4px; font-variant-numeric: tabular-nums; }
+.vc-note { font-size: 12px; color: #fbbf24; cursor: help; padding: 0 2px; }
+.vc-setup { color: #fff; border-color: transparent; background: linear-gradient(135deg, var(--accent-3), var(--accent-1)); }
+.vc-hint { font-size: 11.5px; color: var(--text-faint); }
+@media (max-width: 640px) { .vc-model { max-width: 170px; } .vc-cost { display: none; } }
+
+/* option popovers reuse the effort panel look */
+.opt-pop { width: 250px; max-height: min(420px, 70dvh); overflow-y: auto; }
+
+/* video model picker */
+.vmodel-pop { width: min(520px, calc(100vw - 20px)); }
+.vmp-title { font-size: 11px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; color: var(--text-faint); padding: 12px 14px 0; }
+.vmp-refresh { width: 28px; height: 28px; margin-left: auto; font-size: 15px; }
+.vmp-refresh.spinning { animation: spin .8s linear infinite; }
+.vmp-auto { margin: 2px 0 6px; border-radius: 12px; border: 1px dashed rgba(255,95,162,.45); padding: 2px 2px 8px; }
+.vmp-auto.selected { border-style: solid; background: rgba(255,95,162,.06); }
+.vmp-prio { display: flex; gap: 5px; padding: 0 10px; flex-wrap: wrap; }
+.vmp-prio__b { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border-strong); background: transparent; color: var(--text-dim); font-size: 11.5px; font-weight: 600; }
+.vmp-prio__b.on { background: var(--text); color: var(--surface-solid); border-color: transparent; }
+.vmp-caps { display: flex; align-items: center; gap: 6px; flex-shrink: 0; font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.vmp-cost { color: #34d399; font-weight: 700; }
+.vmp-err { font-size: 11px; color: #fbbf24; padding: 0 10px 6px; }
+.mp-item--off { opacity: .55; }
+.mp-badge--dim { color: var(--text-faint); border-color: var(--border-strong); }
+
+/* user bubble tag */
+.vreq-tag { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .3px; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.18); margin-bottom: 6px; }
+
+/* video cards in the chat */
+.vcards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); margin: 4px 0 2px; }
+.vcards:has(> .vcard:only-child) { grid-template-columns: minmax(0, 620px); }
+.vcard { border: 1px solid var(--border-strong); border-radius: 16px; background: var(--surface-2); overflow: hidden; display: flex; flex-direction: column; min-width: 0; animation: msgIn .3s var(--ease); }
+.vcard--portrait { max-width: 340px; }
+.vcard--failed, .vcard--cancelled { border-color: rgba(255,107,138,.4); }
+.vcard__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 12px 8px; }
+.vcard__model { font-weight: 700; font-size: 13.5px; color: var(--text); }
+.vcard__prov { font-size: 11.5px; color: var(--text-faint); }
+.vcard__chips { display: flex; gap: 5px; flex-wrap: wrap; margin-left: auto; }
+.vcard__chip { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--surface-solid); border: 1px solid var(--border); color: var(--text-dim); white-space: nowrap; }
+.vcard__cost { color: #34d399; border-color: rgba(52,211,153,.35); }
+.vcard__video { display: block; width: 100%; max-height: 72vh; background: #000; }
+.vcard__error { margin: 0 12px 4px; padding: 12px 14px; border-radius: 12px; background: rgba(255,107,138,.08); border: 1px solid rgba(255,107,138,.3); color: #ff9db2; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.vcard__stage { position: relative; width: 100%; max-height: 60vh; background: radial-gradient(120% 90% at 30% 20%, rgba(124,92,255,.35), transparent 60%), radial-gradient(100% 80% at 80% 90%, rgba(255,95,162,.3), transparent 60%), #0b0b16; display: grid; place-items: center; overflow: hidden; }
+.vcard__shimmer { position: absolute; inset: 0; background: linear-gradient(110deg, transparent 20%, rgba(255,255,255,.07) 40%, transparent 60%); background-size: 220% 100%; animation: vshimmer 2.2s linear infinite; }
+@keyframes vshimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+.vcard__center { position: relative; text-align: center; padding: 16px; color: #fff; }
+.vcard__label { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14px; }
+.vcard__meta { margin-top: 6px; font-size: 12px; color: rgba(255,255,255,.7); font-variant-numeric: tabular-nums; }
+.vcard__progress { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: rgba(255,255,255,.1); }
+.vcard__progress span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent-1), var(--accent-3)); transition: width 1s linear; }
+.vcard__prompt { margin: 8px 12px 0; font-size: 12.5px; color: var(--text-dim); }
+.vcard__prompt summary { cursor: pointer; font-weight: 600; color: var(--text-faint); font-size: 12px; }
+.vcard__prompt > div { margin-top: 6px; line-height: 1.55; white-space: pre-wrap; }
+.vcard__orig { margin-top: 6px; font-size: 11.5px; color: var(--text-faint); }
+.vcard__notes { margin: 6px 12px 0; font-size: 11.5px; color: #fbbf24; }
+.vcard__actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 12px 12px; }
+.vcard__btn { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px; border-radius: 9px; border: 1px solid var(--border-strong); background: transparent; color: var(--text); font-size: 12.5px; font-weight: 600; text-decoration: none; cursor: pointer; }
+.vcard__btn:hover { background: var(--surface-solid); border-color: var(--accent-3); }
+.vcard__btn--primary { color: #fff; border-color: transparent; background: linear-gradient(135deg, var(--accent-3), var(--accent-1)); }
+.vcard__btn--primary:hover { filter: brightness(1.1); }
+.perf .vcard__shimmer { animation: none; }
+
+/* welcome suggestions: fit 3–4 per row */
+.suggestions { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+/* links inside video cards must not inherit the markdown link style */
+.md .vcard__btn { color: var(--text); text-decoration: none; }
+.md .vcard__btn--primary { color: #fff; }
+.opt-pop, .effort-pop { overflow-y: auto; }

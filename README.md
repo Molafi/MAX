@@ -15,6 +15,35 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 
 ---
 
+## 🎬 New: AI video generation
+
+MAX generates **real AI videos** with video models: **Veo 3.1** (Fast/Lite), **Kling 3.0**,
+**Seedance 2.x**, **Wan**, **Hailuo** and more.
+
+- **Connect one provider** in Settings → Video generation. You can use
+  [OpenRouter](https://openrouter.ai/keys) (one key for every model above, with a live model list)
+  or a [Google Gemini API key](https://aistudio.google.com/apikey) for Veo 3.1.
+- **Video mode.** Click the 🎬 camera button in the composer, or type `/video <idea>`. Your message
+  becomes a video. The pills under the message box set the model, length, aspect ratio (16:9, 9:16,
+  1:1…), resolution, audio and ✨ prompt enhancement, and show a cost estimate.
+- **Auto: MAX chooses the model.** Auto keeps only the models that can do the request (image-to-video
+  support, length, aspect ratio, audio), then scores them for quality, cost and speed. The scoring
+  depends on your priority: *Best quality*, *Balanced* or *Fast & cheap*. You can also pick a model
+  yourself from the searchable picker.
+- **Or just ask in chat.** "Make a 10-second vertical video of…" works too. The chat model calls the
+  `generate_video` tool, picks a model and writes a detailed cinematic prompt.
+- **Animate a photo.** Attach an image in Video mode and it becomes the first frame (image-to-video).
+- **Video cards** show live progress, then an inline player. Each card has **Download**,
+  **Regenerate**, **Other model** (to compare models side by side) and **Remix** buttons.
+- **Reliable.** Jobs run on the MAX server and videos are saved to `data/videos/`, so they finish even
+  if you close the tab, and they stay playable after the provider's link expires. If a model rejects
+  a setting (e.g. an unsupported length), MAX retries with the nearest supported value. After a server
+  restart, unfinished videos resume.
+
+> OpenAI's Sora API was shut down on Sept 24, 2026, so it isn't offered. CodeCraft/AgentRouter don't
+> list video models today. If CodeCraft adds them, the built-in OpenAI-compatible gateway
+> (`/v1/videos`) picks them up with your existing CodeCraft key.
+
 ## 🆕 What's new in 2.0
 
 - **Two providers, 40 models.** Pick any model from the top‑bar picker (search, provider tabs,
@@ -29,8 +58,8 @@ hold it (though you *can* enter your own key in Settings if you prefer).
 - **Reads every file type.** Images are resized and converted automatically; **PDF** text is extracted (scanned
   pages are sent as images); **Word/Excel/PowerPoint/OpenDocument**; **ZIP** archives (file list and text
   contents); **videos** (key frames plus duration); notebooks, code, logs, CSV. You can drop files anywhere on the window.
-- **Video maker.** Type `/video <idea>` (or use the 🎬 Video tab). MAX writes a 1280×720 canvas
-  animation and records it to a **WebM/MP4** you can download. Any canvas code block also gets a 🎬 Video button.
+- **Motion graphics.** Type `/motion <idea>`. MAX writes a 1280×720 canvas animation and records it
+  to a **WebM/MP4** you can download. Any canvas code block also gets a 🎬 Video button.
 - **Faster GitHub connection.** Lists all your repos (up to 1,000). You can type `owner/name` to
   open any public repo. Includes a branch switcher and a "connected as" status. Data is refreshed on every new chat and
   when you come back to the tab. GitHub ETag caching makes these refreshes nearly free. Files over 1 MB now load, and all
@@ -193,6 +222,9 @@ All settings live in `.env` (see `.env.example`):
 | `AGENTROUTER_BASE_URL` | `https://agentrouter.org`   | Server calls `${BASE_URL}/v1/messages`.                 |
 | `DEFAULT_PROVIDER`     | `codecraft`                 | `codecraft` or `agentrouter`.                           |
 | `DEFAULT_MODEL`        | `claude-opus-5`             | Model used when the UI doesn't pick one.                |
+| `OPENROUTER_API_KEY`   | *(empty)*                   | Video models via OpenRouter (Veo, Kling, Seedance, Wan, Hailuo…). |
+| `GEMINI_API_KEY`       | *(empty)*                   | Veo 3.1 via the Google Gemini API.                      |
+| `VIDEO_GATEWAY_BASE_URL` / `VIDEO_GATEWAY_API_KEY` | CodeCraft base / CodeCraft key | Any OpenAI-compatible `/v1/videos` gateway. |
 | `PORT`                 | `8787`                      | Local port.                                             |
 | `ALLOW_CLIENT_KEY`     | `true`                      | Let users supply their own key in Settings.             |
 | `RATE_LIMIT_PER_MIN`   | `60`                        | Per‑IP request cap per minute (`0` disables).           |
@@ -287,7 +319,8 @@ MAX/
 ├── server.js          # Zero-dependency Node proxy + static file server
 ├── lib/
 │   ├── providers.js   # OpenAI ⇄ Anthropic request/stream translation + fallbacks
-│   └── models.js      # Model catalog (provider, capabilities)
+│   ├── models.js      # Chat model catalog (provider, capabilities)
+│   └── video.js       # Video generation: OpenRouter / Veo / gateway adapters + job manager
 ├── package.json
 ├── .env.example       # Copy to .env and add your key
 └── public/

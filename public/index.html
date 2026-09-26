@@ -212,6 +212,9 @@
             <button type="button" class="icon-btn composer__attach" id="mic-btn" title="Voice input" aria-label="Voice input">
               <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>
             </button>
+            <button type="button" class="icon-btn composer__attach video-toggle" id="video-toggle" title="Video mode — generate videos with AI video models (Veo, Kling, Seedance…)" aria-label="Video mode" aria-pressed="false">
+              <svg viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2.5"/><path d="M16 10.5l5-3v9l-5-3z"/></svg>
+            </button>
             <input type="file" id="file-input" multiple hidden />
             <button type="button" class="effort-pill" id="effort-pill" title="Reasoning effort" aria-haspopup="listbox">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3a3 3 0 00-3 3v.5A3.5 3.5 0 004 13a3.5 3.5 0 003 5.5A3 3 0 0012 20V5a2 2 0 00-3-2zM15 3a3 3 0 013 3v.5a3.5 3.5 0 012 6.5 3.5 3.5 0 01-3 5.5 3 3 0 01-5 1.5"/></svg>
@@ -219,6 +222,7 @@
               <svg class="effort-pill__chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
             </button>
             <div class="cap-chips" id="cap-chips" aria-label="Model capabilities"></div>
+            <div class="video-controls" id="video-controls" aria-label="Video generation options" hidden></div>
             <span class="composer__spacer"></span>
             <span class="char-count" id="char-count">0</span>
             <button type="button" class="stop-btn" id="stop-btn" title="Stop generating" hidden>
@@ -332,6 +336,62 @@
             <input type="checkbox" id="set-perf" class="switch" />
           </label>
         </div>
+
+        <div class="section-divider" id="video-section"><span>Video generation</span></div>
+        <p class="field__help" style="margin-top:-4px">Real AI video models. Connect at least one provider — MAX picks the best model for each request (Auto), or choose one yourself in 🎬 Video mode. Videos are saved on your MAX server.</p>
+
+        <div class="field" id="orkey-field">
+          <label for="set-orkey">OpenRouter key <span class="field__opt">(Veo 3.1 · Kling 3.0 · Seedance · Wan · Hailuo — one key)</span></label>
+          <div class="input-icon">
+            <input type="password" id="set-orkey" placeholder="sk-or-…" autocomplete="new-password" spellcheck="false" />
+            <button type="button" class="reveal-btn" data-reveal="set-orkey" title="Show/hide">👁</button>
+          </div>
+          <p class="field__help" id="orkey-help">Get one at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">openrouter.ai/keys</a>.</p>
+          <div class="danger-row mt8"><button class="btn btn--ghost btn--sm" id="or-test" type="button">Test OpenRouter</button></div>
+          <p class="field__help" id="or-test-result"></p>
+        </div>
+
+        <div class="field" id="gkey-field">
+          <label for="set-gkey">Google Gemini API key <span class="field__opt">(Veo 3.1 · Veo 3.1 Fast · Veo 3.1 Lite)</span></label>
+          <div class="input-icon">
+            <input type="password" id="set-gkey" placeholder="AIza…" autocomplete="new-password" spellcheck="false" />
+            <button type="button" class="reveal-btn" data-reveal="set-gkey" title="Show/hide">👁</button>
+          </div>
+          <p class="field__help" id="gkey-help">Get one at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com/apikey</a> (Veo needs a paid-tier key).</p>
+          <div class="danger-row mt8"><button class="btn btn--ghost btn--sm" id="g-test" type="button">Test Google</button></div>
+          <p class="field__help" id="g-test-result"></p>
+        </div>
+
+        <div class="field" id="gwkey-field">
+          <label for="set-gwkey"><span id="gw-label">OpenAI-compatible gateway</span> <span class="field__opt">(optional · uses /v1/videos)</span></label>
+          <div class="input-icon">
+            <input type="password" id="set-gwkey" placeholder="leave blank to reuse your CodeCraft key" autocomplete="new-password" spellcheck="false" />
+            <button type="button" class="reveal-btn" data-reveal="set-gwkey" title="Show/hide">👁</button>
+          </div>
+          <p class="field__help" id="gw-help"></p>
+          <div class="danger-row mt8"><button class="btn btn--ghost btn--sm" id="gw-test" type="button">Find video models</button></div>
+          <p class="field__help" id="gw-test-result"></p>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="set-vpriority">When MAX chooses (Auto)</label>
+            <select id="set-vpriority">
+              <option value="quality">Best quality</option>
+              <option value="balanced">Balanced</option>
+              <option value="fast">Fast &amp; cheap</option>
+            </select>
+          </div>
+          <div class="field">
+            <label class="switch-row" for="set-venhance">
+              <span><b>✨ Enhance prompts</b>
+              <span class="field__help">Your chat model turns short ideas into detailed shot descriptions first.</span></span>
+              <input type="checkbox" id="set-venhance" class="switch" />
+            </label>
+          </div>
+        </div>
+
+        <div class="section-divider"><span>Chat behaviour</span></div>
 
         <div class="field">
           <label for="set-system">System prompt <span class="field__opt">(persona / behavior)</span></label>
