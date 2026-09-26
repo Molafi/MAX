@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MAX preview</title>
+<style>html,body{margin:0;height:100%;background:#0b0b14;color:#e0e0e0;font-family:system-ui,sans-serif}
+#host{position:fixed;inset:0;width:100%;height:100%;border:0;background:#fff}
+.wait{display:grid;place-items:center;height:100%;opacity:.6}</style>
+</head>
+<body>
+<div class="wait" id="wait">Loading preview…</div>
+<script>
+/*
+ * MAX sandbox — runs model-generated HTML/JS.
+ *
+ * Mode 1 (normal): loaded inside <iframe sandbox="allow-scripts"> by the app.
+ *   The frame has an opaque origin, so untrusted code cannot read MAX's cookies,
+ *   storage or API. It waits for {type:"max-render", html, record} and writes it.
+ *   With `record`, a recorder is injected that captures the largest <canvas>
+ *   to a WebM/MP4 video via MediaRecorder and posts the Blob back.
+ *
+ * Mode 2 (host): opened as a top-level tab ("Open in tab"). It NEVER runs the
+ *   untrusted code itself — it creates a sandboxed iframe of this same page and
+ *   forwards the HTML into it.
+ */
+(function () {
+  "use strict";
+  var isTop = window.top === window;
+
+  function recorderScript(cfg) {
+    return "<script>(" + function (cfg) {
+      var post = function (m) { m.__max = true; try { parent.postMessage(m, "*"); } catch (e) {} };
+      function biggestCanvas() {
+        var list = Array.prototype.slice.call(document.querySelectorAll("canvas"));
+        list.sort(function (a, b) { return b.width * b.height - a.width * a.height; });
+        return list[0] || null;
+      }
+      function record(c) {
+        var stream;
+        try { stream = c.captureStream(cfg.fps); }
+        catch (e) { post({ type: "video-error", message: "Could not capture the canvas (" + (e && e.message) + "). Cross-origin images taint canvases — draw everything procedurally." }); return; }
+        if (!window.MediaRecorder) { post({ type: "video-error", message: "This browser can't record video (MediaRecorder missing)." }); return; }
+        var types = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4;codecs=avc1", "video/mp4"];
+        var mime = "";
+        for (var i = 0; i < types.length; i++) if (MediaRecorder.isTypeSupported(types[i])) { mime = types[i]; break; }
+        var mr;
+        try { mr = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: cfg.bitrate } : { videoBitsPerSecond: cfg.bitrate }); }
+        catch (e) { post({ type: "video-error", message: "Recorder failed to start: " + (e && e.message) }); return; }
+        var chunks = [];
+        mr.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+        mr.onstop = function () {
+          var type = (mr.mimeType || mime || "video/webm").split(";")[0];
+          post({ type: "video-done", blob: new Blob(chunks, { type: type }), mime: type, width: c.width, height: c.height, seconds: cfg.seconds });
+        };
+        var t0 = performance.now();
+        mr.start(250);
+        post({ type: "video-start", seconds: cfg.seconds, width: c.width, height: c.height });
+        var iv = setInterval(function () {
+          var p = Math.min(1, (performance.now() - t0) / (cfg.seconds * 1000));
+          post({ type: "video-progress", p: p });
+          if (p >= 1) { clearInterval(iv); try { mr.stop(); } catch (e) {} }
+        }, 200);
+      }
+      function start() {
+        var tries = 0;
+        var iv = setInterval(function () {
+          var c = biggestCanvas();
+          if (c || ++tries > 120) {
+            clearInterval(iv);
+            if (!c) { post({ type: "video-error", message: "No <canvas> element found — videos are recorded from a canvas animation." }); return; }
+            setTimeout(function () { record(c); }, 120);
+          }
+        }, 50);
+      }
+      if (document.readyState === "complete") start(); else window.addEventListener("load", start);
+    }.toString() + ")(" + JSON.stringify(cfg) + ");<\/script>";
+  }
+
+  function render(html, record) {
+    var doc = String(html || "");
+    if (record) {
+      var cfg = {
+        seconds: Math.max(1, Math.min(60, Number(record.seconds) || 8)),
+        fps: Math.max(10, Math.min(60, Number(record.fps) || 30)),
+        bitrate: Math.max(1e6, Math.min(2e7, Number(record.bitrate) || 8e6)),
+      };
+      doc += recorderScript(cfg);
+    }
+    // Report runtime errors to the app so the user can see / ask MAX to fix them.
+    var errHook = "<script>window.addEventListener('error',function(e){try{parent.postMessage({__max:true,type:'runtime-error',message:String(e.message||e)},'*')}catch(_){}});<\/script>";
+    var snapHook = "<script>window.addEventListener('message',function(e){if(!e.data||e.data.type!=='max-snapshot')return;var c=Array.prototype.slice.call(document.querySelectorAll('canvas')).sort(function(a,b){return b.width*b.height-a.width*a.height})[0];var m={__max:true,type:'snapshot'};if(!c){m.message='No canvas to snapshot — use Open in tab and take a screenshot.'}else{try{m.dataUrl=c.toDataURL('image/png')}catch(err){m.message='Canvas is tainted by cross-origin images.'}}parent.postMessage(m,'*')});<\/script>";
+    document.open();
+    document.write(errHook + snapHook + doc);
+    document.close();
+  }
+
+  if (!isTop) {
+    window.addEventListener("message", function (e) {
+      var d = e.data;
+      if (!d || d.type !== "max-render" || e.source !== parent) return;
+      render(d.html, d.record);
+    });
+    parent.postMessage({ __max: true, type: "ready" }, "*");
+    return;
+  }
+
+  // ---- host mode (top-level tab) ----
+  var pending = null;
+  var frame = document.createElement("iframe");
+  frame.id = "host";
+  frame.setAttribute("sandbox", "allow-scripts allow-modals allow-popups");
+  frame.src = "/sandbox.html";
+  document.body.appendChild(frame);
+  var frameReady = false;
+  function flush() {
+    if (frameReady && pending) {
+      frame.contentWindow.postMessage({ type: "max-render", html: pending, record: null }, "*");
+      document.getElementById("wait").remove();
+      pending = null;
+    }
+  }
+  window.addEventListener("message", function (e) {
+    var d = e.data || {};
+    if (e.source === frame.contentWindow && d.__max && d.type === "ready") { frameReady = true; flush(); return; }
+    if (e.source === window.opener && e.origin === location.origin && d.type === "max-host-render") {
+      pending = d.html; flush();
+    }
+  });
+  if (window.opener) window.opener.postMessage({ type: "max-host-ready" }, location.origin);
+})();
+</script>
+</body>
+</html>

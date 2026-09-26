@@ -1,8 +1,8 @@
 /* MAX service worker — installable app shell + offline static cache.
    Deliberately conservative: only GET, same-origin, non-API requests are cached.
    API calls (including the streaming /api/chat) always go straight to the network. */
-const CACHE = "max-shell-v2";
-const SHELL = ["/", "/index.html", "/login.html", "/login.js", "/styles.css", "/app.js", "/bg.js", "/favicon.svg", "/manifest.webmanifest"];
+const CACHE = "max-shell-v3";
+const SHELL = ["/", "/index.html", "/login.html", "/login.js", "/styles.css", "/app.js", "/bg.js", "/files.js", "/favicon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
@@ -26,18 +26,18 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return; // let CDN requests pass through
   if (url.pathname.startsWith("/api/")) return;    // never cache API responses
 
+  if (url.pathname === "/sandbox.html") return;    // preview sandbox: always live
+
+  // Network-first so updates ship immediately; the cache is only an offline fallback.
   event.respondWith(
-    caches.match(req).then((cached) => {
-      const network = fetch(req)
-        .then((res) => {
-          if (res && res.status === 200 && res.type === "basic") {
-            const copy = res.clone();
-            caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
-          }
-          return res;
-        })
-        .catch(() => cached || caches.match("/index.html"));
-      return cached || network;
-    })
+    fetch(req)
+      .then((res) => {
+        if (res && res.status === 200 && res.type === "basic") {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+        }
+        return res;
+      })
+      .catch(() => caches.match(req).then((cached) => cached || caches.match("/index.html")))
   );
 });

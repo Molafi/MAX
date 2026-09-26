@@ -4,15 +4,41 @@
   <img src="public/favicon.svg" width="88" alt="MAX logo" />
 </p>
 
-**MAX** is a polished, premium chat interface for talking to AI models through
-[AgentRouter](https://agentrouter.org) (an Anthropic‑compatible gateway that gives you
-access to Claude, GPT, DeepSeek, GLM and more behind one key).
+**MAX** is a polished, premium chat interface for 40 AI models through two providers:
+[CodeCraft API](https://codecraftapi.com) (OpenAI‑compatible: Claude Opus 5, GPT‑5.6, Gemini 3.x,
+DeepSeek V4, Qwen, Kimi, GLM, Grok, Seed, Muse…) and [AgentRouter](https://agentrouter.org)
+(Anthropic‑compatible). Use either one, or both at once.
 
 It ships as a **zero‑dependency Node server** (no `npm install` needed) plus a fast,
 hand‑built vanilla frontend. Your API key stays on the server — the browser never has to
 hold it (though you *can* enter your own key in Settings if you prefer).
 
 ---
+
+## 🆕 What's new in 2.0
+
+- **Two providers, 40 models.** Pick any model from the top‑bar picker (search, provider tabs,
+  capability icons, ⌘/Ctrl+M). MAX converts requests and streams so every feature (tools,
+  vision, reasoning, repo editing) works on both. **Refresh model list** pulls new models from the provider.
+- **Reasoning effort panel** (Low · Medium · High · xHigh · Max) in the composer. Sent as
+  `reasoning_effort` to CodeCraft and as Claude's extended‑thinking budget to AgentRouter.
+- **Capability chips** (Reasoning · Vision · Tools · Streaming · JSON) for the selected model;
+  click **JSON** to force JSON output.
+- **Automatic compatibility fallback.** If a model rejects an optional parameter (effort,
+  temperature, stream options, JSON mode), MAX drops that parameter and retries on its own, so you don't get an error.
+- **Reads every file type.** Images are resized and converted automatically; **PDF** text is extracted (scanned
+  pages are sent as images); **Word/Excel/PowerPoint/OpenDocument**; **ZIP** archives (file list and text
+  contents); **videos** (key frames plus duration); notebooks, code, logs, CSV. You can drop files anywhere on the window.
+- **Video maker.** Type `/video <idea>` (or use the 🎬 Video tab). MAX writes a 1280×720 canvas
+  animation and records it to a **WebM/MP4** you can download. Any canvas code block also gets a 🎬 Video button.
+- **Faster GitHub connection.** Lists all your repos (up to 1,000). You can type `owner/name` to
+  open any public repo. Includes a branch switcher and a "connected as" status. Data is refreshed on every new chat and
+  when you come back to the tab. GitHub ETag caching makes these refreshes nearly free. Files over 1 MB now load, and all
+  edits go into **one atomic commit**. GitLab now pages through large trees too.
+- **No more lag.** Streaming paints at most once per frame, and syntax highlighting waits until the answer finishes.
+  The background animation is lighter, and a **Performance mode** switch turns it off entirely.
+- **Safe live previews.** Model‑generated HTML now runs in an isolated sandbox page. It used to be blocked by
+  the app's own security policy. If the preview hits an error, **Ask MAX to fix it** sends the error back to the model.
 
 ## ✨ Features
 
@@ -116,19 +142,21 @@ If you cloned this repo, just `cd` into it:
 cd MAX
 ```
 
-### 3. Add your API key
-Get a key from **https://agentrouter.org/console/token** (it looks like `sk-...`).
+### 3. Add your API key(s)
+Get a key from **[codecraftapi.com](https://codecraftapi.com)** (API Keys) and/or
+**[agentrouter.org/console/token](https://agentrouter.org/console/token)**.
 
-Copy the example env file and paste your key in:
+Copy the example env file and paste your key(s) in:
 ```bash
 cp .env.example .env
 ```
-Then open `.env` and set:
 ```env
-AGENTROUTER_API_KEY=sk-your-real-key-here
+CODECRAFT_API_KEY=sk-your-codecraft-key
+AGENTROUTER_API_KEY=sk-your-agentrouter-key
 ```
 > Prefer not to use a `.env` file? You can skip this and instead paste your key into
-> **Settings** inside the app — it will be stored only in your browser.
+> **Settings → AI providers** inside the app. Keys are stored only in your browser: for the current tab by default, or
+> permanently if you turn on "Remember keys on this device".
 
 ### 4. Start the server
 No dependencies to install. Just run:
@@ -159,9 +187,12 @@ All settings live in `.env` (see `.env.example`):
 
 | Variable               | Default                     | Description                                             |
 |------------------------|-----------------------------|---------------------------------------------------------|
-| `AGENTROUTER_API_KEY`  | *(empty)*                   | Your AgentRouter key. Kept server‑side.                 |
-| `AGENTROUTER_BASE_URL` | `https://agentrouter.org`   | Upstream base. Server calls `${BASE_URL}/v1/messages`.  |
-| `DEFAULT_MODEL`        | `claude-sonnet-4-6`         | Model used when the UI doesn't pick one.                |
+| `CODECRAFT_API_KEY`    | *(empty)*                   | CodeCraft key. Kept server‑side.                        |
+| `CODECRAFT_BASE_URL`   | `https://codecraftapi.com/v1` | Server calls `${BASE_URL}/chat/completions`.          |
+| `AGENTROUTER_API_KEY`  | *(empty)*                   | AgentRouter key. Kept server‑side.                      |
+| `AGENTROUTER_BASE_URL` | `https://agentrouter.org`   | Server calls `${BASE_URL}/v1/messages`.                 |
+| `DEFAULT_PROVIDER`     | `codecraft`                 | `codecraft` or `agentrouter`.                           |
+| `DEFAULT_MODEL`        | `claude-opus-5`             | Model used when the UI doesn't pick one.                |
 | `PORT`                 | `8787`                      | Local port.                                             |
 | `ALLOW_CLIENT_KEY`     | `true`                      | Let users supply their own key in Settings.             |
 | `RATE_LIMIT_PER_MIN`   | `60`                        | Per‑IP request cap per minute (`0` disables).           |
@@ -177,9 +208,10 @@ from the ⚙️ **Settings** panel in the app.
 ## 🧠 How it works
 
 ```
-Browser (public/)  ──POST /api/chat──▶  server.js  ──/v1/messages──▶  AgentRouter
-      ▲                                    │                              │
-      └────────── SSE stream ◀─────────────┴──────── SSE stream ◀─────────┘
+                                         ┌──/chat/completions──▶ CodeCraft (OpenAI format, translated)
+Browser ──POST /api/chat──▶ server.js ───┤
+   ▲                                     └──/v1/messages──────▶ AgentRouter (Anthropic format)
+   └──────── Anthropic-style SSE stream ◀── (lib/providers.js converts OpenAI chunks) ──┘
 ```
 
 - The browser sends the conversation to the local server.
@@ -253,6 +285,9 @@ Prefer the old single‑user experience? Set `AUTH_ENABLED=false` and there's no
 ```
 MAX/
 ├── server.js          # Zero-dependency Node proxy + static file server
+├── lib/
+│   ├── providers.js   # OpenAI ⇄ Anthropic request/stream translation + fallbacks
+│   └── models.js      # Model catalog (provider, capabilities)
 ├── package.json
 ├── .env.example       # Copy to .env and add your key
 └── public/
@@ -260,6 +295,8 @@ MAX/
     ├── styles.css     # Premium theming, animations, responsive layout
     ├── app.js         # Chat logic, streaming, conversation management
     ├── bg.js          # Animated constellation background
+    ├── files.js       # Universal file reader (PDF, Office, ZIP, video, images…)
+    ├── sandbox.html   # Isolated runner for previews + video recording
     ├── sw.js          # Service worker (offline app shell)
     ├── manifest.webmanifest  # PWA manifest
     └── favicon.svg    # The "L" logo

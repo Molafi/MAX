@@ -122,9 +122,10 @@
           <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
         </button>
         <div class="topbar__center">
-          <button class="model-pill" id="model-pill" title="Change model">
+          <button class="model-pill" id="model-pill" title="Choose model (Ctrl/⌘+M)" aria-haspopup="listbox" type="button">
             <span class="model-pill__dot"></span>
-            <span id="model-pill-name">claude-opus-4-8</span>
+            <span id="model-pill-name">Claude Opus 5</span>
+            <span class="model-pill__prov" id="model-pill-prov">CodeCraft</span>
             <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
           </button>
           <button class="auto-pill" id="auto-toggle" title="Toggle Autonomous mode" aria-pressed="false">
@@ -179,26 +180,15 @@
                 stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </div>
-          <h1 class="welcome__title">Meet <span class="grad-text">MAX</span></h1>
-          <p class="welcome__sub">Your premium AI companion. Ask anything — code, ideas, writing, or a quick chat.</p>
-          <div class="suggestions" id="suggestions">
-            <button class="suggestion" data-prompt="Explain how JavaScript promises work with a clear example.">
-              <span class="suggestion__icon">✦</span>
-              <span><b>Explain a concept</b>How do JavaScript promises work?</span>
-            </button>
-            <button class="suggestion" data-prompt="Write a Python function that returns the nth Fibonacci number, with comments.">
-              <span class="suggestion__icon">⌘</span>
-              <span><b>Write some code</b>A Python Fibonacci function</span>
-            </button>
-            <button class="suggestion" data-prompt="Give me 5 creative name ideas for a productivity app, with a one-line pitch each.">
-              <span class="suggestion__icon">✎</span>
-              <span><b>Brainstorm ideas</b>Names for a productivity app</span>
-            </button>
-            <button class="suggestion" data-prompt="Summarize the key differences between HTTP/1.1, HTTP/2, and HTTP/3.">
-              <span class="suggestion__icon">◈</span>
-              <span><b>Summarize</b>HTTP/1.1 vs 2 vs 3</span>
-            </button>
+          <h1 class="welcome__title">How can I help you?</h1>
+          <p class="welcome__sub">Ask anything, drop in any file or image, connect a repo — or pick a suggestion below.</p>
+          <div class="welcome-tabs" id="welcome-tabs" role="tablist">
+            <button class="welcome-tab active" data-cat="create" type="button" role="tab">✦ Create</button>
+            <button class="welcome-tab" data-cat="explore" type="button" role="tab">◎ Explore</button>
+            <button class="welcome-tab" data-cat="code" type="button" role="tab">&lt;/&gt; Code</button>
+            <button class="welcome-tab" data-cat="video" type="button" role="tab">🎬 Video</button>
           </div>
+          <div class="suggestions" id="suggestions"></div>
           <div class="welcome__status" id="welcome-status"></div>
         </div>
         <div class="messages" id="messages"></div>
@@ -213,24 +203,31 @@
       <div class="composer-wrap">
         <div class="attachments" id="attachments"></div>
         <form class="composer" id="composer">
-          <button type="button" class="icon-btn composer__attach" id="attach-btn" title="Attach image">
-            <svg viewBox="0 0 24 24"><path d="M21 12.5V7a4 4 0 00-8 0v9a2.5 2.5 0 005 0V8"/></svg>
-          </button>
-          <button type="button" class="icon-btn composer__attach" id="mic-btn" title="Voice input" aria-label="Voice input">
-            <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>
-          </button>
-          <input type="file" id="file-input" multiple hidden />
           <textarea id="input" class="composer__input" rows="1"
-            placeholder="Message MAX…" autocomplete="off" autofocus></textarea>
-          <div class="composer__meta">
+            placeholder="Ask anything… (drop files, paste images, @ to mention repo files, / for commands)" autocomplete="off" autofocus></textarea>
+          <div class="composer__bar">
+            <button type="button" class="icon-btn composer__attach" id="attach-btn" title="Attach files — images, PDF, Office, ZIP, video, code…" aria-label="Attach files">
+              <svg viewBox="0 0 24 24"><path d="M21 12.5V7a4 4 0 00-8 0v9a2.5 2.5 0 005 0V8"/></svg>
+            </button>
+            <button type="button" class="icon-btn composer__attach" id="mic-btn" title="Voice input" aria-label="Voice input">
+              <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>
+            </button>
+            <input type="file" id="file-input" multiple hidden />
+            <button type="button" class="effort-pill" id="effort-pill" title="Reasoning effort" aria-haspopup="listbox">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3a3 3 0 00-3 3v.5A3.5 3.5 0 004 13a3.5 3.5 0 003 5.5A3 3 0 0012 20V5a2 2 0 00-3-2zM15 3a3 3 0 013 3v.5a3.5 3.5 0 012 6.5 3.5 3.5 0 01-3 5.5 3 3 0 01-5 1.5"/></svg>
+              <span id="effort-label">Medium</span>
+              <svg class="effort-pill__chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+            </button>
+            <div class="cap-chips" id="cap-chips" aria-label="Model capabilities"></div>
+            <span class="composer__spacer"></span>
             <span class="char-count" id="char-count">0</span>
+            <button type="button" class="stop-btn" id="stop-btn" title="Stop generating" hidden>
+              <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+            </button>
+            <button type="submit" class="send-btn" id="send-btn" title="Send (Enter)" disabled>
+              <svg viewBox="0 0 24 24"><path d="M7 11l5-5 5 5M12 6v13"/></svg>
+            </button>
           </div>
-          <button type="button" class="stop-btn" id="stop-btn" title="Stop generating" hidden>
-            <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
-          </button>
-          <button type="submit" class="send-btn" id="send-btn" title="Send (Enter)" disabled>
-            <svg viewBox="0 0 24 24"><path d="M7 11l5-5 5 5M12 6v13"/></svg>
-          </button>
         </form>
         <div class="composer-tools">
           <button type="button" class="repo-tool" id="files-btn" title="Browse repository files" hidden aria-label="Browse files">
@@ -247,12 +244,17 @@
           <button type="button" class="repo-chip" id="repo-chip" title="Choose a repository for MAX to work in" aria-haspopup="listbox">
             <svg class="repo-chip__gh" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 00-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.5 9.5 0 015 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0012 2z"/></svg>
             <span id="repo-chip-label">Add repository</span>
-            <button type="button" class="repo-chip__x" id="repo-chip-clear" title="Clear selected repository" hidden aria-label="Clear repository">
-              <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
-            </button>
           </button>
+          <button type="button" class="repo-chip__x" id="repo-chip-clear" title="Clear selected repository" hidden aria-label="Clear repository">
+            <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+          <button type="button" class="repo-tool branch-chip" id="branch-chip" title="Switch branch" hidden aria-label="Switch branch">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="5" r="2.2"/><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="8" r="2.2"/><path d="M6 7.2v9.6M18 10.2c0 4-6 3.5-11 7"/></svg>
+            <span id="branch-chip-label">main</span>
+          </button>
+          <span class="gh-status" id="gh-status" hidden></span>
         </div>
-        <p class="composer__hint">MAX can make mistakes. Enter to send · Shift+Enter for a new line.</p>
+        <p class="composer__hint">↵ Enter to send · ⇧ Shift+Enter for a new line · drop any file · MAX can make mistakes.</p>
       </div>
     </main>
   </div>
@@ -268,20 +270,67 @@
       </div>
       <div class="modal__body">
 
+        <div class="section-divider" id="providers-section"><span>AI providers</span></div>
+
+        <div class="field" id="cckey-field">
+          <label for="set-cckey">CodeCraft API key <span class="field__opt">(OpenAI-compatible · 30+ models)</span></label>
+          <div class="input-icon">
+            <input type="password" id="set-cckey" placeholder="sk-…" autocomplete="new-password" spellcheck="false" />
+            <button type="button" class="reveal-btn" id="reveal-cckey" title="Show/hide">👁</button>
+          </div>
+          <p class="field__help" id="cckey-help">Get a key at <a href="https://codecraftapi.com/dashboard" target="_blank" rel="noopener noreferrer">codecraftapi.com</a> → API Keys.</p>
+          <div class="danger-row mt8">
+            <button class="btn btn--ghost btn--sm" id="cc-test" type="button">Test CodeCraft</button>
+            <button class="btn btn--ghost btn--sm" id="cc-models" type="button">Refresh model list</button>
+          </div>
+          <p class="field__help" id="cc-test-result"></p>
+        </div>
+
         <div class="field" id="apikey-field">
-          <label for="set-apikey">API key <span class="field__opt">(kept for this browser session only)</span></label>
+          <label for="set-apikey">AgentRouter API key <span class="field__opt">(Anthropic-compatible)</span></label>
           <div class="input-icon">
             <input type="password" id="set-apikey" placeholder="sk-…" autocomplete="new-password" spellcheck="false" />
             <button type="button" class="reveal-btn" id="reveal-key" title="Show/hide">👁</button>
           </div>
           <p class="field__help" id="apikey-help"></p>
+          <div class="danger-row mt8">
+            <button class="btn btn--ghost btn--sm" id="ar-test" type="button">Test AgentRouter</button>
+            <button class="btn btn--ghost btn--sm" id="ar-models" type="button">Refresh model list</button>
+          </div>
+          <p class="field__help" id="ar-test-result"></p>
+        </div>
+
+        <div class="field">
+          <label class="switch-row" for="set-remember">
+            <span>
+              <b>Remember keys &amp; tokens on this device</b>
+              <span class="field__help">Off: keys are cleared when you close the tab. On: stored in this browser's local storage.</span>
+            </span>
+            <input type="checkbox" id="set-remember" class="switch" />
+          </label>
         </div>
 
         <div class="field">
           <label for="set-model">Model</label>
           <select id="set-model"></select>
-          <p class="field__help">Includes the five model IDs allowed by your AgentRouter token restrictions.</p>
-          <input type="text" id="set-model-custom" class="mt8" placeholder="…or type a custom model id" spellcheck="false" />
+          <p class="field__help">Tip: use the model picker at the top of the chat for search &amp; capabilities.</p>
+          <div class="field-row mt8">
+            <input type="text" id="set-model-custom" placeholder="…or type a custom model id" spellcheck="false" />
+            <select id="set-model-custom-prov" title="Provider for the custom model id">
+              <option value="codecraft">CodeCraft</option>
+              <option value="agentrouter">AgentRouter</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="switch-row" for="set-perf">
+            <span>
+              <b>Performance mode</b>
+              <span class="field__help">Turns off the animated background and heavy blur effects — smoother on older laptops and phones.</span>
+            </span>
+            <input type="checkbox" id="set-perf" class="switch" />
+          </label>
         </div>
 
         <div class="field">
@@ -379,7 +428,7 @@
         <div class="field">
           <div class="danger-row">
             <button class="btn btn--ghost" id="gh-test">Test connection</button>
-            <button class="btn btn--ghost" id="ai-test">Test AI provider</button>
+            <button class="btn btn--ghost" id="ai-test">Test current AI model</button>
           </div>
           <p class="field__help" id="gh-test-result"></p>
         </div>
@@ -541,6 +590,7 @@
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 
   <script src="bg.js" defer></script>
+  <script src="files.js" defer></script>
   <script src="app.js" defer></script>
 </body>
 </html>

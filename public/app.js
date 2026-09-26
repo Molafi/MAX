@@ -16,6 +16,7 @@
   let SESSION_KEY = "max.apiKey.session.v1";
   let GH_SESSION_KEY = "max.ghToken.session.v1";
   let GL_SESSION_KEY = "max.glToken.session.v1";
+  let CC_SESSION_KEY = "max.ccKey.session.v1";
   const DONE_MARKER = "[[MAX_DONE]]";
 
   /* ---------- Skills catalog ---------- */
@@ -475,6 +476,7 @@
     SESSION_KEY = SCOPE + "max.apiKey.session.v1";
     GH_SESSION_KEY = SCOPE + "max.ghToken.session.v1";
     GL_SESSION_KEY = SCOPE + "max.glToken.session.v1";
+    CC_SESSION_KEY = SCOPE + "max.ccKey.session.v1";
     LS.convos = SCOPE + "max.conversations.v1";
     LS.settings = SCOPE + "max.settings.v1";
     LS.active = SCOPE + "max.active.v1";
@@ -482,27 +484,38 @@
   }
 
   // Rough per-model pricing (USD per 1M tokens) for the running cost estimate.
-  const PRICING = {
-    "claude-opus-4-8": { in: 15, out: 75 },
-    "claude-opus-4-7": { in: 15, out: 75 },
-    "claude-opus-4-6": { in: 15, out: 75 },
-    "glm-5.2": { in: 0.6, out: 2.2 },
-    "gpt-5.5": { in: 5, out: 15 },
-    "gpt-5.6-sol": { in: 5, out: 15 },
-    "kimi-k3": { in: 1, out: 4 },
+  // Matched by longest id prefix, so new model versions inherit a sane estimate.
+  const PRICING_HINTS = {
+    "claude-opus": { in: 15, out: 75 }, "claude-sonnet": { in: 3, out: 15 }, "claude-fable": { in: 3, out: 15 },
+    "claude-mythos": { in: 15, out: 75 }, "gpt-5.5-pro": { in: 15, out: 120 }, "gpt-5": { in: 1.25, out: 10 },
+    "gemini-3.1-pro": { in: 2, out: 12 }, "gemini": { in: 0.3, out: 2.5 }, "gemma": { in: 0.05, out: 0.1 },
+    "grok": { in: 3, out: 15 }, "deepseek": { in: 0.3, out: 1.2 }, "qwen": { in: 0.8, out: 3 },
+    "kimi": { in: 0.6, out: 2.5 }, "glm": { in: 0.6, out: 2.2 }, "seed": { in: 0.3, out: 1.2 }, "muse": { in: 1, out: 4 },
   };
-  const priceFor = (model) => PRICING[model] || { in: 5, out: 15 };
+  const priceFor = (model) => {
+    const id = String(model || "").toLowerCase();
+    let best = null;
+    for (const k of Object.keys(PRICING_HINTS)) if (id.startsWith(k) && (!best || k.length > best.length)) best = k;
+    return best ? PRICING_HINTS[best] : { in: 3, out: 15 };
+  };
   const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
-  const ALLOWED_TEXT_EXTS = new Set(["js", "ts", "jsx", "tsx", "py", "rb", "go", "rs", "java", "c", "cpp", "h", "cs", "swift", "kt", "php", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "sql", "html", "htm", "css", "scss", "sass", "less", "xml", "json", "jsonl", "yaml", "yml", "toml", "ini", "cfg", "env", "md", "mdx", "txt", "log", "csv", "tsv", "tex", "r", "m", "lua", "pl", "ex", "exs", "erl", "hs", "ml", "clj", "lisp", "el", "vim", "dockerfile", "makefile", "cmake", "gradle", "sbt", "tf", "hcl", "proto", "graphql", "gql", "vue", "svelte", "astro"]);
 
+  // Offline fallback only — the real catalog comes from /api/config.
+  const ALL_CAPS = { reasoning: true, vision: true, tools: true, streaming: true, json: true };
   const DEFAULT_MODELS = [
-    { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
-    { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
-    { id: "claude-opus-4-8", label: "Claude Opus 4.8 — recommended" },
-    { id: "glm-5.2", label: "GLM 5.2" },
-    { id: "gpt-5.5", label: "GPT-5.5" },
-    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
-    { id: "kimi-k3", label: "Kimi K3" },
+    { id: "claude-opus-5", label: "Claude Opus 5", provider: "codecraft", family: "Anthropic", caps: ALL_CAPS },
+    { id: "claude-opus-4-8", label: "Claude Opus 4.8", provider: "agentrouter", family: "Anthropic", caps: ALL_CAPS },
+  ];
+  const DEFAULT_PROVIDERS = [
+    { id: "codecraft", label: "CodeCraft API", style: "openai", hasServerKey: false, keyUrl: "https://codecraftapi.com/dashboard" },
+    { id: "agentrouter", label: "AgentRouter", style: "anthropic", hasServerKey: false, keyUrl: "https://agentrouter.org/console/token" },
+  ];
+  const EFFORTS = [
+    { id: "low", label: "Low", hint: "Fastest answers" },
+    { id: "medium", label: "Medium", hint: "Balanced" },
+    { id: "high", label: "High", hint: "Thinks harder" },
+    { id: "xhigh", label: "xHigh", hint: "Deep reasoning" },
+    { id: "max", label: "Max", hint: "Maximum reasoning budget" },
   ];
 
   const LS = {
@@ -515,13 +528,21 @@
   /* ---------- state ---------- */
   const state = {
     config: {
-      defaultModel: "claude-opus-4-8", models: DEFAULT_MODELS, allowClientKey: true, hasServerKey: false,
+      defaultModel: "claude-opus-5", defaultProvider: "codecraft", models: DEFAULT_MODELS, providers: DEFAULT_PROVIDERS,
+      allowClientKey: true, hasServerKey: false,
       github: { hasServerToken: false, allowClientToken: true, owner: "", repo: "", branch: "main" },
       gitlab: { hasServerToken: false, allowClientToken: true },
     },
     settings: {
-      apiKey: "",
+      apiKey: "",        // AgentRouter key (legacy name)
+      ccKey: "",         // CodeCraft API key
+      rememberKeys: false, // persist keys in localStorage instead of sessionStorage
+      aiProvider: "",    // "codecraft" | "agentrouter" ("" = server default)
       model: "",
+      effort: "medium",  // low | medium | high | xhigh | max
+      jsonMode: false,
+      perfMode: false,   // disable the animated background
+      customModels: [],  // [{id, provider}] discovered via "Refresh models"
       system: "You are MAX, a helpful, friendly and concise AI assistant. Use Markdown for formatting when helpful.",
       maxTokens: 8192,
       temperature: 1.0,
@@ -596,14 +617,36 @@
       if (!Array.isArray(state.settings.skills)) state.settings.skills = [];
       if (!state.settings.powers || !Array.isArray(state.settings.powers.installed)) state.settings.powers = { installed: [] };
       if (state.settings.provider !== "gitlab") state.settings.provider = "github";
-      state.settings.apiKey = sessionStorage.getItem(SESSION_KEY) || "";
-      state.settings.github.token = sessionStorage.getItem(GH_SESSION_KEY) || "";
-      state.settings.gitlab.token = sessionStorage.getItem(GL_SESSION_KEY) || "";
+      if (!Array.isArray(state.settings.customModels)) state.settings.customModels = [];
+      if (!EFFORTS.some((e) => e.id === state.settings.effort)) state.settings.effort = "medium";
+      state.settings.apiKey = secretGet(SESSION_KEY);
+      state.settings.ccKey = secretGet(CC_SESSION_KEY);
+      state.settings.github.token = secretGet(GH_SESSION_KEY);
+      state.settings.gitlab.token = secretGet(GL_SESSION_KEY);
     } catch {}
     state.activeId = localStorage.getItem(LS.active) || null;
   }
+  // If storage is full, drop heavy attachment payloads (images/PDF bytes) from
+  // older messages — the text stays, and the server copy still has everything.
+  function compactForStorage() {
+    let freed = 0;
+    const convos = [...state.conversations].sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+    for (const c of convos) {
+      if (c.id === state.activeId) continue;
+      for (const m of c.messages || []) {
+        for (const a of m.images || []) {
+          if (a.dataUrl) { freed += a.dataUrl.length; delete a.dataUrl; a.stripped = true; }
+          if (a.images) { freed += JSON.stringify(a.images).length; delete a.images; }
+        }
+      }
+      if (freed > 2_000_000) break;
+    }
+    return freed;
+  }
   const saveConvos = () => {
-    safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations), "Conversation history");
+    let ok = safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations));
+    if (!ok && compactForStorage()) ok = safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations));
+    if (!ok) toast("Conversation history could not be saved locally (storage full). It is still synced to the server.", "error");
     // Auto-sync to server in the background (fire and forget)
     syncConvosToServer();
   };
@@ -661,23 +704,33 @@
       }
     } catch {} // offline or server down — fine, just use localStorage
   }
+  // Secrets (API keys + tokens) live in sessionStorage by default (cleared when
+  // the tab closes). With "Remember keys on this device" they go to localStorage.
+  function secretGet(key) {
+    try { return sessionStorage.getItem(key) || localStorage.getItem("secret." + key) || ""; } catch { return ""; }
+  }
+  function secretPut(key, val) {
+    try {
+      if (!val) { sessionStorage.removeItem(key); localStorage.removeItem("secret." + key); return; }
+      safeStorageSet(sessionStorage, key, val);
+      if (state.settings.rememberKeys) safeStorageSet(localStorage, "secret." + key, val);
+      else localStorage.removeItem("secret." + key);
+    } catch {}
+  }
   const saveSettings = () => {
-    // Deep-clone, then strip the two session-only secrets before persisting.
+    // Deep-clone, then strip the secrets before persisting the rest.
     const persistent = JSON.parse(JSON.stringify(state.settings));
     const apiKey = persistent.apiKey; delete persistent.apiKey;
+    const ccKey = persistent.ccKey; delete persistent.ccKey;
     const ghToken = persistent.github ? persistent.github.token : "";
     const glToken = persistent.gitlab ? persistent.gitlab.token : "";
     if (persistent.github) delete persistent.github.token;
     if (persistent.gitlab) delete persistent.gitlab.token;
     safeStorageSet(localStorage, LS.settings, JSON.stringify(persistent), "Settings");
-
-    const putSession = (key, val) => {
-      if (val) safeStorageSet(sessionStorage, key, val);
-      else { try { sessionStorage.removeItem(key); } catch {} }
-    };
-    putSession(SESSION_KEY, apiKey);
-    putSession(GH_SESSION_KEY, ghToken);
-    putSession(GL_SESSION_KEY, glToken);
+    secretPut(SESSION_KEY, apiKey);
+    secretPut(CC_SESSION_KEY, ccKey);
+    secretPut(GH_SESSION_KEY, ghToken);
+    secretPut(GL_SESSION_KEY, glToken);
   };
   const saveActive = () => state.activeId
     ? safeStorageSet(localStorage, LS.active, state.activeId)
@@ -706,7 +759,7 @@
     if (convo.title !== "New chat") return;
     const firstUser = convo.messages.find((m) => m.role === "user");
     if (firstUser) {
-      const t = firstUser.content.trim().replace(/\s+/g, " ").slice(0, 46);
+      const t = (firstUser.content || firstUser.images?.[0]?.name || "").trim().replace(/\s+/g, " ").slice(0, 46);
       convo.title = t || "New chat";
     }
   }
@@ -803,9 +856,10 @@
     return false;
   }
 
-  function enhanceContent(container) {
+  function enhanceContent(container, opts = {}) {
     $$("pre code", container).forEach((code) => {
       if (code.closest(".code-block")) return;
+      if (opts.live) { code.parentElement.classList.add("pre-live"); return; } // highlight once complete
       const pre = code.parentElement;
       const langMatch = [...code.classList].find((c) => c.startsWith("language-"));
       const lang = langMatch ? langMatch.replace("language-", "") : "";
@@ -825,7 +879,8 @@
 
       const previewable = isPreviewable(lang, rawCode);
       const runBtn = previewable
-        ? `<button class="code-run" type="button" title="Run this code in a preview panel">
+        ? `${hasCanvas(rawCode) ? `<button class="code-video" type="button" title="Record this animation as a video">🎬 <span>Video</span></button>` : ""}
+          <button class="code-run" type="button" title="Run this code in a preview panel">
             <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;stroke:none"><polygon points="5,3 19,12 5,21"/></svg>
             <span>Run</span></button>`
         : "";
@@ -850,6 +905,7 @@
 
       if (previewable) {
         head.querySelector(".code-run").addEventListener("click", () => openPreview(rawCode, lang));
+        head.querySelector(".code-video")?.addEventListener("click", () => openPreview(rawCode, lang, { record: true }));
       }
     });
     // open links in new tab safely
@@ -860,20 +916,37 @@
      Artifacts / Preview panel — sandboxed iframe live preview
      ============================================================ */
   let previewOverlay = null;
+  let previewFrame = null;   // the live sandbox iframe
+  let previewHandlers = {};  // message type -> handler for the current preview
 
-  function openPreview(code, lang) {
+  // One global listener for messages from the sandbox iframe (opaque origin,
+  // so we authenticate by comparing the source window, not the origin).
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || !d.__max || !previewFrame || e.source !== previewFrame.contentWindow) return;
+    const h = previewHandlers[d.type];
+    if (h) h(d);
+  });
+
+  const hasCanvas = (code) => /<canvas[\s>]|createElement\(\s*["']canvas["']\s*\)/i.test(code);
+
+  function openPreview(code, lang, opts = {}) {
     closePreview();
     const html = buildPreviewHtml(code, lang);
-
+    const canRecord = hasCanvas(html);
+    const secs = Math.max(2, Math.min(60, opts.seconds || 8));
     const overlay = document.createElement("div");
     overlay.className = "modal-overlay preview-overlay";
     overlay.innerHTML = `
       <div class="preview-panel" role="dialog" aria-modal="true">
         <div class="preview-panel__head">
-          <span class="preview-panel__title">Preview</span>
+          <span class="preview-panel__title">${opts.record ? "🎬 Video studio" : "Preview"}</span>
           <div class="preview-panel__actions">
+            ${canRecord ? `<label class="video-secs" title="Video length">⏱ <input type="number" id="video-secs" min="2" max="60" value="${secs}">s</label>
+            <button class="btn btn--primary btn--sm" id="preview-record" type="button">🎬 Record video</button>` : ""}
+            <button class="btn btn--ghost btn--sm" id="preview-reload" type="button" title="Restart the preview">↻</button>
             <button class="btn btn--ghost btn--sm" id="preview-png" type="button">Save PNG</button>
-            <button class="btn btn--ghost btn--sm" id="preview-download" type="button">Download</button>
+            <button class="btn btn--ghost btn--sm" id="preview-download" type="button">Download .html</button>
             <button class="btn btn--ghost btn--sm" id="preview-newtab" type="button">Open in tab</button>
             <button class="icon-btn" id="preview-fullscreen" type="button" title="Fullscreen" aria-label="Toggle fullscreen">
               <svg viewBox="0 0 24 24" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3M3 16v3a2 2 0 002 2h3m8 0h3a2 2 0 002-2v-3"/></svg>
@@ -883,112 +956,162 @@
             </button>
           </div>
         </div>
+        <div class="video-bar" id="video-bar" hidden>
+          <div class="video-bar__progress"><span id="video-progress"></span></div>
+          <span class="video-bar__label" id="video-label">Preparing…</span>
+        </div>
         <div class="preview-panel__body">
           <iframe class="preview-iframe" sandbox="allow-scripts allow-modals" title="Code preview"></iframe>
+          <div class="video-result" id="video-result" hidden></div>
         </div>
+        <div class="preview-error" id="preview-error" hidden></div>
       </div>`;
     document.body.appendChild(overlay);
     previewOverlay = overlay;
-
     const iframe = overlay.querySelector(".preview-iframe");
-    const blob = new Blob([html], { type: "text/html" });
-    const url = URL.createObjectURL(blob);
-    iframe.src = url;
-    iframe.onload = () => setTimeout(() => URL.revokeObjectURL(url), 2000);
+    previewFrame = iframe;
+    let pendingRecord = null;
+    let videoUrl = null;
+
+    const run = (record) => {
+      pendingRecord = record || null;
+      previewHandlers.ready = () => iframe.contentWindow.postMessage({ type: "max-render", html, record: pendingRecord }, "*");
+      iframe.src = "/sandbox.html?v=" + Date.now().toString(36);
+    };
+    const bar = overlay.querySelector("#video-bar");
+    const label = overlay.querySelector("#video-label");
+    const prog = overlay.querySelector("#video-progress");
+    const errBox = overlay.querySelector("#preview-error");
+    previewHandlers["runtime-error"] = (d) => {
+      errBox.hidden = false;
+      errBox.innerHTML = `⚠ Runtime error in the preview: <code>${esc(d.message)}</code> <button class="btn btn--ghost btn--sm" type="button">Ask MAX to fix it</button>`;
+      errBox.querySelector("button").onclick = () => {
+        closePreview();
+        const input = $("#input");
+        input.value = `The code you generated throws this error when run: "${d.message}". Please fix it and send the complete corrected code.`;
+        autoResize(input); updateCharCount(); updateSendState(); input.focus();
+      };
+    };
+    previewHandlers["video-start"] = (d) => { bar.hidden = false; label.textContent = `Recording ${d.seconds}s at ${d.width}×${d.height}…`; };
+    previewHandlers["video-progress"] = (d) => { prog.style.width = `${Math.round(d.p * 100)}%`; };
+    previewHandlers["video-error"] = (d) => { bar.hidden = false; prog.style.width = "0"; label.textContent = "✗ " + d.message; toast(d.message, "error"); };
+    previewHandlers["video-done"] = (d) => {
+      prog.style.width = "100%";
+      const ext = /mp4/.test(d.mime) ? "mp4" : "webm";
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      videoUrl = URL.createObjectURL(d.blob);
+      label.textContent = `✓ Video ready — ${formatSize(d.blob.size)} · ${d.width}×${d.height} · ${ext.toUpperCase()}`;
+      const box = overlay.querySelector("#video-result");
+      box.hidden = false;
+      box.innerHTML = `<video controls autoplay loop playsinline src="${videoUrl}"></video>
+        <div class="video-result__actions">
+          <a class="btn btn--primary btn--sm" href="${videoUrl}" download="max-video-${Date.now().toString(36)}.${ext}">⬇ Download ${ext.toUpperCase()}</a>
+          <button class="btn btn--ghost btn--sm" type="button" id="video-back">Back to live preview</button>
+        </div>`;
+      box.querySelector("#video-back").onclick = () => { box.hidden = true; };
+      toast("Video ready — download it from the preview panel", "success");
+    };
+    previewHandlers.snapshot = (d) => {
+      if (!d.dataUrl) { toast(d.message || "Nothing to snapshot.", "error"); return; }
+      const a = document.createElement("a");
+      a.href = d.dataUrl; a.download = `preview-${Date.now().toString(36)}.png`;
+      document.body.appendChild(a); a.click(); a.remove();
+      toast("Saved PNG", "success");
+    };
+
+    run(opts.record ? { seconds: secs, fps: 30 } : null);
 
     overlay.querySelector("#preview-close").addEventListener("click", closePreview);
     overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closePreview(); });
-
+    overlay.querySelector("#preview-reload").addEventListener("click", () => { errBox.hidden = true; run(null); });
+    overlay.querySelector("#preview-record")?.addEventListener("click", () => {
+      const n = Math.max(2, Math.min(60, parseInt(overlay.querySelector("#video-secs").value, 10) || 8));
+      overlay.querySelector("#video-result").hidden = true;
+      bar.hidden = false; prog.style.width = "0"; label.textContent = "Starting recorder…";
+      run({ seconds: n, fps: 30 });
+    });
     overlay.querySelector("#preview-download").addEventListener("click", () => {
       download(`preview-${Date.now().toString(36)}.html`, html, "text/html");
       toast("Downloaded", "success");
     });
     overlay.querySelector("#preview-newtab").addEventListener("click", () => {
-      const w = window.open("", "_blank");
-      if (w) { w.document.write(html); w.document.close(); }
+      // The tab hosts its own sandboxed iframe — the code never runs with MAX's origin.
+      const w = window.open("/sandbox.html#host", "_blank");
+      if (!w) { toast("Pop-up blocked — allow pop-ups to open previews in a tab.", "error"); return; }
+      const onMsg = (e) => {
+        if (e.source === w && e.origin === location.origin && e.data?.type === "max-host-ready") {
+          w.postMessage({ type: "max-host-render", html }, location.origin);
+          window.removeEventListener("message", onMsg);
+        }
+      };
+      window.addEventListener("message", onMsg);
+      setTimeout(() => window.removeEventListener("message", onMsg), 15000);
     });
-
     overlay.querySelector("#preview-fullscreen").addEventListener("click", () => {
       overlay.querySelector(".preview-panel").classList.toggle("preview-panel--full");
     });
-
-    overlay.querySelector("#preview-png").addEventListener("click", () => {
-      exportPreviewPng(overlay.querySelector(".preview-iframe"), code, lang);
-    });
+    overlay.querySelector("#preview-png").addEventListener("click", () => exportPreviewPng(iframe, code, lang));
   }
 
-  // Render the current preview to a PNG the user can download. SVG artifacts are
-  // rasterised directly; HTML/other artifacts are drawn from the live iframe via
-  // an SVG <foreignObject> snapshot (all local, no dependencies or network).
+  // PNG export: SVG is rasterised locally; anything else asks the sandbox to
+  // snapshot its largest <canvas> (the iframe is cross-origin by design).
   function exportPreviewPng(iframe, code, lang) {
-    const finish = (canvas) => {
-      canvas.toBlob((blob) => {
-        if (!blob) { toast("Could not render PNG", "error"); return; }
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `preview-${Date.now().toString(36)}.png`;
-        document.body.appendChild(a); a.click(); a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 2000);
-        toast("Saved PNG", "success");
-      }, "image/png");
-    };
-
-    // Direct path for SVG source — most reliable and crisp.
     const isSvg = lang === "svg" || code.trim().startsWith("<svg");
     if (isSvg) {
       const img = new Image();
-      const svgBlob = new Blob([code], { type: "image/svg+xml;charset=utf-8" });
-      const url = URL.createObjectURL(svgBlob);
+      const url = URL.createObjectURL(new Blob([code], { type: "image/svg+xml;charset=utf-8" }));
       img.onload = () => {
         const w = img.width || 900, h = img.height || 600;
         const canvas = document.createElement("canvas");
-        canvas.width = w; canvas.height = h;
+        canvas.width = w * 2; canvas.height = h * 2;
         const ctx = canvas.getContext("2d");
-        ctx.fillStyle = "#1a1a2e"; ctx.fillRect(0, 0, w, h);
+        ctx.scale(2, 2);
         ctx.drawImage(img, 0, 0, w, h);
         URL.revokeObjectURL(url);
-        finish(canvas);
+        canvas.toBlob((blob) => {
+          if (!blob) { toast("Could not render PNG", "error"); return; }
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob); a.download = `preview-${Date.now().toString(36)}.png`;
+          document.body.appendChild(a); a.click(); a.remove();
+          toast("Saved PNG", "success");
+        }, "image/png");
       };
       img.onerror = () => { URL.revokeObjectURL(url); toast("Could not render PNG", "error"); };
       img.src = url;
       return;
     }
-
-    // HTML/other: snapshot the live iframe document via foreignObject.
-    try {
-      const doc = iframe.contentDocument;
-      const rect = iframe.getBoundingClientRect();
-      const w = Math.max(1, Math.round(rect.width)) * 2;
-      const h = Math.max(1, Math.round(rect.height)) * 2;
-      const inner = doc ? new XMLSerializer().serializeToString(doc.documentElement) : "";
-      const svg =
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${rect.width} ${rect.height}">` +
-        `<foreignObject width="100%" height="100%">${inner.replace(/^<html/, '<html xmlns="http://www.w3.org/1999/xhtml"')}</foreignObject></svg>`;
-      const img = new Image();
-      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
-      img.onload = () => {
-        const canvas = document.createElement("canvas");
-        canvas.width = w; canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        ctx.fillStyle = "#1a1a2e"; ctx.fillRect(0, 0, w, h);
-        ctx.drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
-        finish(canvas);
-      };
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        toast("PNG export isn't available for this preview — use “Open in tab” and screenshot it.", "error");
-      };
-      img.src = url;
-    } catch {
-      toast("PNG export isn't available for this preview — use “Open in tab” and screenshot it.", "error");
-    }
+    try { iframe.contentWindow.postMessage({ type: "max-snapshot" }, "*"); }
+    catch { toast("PNG export isn't available for this preview.", "error"); }
   }
 
   function closePreview() {
     if (previewOverlay) { previewOverlay.remove(); previewOverlay = null; }
+    previewFrame = null; previewHandlers = {};
   }
+
+  // Pull the first runnable HTML (with a canvas) out of a reply and record it.
+  function extractVideoCode(text) {
+    const re = /```([\w-]*)\n([\s\S]*?)```/g;
+    let m, best = null;
+    while ((m = re.exec(text || ""))) {
+      const lang = (m[1] || "").toLowerCase(), code = m[2];
+      if ((lang === "html" || lang === "htm" || !lang) && hasCanvas(code)) { best = code; break; }
+      if (!best && (lang === "html" || lang === "htm")) best = code;
+    }
+    return best;
+  }
+  function autoRenderVideo(aiMsg) {
+    const code = extractVideoCode(aiMsg.content);
+    if (!code) { toast("MAX didn't return a runnable animation — try again or rephrase.", "error"); return; }
+    openPreview(code, "html", { record: true, seconds: aiMsg.video?.seconds || 8 });
+  }
+
+  const VIDEO_SYSTEM = (seconds) => `[Video mode] The user wants a VIDEO. MAX renders videos by recording a canvas animation you write, so reply with a very short intro sentence and then ONE complete, self-contained HTML document in a single \`\`\`html code block, and nothing after it. Requirements:
+- A single <canvas> of exactly 1280×720 (set canvas.width/height; CSS may scale it to fit the window), black or designed background, no page scrollbars.
+- The animation starts immediately on load and is exactly ${seconds} seconds long; drive it with requestAnimationFrame and elapsed time (performance.now()), and hold the final frame after ${seconds}s.
+- Cinematic quality: smooth easing, layered motion, gradients, glow (shadowBlur), particles, parallax, kinetic typography — like a professional motion-graphics studio.
+- Everything must be drawn procedurally in JavaScript: NO external images, fonts, libraries, audio or network requests, and no user interaction.
+- Plain JavaScript only, wrapped in <script> tags, no console errors.`;
 
   function buildPreviewHtml(code, lang) {
     // SVG → wrap in minimal HTML
@@ -1024,12 +1147,15 @@
   function renderWelcomeStatus() {
     const el = $("#welcome-status");
     if (!el) return;
-    const hasKey = Boolean(state.settings.apiKey || state.config.hasServerKey);
+    const hasKey = providerReady();
     const repo = activeRepo();
     const hasGh = providerHasToken("github");
+    const gh = state.ghStatus;
+    const ghDetail = !hasGh ? "Not connected — add a token in Settings"
+      : gh?.error ? `⚠ ${gh.error}` : gh?.login ? `Connected as ${gh.login}${gh.repoCount != null ? ` · ${gh.repoCount} repos` : ""}` : "Connecting…";
     const items = [
-      { ok: hasKey, label: "AI provider", detail: hasKey ? currentModel() : "No key — add in Settings" },
-      { ok: hasGh, label: "GitHub", detail: hasGh ? (repo ? repo.fullName : "Connected") : "Not connected" },
+      { ok: hasKey, label: providerInfo(currentProvider()).label, detail: hasKey ? modelLabel(currentModel(), currentProvider()) : "No key — add in Settings" },
+      { ok: hasGh && !gh?.error, label: "GitHub", detail: ghDetail },
       { ok: Boolean(repo), label: "Working repo", detail: repo ? `${repo.fullName} (${repo.branch})` : "None selected" },
     ];
     el.innerHTML = `<div class="status-grid">${items.map((i) => `
@@ -1080,9 +1206,7 @@
       // user: show images + text (escaped, preserve newlines)
       let inner = "";
       if (m.images && m.images.length) {
-        inner += `<div class="attachments" style="margin-bottom:8px">` +
-          m.images.map((im) => `<div class="attachment"><img src="${im.dataUrl}" alt="attachment"></div>`).join("") +
-          `</div>`;
+        inner += `<div class="attachments attachments--msg">` + m.images.map((a) => attachmentChipHtml(a, false)).join("") + `</div>`;
       }
       inner += `<div>${esc(m.content).replace(/\n/g, "<br>")}</div>`;
       bubble.innerHTML = inner;
@@ -1161,8 +1285,13 @@
   }
 
   /* ---------- streaming assistant bubble handle ---------- */
+  // Rendering Markdown for every token is what made long answers lag. Updates
+  // are coalesced to at most one paint per animation frame (~16ms, and at most
+  // every 60ms for very long texts), and code highlighting is deferred until the
+  // answer is complete.
   function appendStreamingAssistant() {
     showWelcome(false);
+    $$(".msg--last", messagesEl()).forEach((r) => r.classList.remove("msg--last"));
     const row = document.createElement("div");
     row.className = "msg msg--assistant msg--last";
     row.innerHTML = `<div class="msg__avatar">M</div>
@@ -1173,29 +1302,53 @@
     messagesEl().appendChild(row);
     scrollToBottom(true);
     const bubble = row.querySelector(".msg__bubble");
+    let pending = null, rafId = 0, toId = 0, lastPaint = 0, thinkOpen = true;
+    const cancel = () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      if (toId) clearTimeout(toId);
+      rafId = toId = 0;
+    };
+    const paint = () => {
+      rafId = toId = 0;
+      if (!pending) return;
+      const { text, withCursor, thinking, toolRuns } = pending;
+      pending = null;
+      lastPaint = performance.now();
+      const prevThink = bubble.querySelector(".thinking-box");
+      if (prevThink) thinkOpen = prevThink.open;
+      const think = thinking
+        ? `<details class="thinking-box"${thinkOpen ? " open" : ""}><summary>Thinking…</summary><div class="thinking-body">${esc(thinking)}</div></details>`
+        : "";
+      const tools = toolRunsHtml(toolRuns);
+      const textHtml = text
+        ? renderMarkdown(text)
+        : (tools || think ? "" : `<div class="typing"><span></span><span></span><span></span></div>`);
+      const cursor = (withCursor && text) ? '<span class="cursor-blink"></span>' : "";
+      const stick = nearBottom();
+      bubble.innerHTML = think + tools + textHtml + cursor;
+      const tb = bubble.querySelector(".thinking-body");
+      if (tb && thinkOpen) tb.scrollTop = tb.scrollHeight;
+      enhanceContent(bubble, { live: withCursor });
+      if (stick) scrollToBottom(true);
+    };
+    const schedule = (data) => {
+      pending = data;
+      if (rafId || toId) return;
+      const long = (data.text || "").length > 12000;
+      const wait = long ? Math.max(0, 60 - (performance.now() - lastPaint)) : 0;
+      if (wait) toId = setTimeout(() => { toId = 0; rafId = requestAnimationFrame(paint); }, wait);
+      else rafId = requestAnimationFrame(paint);
+    };
     return {
       row,
       bubble,
-      setText(text, withCursor, thinking) {
-        const think = thinking
-          ? `<details class="thinking-box" open><summary>Thinking…</summary><div class="thinking-body">${esc(thinking)}</div></details>`
-          : "";
-        this.bubble.innerHTML = think + renderMarkdown(text) + (withCursor ? '<span class="cursor-blink"></span>' : "");
-        enhanceContent(this.bubble);
-      },
-      // Like setText, but also renders the live tool-activity cards above the text.
+      setText(text, withCursor, thinking) { this.setAgent(text, withCursor, thinking, []); },
       setAgent(text, withCursor, thinking, toolRuns) {
-        const think = thinking
-          ? `<details class="thinking-box" open><summary>Thinking…</summary><div class="thinking-body">${esc(thinking)}</div></details>`
-          : "";
-        const tools = toolRunsHtml(toolRuns);
-        const textHtml = text
-          ? renderMarkdown(text)
-          : (tools ? "" : `<div class="typing"><span></span><span></span><span></span></div>`);
-        const cursor = (withCursor && text) ? '<span class="cursor-blink"></span>' : "";
-        this.bubble.innerHTML = think + tools + textHtml + cursor;
-        enhanceContent(this.bubble);
+        const data = { text, withCursor, thinking, toolRuns: toolRuns ? toolRuns.map((r) => ({ ...r })) : [] };
+        if (!withCursor) { pending = data; cancel(); paint(); return; }
+        schedule(data);
       },
+      flush() { if (pending) { cancel(); paint(); } },
     };
   }
 
@@ -1238,46 +1391,117 @@
   /* ============================================================
      Sending / streaming
      ============================================================ */
-  function buildApiMessages(convo) {
-    return convo.messages.map((m) => {
-      if (m.role === "user" && m.images && m.images.length) {
-        const content = [];
-        for (const im of m.images) {
-          if (im.media_type === "application/pdf") {
-            // PDF document — Claude supports this as a document block
-            content.push({
-              type: "document",
-              source: { type: "base64", media_type: "application/pdf", data: im.dataUrl.split(",")[1] },
-            });
-          } else if (im.media_type && im.media_type.startsWith("image/")) {
-            // Image — vision
-            content.push({
-              type: "image",
-              source: { type: "base64", media_type: im.media_type, data: im.dataUrl.split(",")[1] },
-            });
-          } else if (im.fileName) {
-            // Other binary file — include as a text note describing the attachment
-            // (most models can't process raw binary, so we describe it)
-            content.push({
-              type: "text",
-              text: `[Attached file: ${im.fileName} (${im.media_type || "unknown type"}, ${formatSize(im.fileSize || 0)}). The binary content is available but cannot be displayed as text.]`,
-            });
-          }
-        }
-        if (m.content) content.push({ type: "text", text: m.content });
-        return { role: "user", content };
+  // Turn one stored attachment into API content blocks for the given provider.
+  function attachmentBlocks(a, provStyle) {
+    const blocks = [];
+    const b64 = (u) => String(u || "").split(",")[1] || "";
+    const kind = a.kind || (a.media_type === "application/pdf" ? "pdf" : (a.media_type || "").startsWith("image/") ? "image" : a.fileName ? "binary" : "image");
+    const name = a.name || a.fileName || "file";
+    if (kind === "image") {
+      if (a.dataUrl && ALLOWED_IMAGE_TYPES.has(a.media_type)) {
+        blocks.push({ type: "image", source: { type: "base64", media_type: a.media_type, data: b64(a.dataUrl) } });
+      } else if (a.stripped) {
+        blocks.push({ type: "text", text: `[Image ${name} was attached earlier (no longer stored locally).]` });
       }
-      return { role: m.role, content: m.content };
-    });
+      if (a.text) blocks.push({ type: "text", text: `SVG source of ${name}:\n\`\`\`svg\n${a.text}\n\`\`\`` });
+      return blocks;
+    }
+    if (kind === "pdf") {
+      const pages = a.meta?.pages ? `, ${a.meta.pages} pages` : "";
+      // Claude (Anthropic API) reads PDFs natively — layout, tables and charts.
+      if (provStyle === "anthropic" && a.dataUrl) {
+        blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64(a.dataUrl) } });
+      } else if (a.text && a.text.trim().length > 20) {
+        blocks.push({ type: "text", text: `Contents of PDF \`${name}\`${pages}:\n\n${a.text}` });
+      } else if (a.dataUrl) {
+        blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64(a.dataUrl) } });
+      }
+      for (const im of a.images || []) {
+        if (im.dataUrl) blocks.push({ type: "image", source: { type: "base64", media_type: im.media_type, data: b64(im.dataUrl) } });
+      }
+      if (a.note) blocks.push({ type: "text", text: `[${name}: ${a.note}]` });
+      return blocks;
+    }
+    if (kind === "video") {
+      blocks.push({ type: "text", text: `[${a.note || `Video ${name}`}]` });
+      for (const im of a.images || []) {
+        if (im.dataUrl) blocks.push({ type: "image", source: { type: "base64", media_type: im.media_type, data: b64(im.dataUrl) } });
+      }
+      return blocks;
+    }
+    if (a.text) {
+      const lang = kind === "text" ? (a.meta?.lang || "") : "";
+      const label = kind === "archive" ? "Archive" : kind === "document" ? "Document" : "File";
+      blocks.push({ type: "text", text: `${label} \`${name}\`:\n\`\`\`${lang}\n${a.text}\n\`\`\`` });
+      return blocks;
+    }
+    blocks.push({ type: "text", text: `[Attached file: ${name} (${a.media_type || "unknown type"}, ${formatSize(a.size || a.fileSize || 0)}). ${a.note || "Its binary content can't be read as text."}]` });
+    return blocks;
   }
 
+  function buildApiMessages(convo) {
+    const style = providerInfo(currentProvider()).style;
+    const out = [];
+    for (const m of convo.messages) {
+      if (m.role === "user" && m.images && m.images.length) {
+        const content = [];
+        for (const a of m.images) content.push(...attachmentBlocks(a, style));
+        if (m.content) content.push({ type: "text", text: m.content });
+        if (!content.length) content.push({ type: "text", text: "(attachment)" });
+        out.push({ role: "user", content });
+        continue;
+      }
+      if (!m.content && m.role === "assistant") continue; // never send empty assistant turns
+      out.push({ role: m.role, content: m.content || "(empty)" });
+    }
+    return out;
+  }
+
+  /* ---------- models + providers ---------- */
+  function providerInfo(id) {
+    const list = state.config.providers || DEFAULT_PROVIDERS;
+    return list.find((p) => p.id === id) || list[0] || DEFAULT_PROVIDERS[0];
+  }
+  function currentProvider() {
+    const p = state.settings.aiProvider;
+    if (p && (state.config.providers || []).some((x) => x.id === p)) return p;
+    return state.config.defaultProvider || "codecraft";
+  }
   function currentModel() {
     return state.settings.model || state.config.defaultModel;
   }
+  function allModels() {
+    const known = new Set(state.config.models.map((m) => `${m.provider}::${m.id}`));
+    const extra = (state.settings.customModels || [])
+      .filter((m) => m && m.id && !known.has(`${m.provider}::${m.id}`))
+      .map((m) => ({ id: m.id, label: m.id, provider: m.provider, family: "Discovered", caps: { ...ALL_CAPS, reasoning: false }, custom: true }));
+    return state.config.models.concat(extra);
+  }
+  function modelInfo(id = currentModel(), provider = currentProvider()) {
+    return allModels().find((m) => m.id === id && m.provider === provider)
+      || allModels().find((m) => m.id === id)
+      || { id, label: id, provider, family: "Custom", caps: { ...ALL_CAPS }, custom: true };
+  }
+  const modelLabel = (id, provider) => modelInfo(id, provider).label || id;
+  function providerKey(provider = currentProvider()) {
+    return provider === "codecraft" ? state.settings.ccKey : state.settings.apiKey;
+  }
+  function providerReady(provider = currentProvider()) {
+    return Boolean(providerKey(provider) || providerInfo(provider).hasServerKey);
+  }
+  function setModel(id, provider) {
+    state.settings.model = id;
+    state.settings.aiProvider = provider;
+    saveSettings();
+    updateModelPill();
+    updateKeyStatus();
+    renderWelcomeStatus();
+  }
 
   // System prompt actually sent — augmented with agent instructions in autonomous mode.
-  function effectiveSystem() {
+  function effectiveSystem(extra) {
     let sys = state.settings.system || "";
+    if (state.settings.jsonMode) sys += `\n\n[JSON mode] Respond with a single valid JSON value only — no prose, no code fences.`;
     const repo = activeRepo();
     if (repo) {
       sys += `\n\n[Working repository] The user has selected the ${repo.provider} repository ${repo.fullName} (branch ${repo.branch || "main"}). When they refer to "the repo", "this project", or "the codebase", assume they mean ${repo.fullName}. The user can switch to a different repository at any time using the repository chip — all tools automatically target whichever repo is currently selected.`;
@@ -1294,6 +1518,7 @@
     if (state.settings.autonomous) {
       sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line.`;
     }
+    if (extra) sys += `\n\n${extra}`;
     return sys.trim() || undefined;
   }
 
@@ -1314,7 +1539,16 @@
   async function sendMessage(text) {
     if (state.streaming) return;
     text = text.trim();
-    if (text && handleSlashSend(text)) return;
+    let video = null;
+    const vm = text.match(/^\/video(?:\s+([\s\S]*))?$/i);
+    if (vm) {
+      const prompt = (vm[1] || "").trim();
+      if (!prompt) { $("#input").value = "/video "; focusInputEnd(); toast("Describe the video you want, e.g. /video 8 second neon logo reveal"); return; }
+      const sm = prompt.match(/(\d{1,2})\s*(?:s\b|sec|second)/i);
+      video = { seconds: Math.max(2, Math.min(60, sm ? parseInt(sm[1], 10) : 8)) };
+      text = `🎬 Make a video: ${prompt}`;
+    } else if (text && handleSlashSend(text)) return;
+    if (state.attachments.some((a) => a.pending)) { toast("Still reading your files — one moment…"); return; }
     const imgs = state.attachments.slice();
     const staged = state.basket.slice();
     if (!text && imgs.length === 0 && !staged.length) return;
@@ -1326,8 +1560,8 @@
     if (staged.length) clearBasket();
 
     const userMsg = {
-      id: uid(), role: "user", content: fullText,
-      images: imgs.map((a) => ({ media_type: a.media_type, dataUrl: a.dataUrl })),
+      id: uid(), role: "user", content: fullText, video: video || undefined,
+      images: imgs.map((a) => ({ ...a })),
     };
     convo.messages.push(userMsg);
     autoTitle(convo);
@@ -1341,7 +1575,11 @@
     renderMessages();
     renderConversations();
 
-    if (state.settings.autonomous) await runAutonomousLoop(convo);
+    // Warm the repo tree in the background so repo tools answer instantly.
+    if (activeRepo() && providerHasToken(activeRepo().provider)) getTree().catch(() => {});
+
+    if (video) await streamAssistant(convo, { video, extraSystem: VIDEO_SYSTEM(video.seconds), noTools: true });
+    else if (state.settings.autonomous) await runAutonomousLoop(convo);
     else await streamAssistant(convo);
   }
 
@@ -1706,16 +1944,21 @@
   // Stream a single model response, updating the visible bubble live (text +
   // tool-activity cards). Returns the parsed { text, thinking, toolUses, stopReason, usage }.
   async function runModelTurn(apiMessages, useModel, toolDefs, stream, ctx) {
+    const useProvider = ctx.provider || currentProvider();
+    const info = modelInfo(useModel, useProvider);
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: state.abort.signal,
       body: JSON.stringify({
+        provider: useProvider,
         model: useModel,
-        system: effectiveSystem(),
+        system: effectiveSystem(ctx.extraSystem),
         max_tokens: state.settings.maxTokens,
         temperature: state.settings.temperature,
-        apiKey: state.settings.apiKey || undefined,
+        apiKey: providerKey(useProvider) || undefined,
+        effort: info.caps?.reasoning !== false ? state.settings.effort : undefined,
+        json: Boolean(state.settings.jsonMode && info.caps?.json !== false && !toolDefs.length) || undefined,
         stream: true,
         messages: apiMessages,
         tools: toolDefs.length ? toolDefs : undefined,
@@ -1738,7 +1981,8 @@
     let curText = "";
     let curThinking = "";
 
-    const rerender = () => stream.setAgent(ctx.priorText + curText, true, curThinking, ctx.toolRuns);
+    // Coalesced to one paint per animation frame (see appendStreamingAssistant).
+    const rerender = () => stream.setAgent(ctx.priorText + curText, true, (ctx.priorThinking || "") + curThinking, ctx.toolRuns);
 
     const consumeRecord = (record) => {
       if (!record?.data) return false;
@@ -1758,6 +2002,11 @@
             blocks[evt.index] = { type: "tool_use", id: cb.id, name: cb.name, json: "" };
             ctx.toolRuns.push({ id: cb.id, name: cb.name, input: null, status: "running", result: null });
             rerender();
+          } else if (cb.type === "thinking") {
+            blocks[evt.index] = { type: "thinking", thinking: "", signature: "" };
+            setStreamLabel("Thinking…");
+          } else if (cb.type === "redacted_thinking") {
+            blocks[evt.index] = { type: "redacted_thinking", data: cb.data || "" };
           } else {
             blocks[evt.index] = { type: cb.type || "text", text: "" };
           }
@@ -1767,9 +2016,12 @@
           const b = blocks[evt.index];
           if (evt.delta?.type === "text_delta" && evt.delta.text) {
             if (b) b.text = (b.text || "") + evt.delta.text;
-            curText += evt.delta.text; if (curText.length < 20) setStreamLabel("Writing…"); rerender(); scrollToBottomIfNear();
+            curText += evt.delta.text; if (curText.length < 20) setStreamLabel("Writing…"); rerender();
           } else if (evt.delta?.type === "thinking_delta" && evt.delta.thinking) {
+            if (b && b.type === "thinking") b.thinking += evt.delta.thinking;
             curThinking += evt.delta.thinking; rerender();
+          } else if (evt.delta?.type === "signature_delta" && b && b.type === "thinking") {
+            b.signature = (b.signature || "") + (evt.delta.signature || "");
           } else if (evt.delta?.type === "input_json_delta" && evt.delta.partial_json != null && b) {
             b.json = (b.json || "") + evt.delta.partial_json;
           }
@@ -1817,12 +2069,16 @@
     const orderedIdx = Object.keys(blocks).map(Number).sort((a, b) => a - b);
     let text = "";
     const toolUses = [];
+    const thinkingBlocks = []; // echoed back on tool loops (Anthropic requires it)
     for (const i of orderedIdx) {
       const b = blocks[i];
       if (b.type === "text") text += b.text || "";
       else if (b.type === "tool_use") toolUses.push({ id: b.id, name: b.name, input: b.input || {} });
+      else if (b.type === "thinking" && b.signature) thinkingBlocks.push({ type: "thinking", thinking: b.thinking, signature: b.signature });
+      else if (b.type === "redacted_thinking" && b.data) thinkingBlocks.push({ type: "redacted_thinking", data: b.data });
     }
-    return { text, thinking: curThinking, toolUses, stopReason, usage };
+    stream.flush?.();
+    return { text, thinking: curThinking, thinkingBlocks, toolUses, stopReason, usage };
   }
 
   function mergeUsage(a, b) {
@@ -1840,14 +2096,25 @@
 
     const stream = appendStreamingAssistant();
     const useModel = opts.model || currentModel();
+    const useProvider = opts.provider || currentProvider();
+    const useInfo = modelInfo(useModel, useProvider);
+    const provStyle = providerInfo(useProvider).style;
     const startedAt = Date.now();
-    const toolDefs = opts.noTools ? [] : availableToolDefs();
+    const toolDefs = (opts.noTools || useInfo.caps?.tools === false) ? [] : availableToolDefs();
     const MAX_TOOL_ROUNDS = 16;
 
-    // One-time nudge: repo read/edit tools are most reliable on Claude models.
-    if (toolDefs.length && !/^claude/i.test(useModel) && !state._toolModelWarned) {
-      state._toolModelWarned = true;
-      toast("Tip: repo reading & editing work most reliably with a Claude model.", "");
+    if (!providerReady(useProvider)) {
+      stream.bubble.classList.remove("md");
+      stream.bubble.innerHTML = `<div class="err-card">⚠ No ${esc(providerInfo(useProvider).label)} API key yet.
+        <button class="btn btn--primary btn--sm" type="button" data-open-settings>Add key in Settings</button></div>`;
+      stream.bubble.querySelector("[data-open-settings]").addEventListener("click", () => openSettings("providers"));
+      state.streaming = false; toggleStreamingUI(false);
+      return;
+    }
+    const hasImages = convo.messages.some((m) => (m.images || []).some((a) => a.kind === "image" || a.kind === "video" || (a.images || []).length));
+    if (hasImages && useInfo.caps?.vision === false && !state._visionWarned) {
+      state._visionWarned = true;
+      toast(`${useInfo.label} may not support images — switch to a vision model (e.g. Claude Opus 5) if it can't see them.`, "");
     }
 
     // Local working history for this agent turn (tool_use/tool_result blocks are
@@ -1868,7 +2135,8 @@
         try {
           turn = await runModelTurn(apiMessages, useModel, toolDefs, stream, {
             priorText: finalText ? finalText + "\n\n" : "",
-            toolRuns,
+            priorThinking: finalThinking ? finalThinking + "\n\n" : "",
+            toolRuns, provider: useProvider, extraSystem: opts.extraSystem,
           });
         } catch (turnErr) {
           // If we already have some text, preserve it and break gracefully
@@ -1876,7 +2144,7 @@
           throw turnErr; // propagate to outer catch if nothing was produced
         }
         usage = mergeUsage(usage, turn.usage);
-        if (turn.thinking) finalThinking = turn.thinking;
+        if (turn.thinking) finalThinking = finalThinking ? finalThinking + "\n\n" + turn.thinking : turn.thinking;
         if (turn.text) finalText = finalText ? finalText + "\n\n" + turn.text : turn.text;
 
         const wantsTools = turn.stopReason === "tool_use" && turn.toolUses.length;
@@ -1884,6 +2152,8 @@
 
         // Record the assistant tool-use turn in the working history…
         const assistantBlocks = [];
+        // Claude requires its signed thinking blocks to be echoed back in tool loops.
+        if (provStyle === "anthropic" && turn.thinkingBlocks?.length) assistantBlocks.push(...turn.thinkingBlocks);
         if (turn.text) assistantBlocks.push({ type: "text", text: turn.text });
         for (const tu of turn.toolUses) assistantBlocks.push({ type: "tool_use", id: tu.id, name: tu.name, input: tu.input });
         apiMessages.push({ role: "assistant", content: assistantBlocks });
@@ -1927,7 +2197,7 @@
         // One more turn without tools to force a text response.
         const follow = await runModelTurn(apiMessages, useModel, [], stream, {
           priorText: "",
-          toolRuns,
+          toolRuns, provider: useProvider, extraSystem: opts.extraSystem,
         });
         if (follow.text) {
           finalText = follow.text;
@@ -1941,7 +2211,9 @@
       stream.setAgent(finalText, false, finalThinking, toolRuns);
       const pending = pendingEditsList();
       const aiMsg = {
-        id: uid(), role: "assistant", content: finalText, usage, model: useModel,
+        id: uid(), role: "assistant", content: finalText, usage, model: useModel, provider: useProvider,
+        effort: useInfo.caps?.reasoning !== false ? state.settings.effort : undefined,
+        video: opts.video || undefined,
         thinking: finalThinking || undefined,
         toolRuns: toolRuns.length ? toolRuns.map((r) => ({
           name: r.name, input: r.input, status: r.status,
@@ -1955,6 +2227,7 @@
       renderConversations();
       updateUsagePill();
       logRequest({ model: useModel, ok: true, ms: Date.now() - startedAt, tokens: usage?.output_tokens });
+      if (opts.video) setTimeout(() => autoRenderVideo(aiMsg), 250);
 
       // If MAX changed files this turn, nudge the user to review the diff.
       const editedThisTurn = toolRuns.some((r) => ["write_file", "edit_file", "delete_file"].includes(r.name) && r.status === "done");
@@ -2048,7 +2321,7 @@
     $("#auto-toggle")?.classList.add("running");
   }
 
-  async function regenerate(aiMsg, modelOverride) {
+  async function regenerate(aiMsg, modelOverride, providerOverride) {
     if (state.streaming) return;
     const convo = activeConvo();
     if (!convo) return;
@@ -2058,7 +2331,10 @@
     convo.messages.splice(idx);
     touchConvo(convo);
     renderMessages();
-    await streamAssistant(convo, modelOverride ? { model: modelOverride } : {});
+    const opts = modelOverride ? { model: modelOverride, provider: providerOverride } : {};
+    const lastUser = [...convo.messages].reverse().find((m) => m.role === "user");
+    if (lastUser?.video) Object.assign(opts, { video: lastUser.video, extraSystem: VIDEO_SYSTEM(lastUser.video.seconds), noTools: true });
+    await streamAssistant(convo, opts);
   }
 
   // Small menu to regenerate the last answer with a different model.
@@ -2072,8 +2348,8 @@
       boxShadow: "var(--shadow)", padding: "5px", minWidth: "200px", fontSize: "13.5px", maxHeight: "260px", overflowY: "auto",
     });
     pop.innerHTML = `<div style="padding:6px 10px;color:var(--text-faint);font-size:11px;text-transform:uppercase;letter-spacing:.5px">Regenerate with</div>` +
-      state.config.models.map((m) =>
-        `<button data-m="${esc(m.id)}" style="display:block;width:100%;padding:8px 10px;background:none;border:none;color:var(--text);border-radius:7px;text-align:left">${esc(m.label || m.id)}</button>`).join("");
+      allModels().filter((m) => providerReady(m.provider)).map((m) =>
+        `<button data-m="${esc(m.id)}" data-p="${esc(m.provider)}" style="display:block;width:100%;padding:8px 10px;background:none;border:none;color:var(--text);border-radius:7px;text-align:left">${esc(m.label || m.id)} <span style="opacity:.5;font-size:11px">${esc(providerInfo(m.provider).label)}</span></button>`).join("");
     document.body.appendChild(pop);
     const r = anchorBtn.getBoundingClientRect();
     pop.style.top = `${Math.min(r.bottom + 6, window.innerHeight - 270)}px`;
@@ -2081,7 +2357,7 @@
     pop.querySelectorAll("button[data-m]").forEach((b) => {
       b.addEventListener("mouseenter", () => (b.style.background = "var(--surface-2)"));
       b.addEventListener("mouseleave", () => (b.style.background = "none"));
-      b.addEventListener("click", () => { pop.remove(); regenerate(aiMsg, b.dataset.m); });
+      b.addEventListener("click", () => { pop.remove(); regenerate(aiMsg, b.dataset.m, b.dataset.p); });
     });
     setTimeout(() => {
       const close = (e) => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener("click", close); } };
@@ -2168,120 +2444,69 @@
   }
 
   /* ---------- attachments ---------- */
-  function renderAttachments() {
-    const box = $("#attachments");
-    box.innerHTML = state.attachments.map((a) => {
-      if (a.media_type && a.media_type.startsWith("image/")) {
-        return `<div class="attachment" data-id="${a.id}">
-          <img src="${a.dataUrl}" alt="attachment">
-          <button class="attachment__remove" data-remove="${a.id}" title="Remove">×</button>
-        </div>`;
-      }
-      // Non-image file (PDF, ZIP, etc.) → show as a file chip
-      const name = a.fileName || "file";
-      const size = a.fileSize ? ` (${formatSize(a.fileSize)})` : "";
-      const icon = fileTypeIcon(a.media_type, name);
-      return `<div class="attachment attachment--file" data-id="${a.id}">
-        <span class="attachment__icon">${icon}</span>
-        <span class="attachment__name" title="${esc(name + size)}">${esc(name)}</span>
-        <button class="attachment__remove" data-remove="${a.id}" title="Remove">×</button>
+  // Every file type is accepted and read by public/files.js (MaxFiles).
+  const KIND_ICON = { pdf: "📕", document: "📝", archive: "📦", video: "🎬", audio: "🎵", text: "📄", binary: "📎", image: "🖼️" };
+  function attachmentChipHtml(a, removable) {
+    const name = a.name || a.fileName || "file";
+    const size = a.size || a.fileSize;
+    if ((a.kind === "image" || (!a.kind && (a.media_type || "").startsWith("image/"))) && a.dataUrl) {
+      return `<div class="attachment" data-id="${esc(a.id || "")}" title="${esc(name)}">
+        <img src="${a.dataUrl}" alt="${esc(name)}" loading="lazy" decoding="async">
+        ${removable ? `<button class="attachment__remove" data-remove="${esc(a.id)}" title="Remove" type="button">×</button>` : ""}
       </div>`;
-    }).join("");
-    updateSendState();
+    }
+    if (a.pending) {
+      return `<div class="attachment attachment--file attachment--pending" data-id="${esc(a.id)}">
+        <span class="tool-run__spin"></span><span class="attachment__name">${esc(name)}</span>
+        <span class="attachment__meta">${a.progress ? Math.round(a.progress * 100) + "%" : "reading…"}</span></div>`;
+    }
+    const kind = a.kind || (a.media_type === "application/pdf" ? "pdf" : "binary");
+    const bits = [];
+    if (size) bits.push(formatSize(size));
+    if (a.meta?.pages) bits.push(`${a.meta.pages} pages`);
+    if (a.meta?.duration) bits.push(`${Math.round(a.meta.duration)}s · ${(a.images || []).length} frames`);
+    if (a.meta?.entries && kind === "archive") bits.push(`${a.meta.entries} files`);
+    if (a.text && kind !== "image") bits.push(a.text.length < 1000 ? `${a.text.length} chars` : `${(a.text.length / 1000).toFixed(1)}k chars`);
+    const readable = a.text || (a.images || []).length || (kind === "pdf" && a.dataUrl);
+    return `<div class="attachment attachment--file${readable ? "" : " attachment--warn"}" data-id="${esc(a.id || "")}" title="${esc(a.note || name)}">
+      <span class="attachment__icon">${KIND_ICON[kind] || "📎"}</span>
+      <span class="attachment__text"><span class="attachment__name">${esc(name)}</span>
+      <span class="attachment__meta">${esc(bits.join(" · ") || kind)}${readable ? "" : " · not readable"}</span></span>
+      ${removable ? `<button class="attachment__remove" data-remove="${esc(a.id)}" title="Remove" type="button">×</button>` : ""}
+    </div>`;
   }
-
-  function fileTypeIcon(mime, name) {
-    const ext = (name || "").split(".").pop().toLowerCase();
-    if (ext === "pdf" || mime === "application/pdf") return "📕";
-    if (["zip", "tar", "gz", "rar", "7z", "bz2"].includes(ext)) return "📦";
-    if (["doc", "docx"].includes(ext)) return "📝";
-    if (["xls", "xlsx"].includes(ext)) return "📊";
-    if (["ppt", "pptx"].includes(ext)) return "📽️";
-    if (["mp3", "wav", "ogg", "m4a"].includes(ext)) return "🎵";
-    if (["mp4", "mov", "avi", "mkv"].includes(ext)) return "🎬";
-    return "📎";
+  function renderAttachments() {
+    $("#attachments").innerHTML = state.attachments.map((a) => attachmentChipHtml(a, true)).join("");
+    updateSendState();
   }
   function clearAttachments() { state.attachments = []; renderAttachments(); }
 
-  function handleFiles(files) {
-    for (const file of files) {
-      // Images → visual attachment (sent as base64 to the model for vision)
-      if (file.type.startsWith("image/")) {
-        if (file.size > 10 * 1024 * 1024) { toast(`${file.name} too large (max 10MB for images)`, "error"); continue; }
-        const reader = new FileReader();
-        reader.onload = () => {
-          state.attachments.push({ id: uid(), media_type: file.type, dataUrl: reader.result });
-          renderAttachments();
-        };
-        reader.readAsDataURL(file);
-        continue;
+  const MAX_ATTACH_BYTES = 50 * 1024 * 1024;
+  async function handleFiles(files) {
+    const list = [...files];
+    if (!list.length) return;
+    if (!window.MaxFiles) { toast("File reader failed to load — reload the page.", "error"); return; }
+    await Promise.all(list.map(async (file) => {
+      if (file.size > MAX_ATTACH_BYTES) { toast(`${file.name} is too large (max 50 MB).`, "error"); return; }
+      const placeholder = { id: uid(), name: file.name, size: file.size, pending: true };
+      state.attachments.push(placeholder);
+      renderAttachments();
+      let att;
+      try {
+        att = await MaxFiles.processFile(file, {
+          onProgress: (p) => { placeholder.progress = p; const el = $(`.attachment[data-id="${placeholder.id}"] .attachment__meta`); if (el) el.textContent = Math.round(p * 100) + "%"; },
+        });
+      } catch (e) {
+        att = { id: uid(), kind: "binary", name: file.name, size: file.size, media_type: file.type, note: `Could not read (${e?.message || e}).` };
       }
-
-      // Determine if we can read this as text
-      const ext = (file.name.split(".").pop() || "").toLowerCase();
-      const isText = ALLOWED_TEXT_EXTS.has(ext) ||
-        file.type.startsWith("text/") ||
-        file.type === "application/json" ||
-        file.type === "application/xml" ||
-        file.type === "application/javascript" ||
-        file.type === "application/x-yaml" ||
-        file.type === "application/toml" ||
-        file.name.toLowerCase() === "dockerfile" ||
-        file.name.toLowerCase() === "makefile";
-
-      // PDF → read as text (extract what we can) or attach as reference
-      const isPdf = ext === "pdf" || file.type === "application/pdf";
-
-      // Archives and binary files → attach as a file reference with metadata
-      const maxSize = 20 * 1024 * 1024; // 20MB universal cap
-      if (file.size > maxSize) { toast(`${file.name} too large (max 20MB)`, "error"); continue; }
-
-      if (isText) {
-        // Text/code → read and inject as a fenced code block
-        if (file.size > 1024 * 1024) { toast(`${file.name} too large for inline text (max 1MB)`, "error"); continue; }
-        const reader = new FileReader();
-        reader.onload = () => {
-          const content = reader.result;
-          const input = $("#input");
-          const lang = ext || "";
-          const block = `\n\nFile \`${file.name}\`:\n\`\`\`${lang}\n${content}\n\`\`\`\n`;
-          input.value = (input.value + block).trimStart();
-          autoResize(input); updateCharCount(); updateSendState(); input.focus();
-          toast(`Added ${file.name} (${formatSize(file.size)})`, "success");
-        };
-        reader.readAsText(file);
-      } else if (isPdf) {
-        // PDF → read as base64, attach as a document the model can read (Claude supports PDF)
-        const reader = new FileReader();
-        reader.onload = () => {
-          state.attachments.push({
-            id: uid(),
-            media_type: "application/pdf",
-            dataUrl: reader.result,
-            fileName: file.name,
-            fileSize: file.size,
-          });
-          renderAttachments();
-          toast(`Attached ${file.name} (${formatSize(file.size)})`, "success");
-        };
-        reader.readAsDataURL(file);
-      } else {
-        // Any other file (ZIP, binary, etc.) → read as base64, show as file attachment
-        const reader = new FileReader();
-        reader.onload = () => {
-          state.attachments.push({
-            id: uid(),
-            media_type: file.type || "application/octet-stream",
-            dataUrl: reader.result,
-            fileName: file.name,
-            fileSize: file.size,
-          });
-          renderAttachments();
-          toast(`Attached ${file.name} (${formatSize(file.size)})`, "success");
-        };
-        reader.readAsDataURL(file);
-      }
-    }
+      const i = state.attachments.indexOf(placeholder);
+      if (i === -1) return; // removed while reading
+      state.attachments[i] = att;
+      renderAttachments();
+      if (att.kind === "binary") toast(att.note || `${file.name} attached (binary).`, "");
+      else if (att.meta?.scanned) toast(`${file.name}: scanned PDF — pages attached as images for vision.`, "");
+    }));
+    updateSendState();
   }
 
   function formatSize(bytes) {
@@ -2456,8 +2681,10 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey: ($("#set-apikey").value.trim()) || state.settings.apiKey || undefined,
-          model: $("#set-model-custom").value.trim() || $("#set-model").value,
+          provider: $("#set-model-custom").value.trim() ? $("#set-model-custom-prov").value : $("#set-model").value.split("::")[0],
+          apiKey: (($("#set-model-custom").value.trim() ? $("#set-model-custom-prov").value : $("#set-model").value.split("::")[0]) === "codecraft"
+            ? $("#set-cckey").value.trim() : $("#set-apikey").value.trim()) || undefined,
+          model: $("#set-model-custom").value.trim() || $("#set-model").value.split("::").slice(1).join("::"),
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -2553,12 +2780,16 @@
       chip.title = `Working in ${r.fullName} (${r.provider}, ${r.branch || "main"}) — click to switch repos`;
       clear.hidden = false;
       if (filesBtn) filesBtn.hidden = false;
+      const bc = $("#branch-chip");
+      if (bc) { bc.hidden = false; $("#branch-chip-label").textContent = r.branch || "main"; }
     } else {
       lbl.textContent = "Add repository";
       chip.classList.remove("selected");
       chip.title = "Pick a repository — MAX can then read, edit & push to it";
       clear.hidden = true;
       if (filesBtn) filesBtn.hidden = true;
+      const bc = $("#branch-chip");
+      if (bc) bc.hidden = true;
     }
   }
 
@@ -2642,14 +2873,111 @@
     return data;
   }
 
+  const repoListCache = {}; // provider -> { repos, at }
+  const repoListInflight = {};
   async function fetchRepos(provider, q) {
-    const res = await fetch(`/api/${provider}/repos`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: providerToken(provider) || undefined, q: q || undefined }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
-    return data.repos || [];
+    if (!q && repoListInflight[provider]) return repoListInflight[provider];
+    const run = (async () => {
+      const res = await fetch(`/api/${provider}/repos`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: providerToken(provider) || undefined, q: q || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      const repos = data.repos || [];
+      if (!q) repoListCache[provider] = { repos, at: Date.now() };
+      return repos;
+    })();
+    if (!q) { repoListInflight[provider] = run; run.finally(() => { delete repoListInflight[provider]; }).catch(() => {}); }
+    return run;
+  }
+
+  // Connection status for the welcome panel + composer, refreshed on startup,
+  // each new chat, after Settings are saved, and when the tab regains focus.
+  let ghStatusAt = 0;
+  async function refreshGithubStatus(force) {
+    if (!providerHasToken("github")) { state.ghStatus = null; renderGhStatus(); return; }
+    if (!force && Date.now() - ghStatusAt < 20_000) return;
+    ghStatusAt = Date.now();
+    try {
+      const res = await fetch("/api/github/test", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: providerToken("github") || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      state.ghStatus = { login: data.login, avatarUrl: data.avatarUrl, repoCount: state.ghStatus?.repoCount ?? null };
+      renderGhStatus();
+      const repos = await fetchRepos("github").catch(() => null);
+      if (repos) { state.ghStatus.repoCount = repos.length; renderGhStatus(); }
+    } catch (err) {
+      state.ghStatus = { error: (err instanceof TypeError ? "Can't reach the MAX server" : err.message).split("\n")[0].slice(0, 140) };
+      renderGhStatus();
+    }
+  }
+  function renderGhStatus() {
+    const el = $("#gh-status");
+    if (el) {
+      const st = state.ghStatus;
+      el.hidden = !st;
+      if (st) {
+        el.className = "gh-status" + (st.error ? " gh-status--err" : "");
+        el.innerHTML = st.error ? "⚠ GitHub" : `<span class="gh-status__dot"></span>${esc(st.login || "")}`;
+        el.title = st.error ? `GitHub: ${st.error}` : `Connected to GitHub as ${st.login}${st.repoCount != null ? ` · ${st.repoCount} repositories` : ""}`;
+      }
+    }
+    renderWelcomeStatus();
+  }
+
+  /* ---------- branch switcher ---------- */
+  async function openBranchPicker(anchor) {
+    if (popEl && popEl.classList.contains("branch-pop")) { closePop(); return; }
+    closePop();
+    const r = activeRepo();
+    if (!r) return;
+    const pop = document.createElement("div");
+    pop.className = "repo-pop branch-pop";
+    pop.innerHTML = `<div class="repo-pop__head"><div class="repo-pop__title">Branch · ${esc(r.fullName)}</div></div>
+      <div class="repo-pop__search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input type="text" placeholder="Filter branches" autocomplete="off" spellcheck="false" /></div>
+      <div class="repo-pop__list"><div class="repo-spinner"></div></div>`;
+    document.body.appendChild(pop);
+    popEl = pop;
+    placePop(pop, anchor, "above");
+    dismissOnOutside(pop, anchor);
+    const listEl = pop.querySelector(".repo-pop__list");
+    const input = pop.querySelector("input");
+    let branches = [];
+    const render = () => {
+      const q = input.value.trim().toLowerCase();
+      const shown = branches.filter((b) => !q || b.name.toLowerCase().includes(q)).slice(0, 200);
+      listEl.innerHTML = shown.map((b) => `<button type="button" class="repo-item${b.name === r.branch ? " active" : ""}" data-b="${esc(b.name)}">
+        <span class="repo-item__name">${esc(b.name)}${b.protected ? " 🔒" : ""}</span>${b.name === r.branch ? `<svg class="repo-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>` : ""}</button>`).join("")
+        || `<div class="repo-pop__msg">No branches match.</div>`;
+      listEl.querySelectorAll("[data-b]").forEach((b) => b.addEventListener("click", () => { closePop(); switchBranch(b.dataset.b); }));
+    };
+    try {
+      const data = await providerFetch("branches", {});
+      branches = data.branches || [];
+      render();
+      input.addEventListener("input", render);
+      setTimeout(() => input.focus(), 20);
+    } catch (err) {
+      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err.message)}</div>`;
+    }
+  }
+  function switchBranch(name) {
+    const r = activeRepo();
+    if (!r || r.branch === name) return;
+    if (pendingCount() && !confirm("You have staged changes on the current branch. Switch anyway? (They will be discarded.)")) return;
+    const bind = { ...r, branch: name };
+    const c = activeConvo();
+    if (c) { c.repo = bind; touchConvo(c); }
+    state.settings.lastRepo = bind;
+    if (bind.provider === "github") state.settings.github.branch = name;
+    saveSettings();
+    treeCache = null; clearPendingEdits(); updateRepoChip();
+    toast(`Switched to branch ${name}`, "success");
   }
 
   let repoPickerEl = null;
@@ -2668,11 +2996,15 @@
         <div class="repo-pop__tabs">
           <button class="repo-tab" data-tab="github" type="button">GitHub</button>
           <button class="repo-tab" data-tab="gitlab" type="button">GitLab</button>
+          <span class="repo-pop__stamp"></span>
+          <button class="icon-btn repo-pop__refresh" id="repo-refresh" type="button" title="Refresh repository list" aria-label="Refresh">
+            <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+          </button>
         </div>
       </div>
       <div class="repo-pop__search">
         <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-        <input type="text" id="repo-search" placeholder="Search" autocomplete="off" spellcheck="false" />
+        <input type="text" id="repo-search" placeholder="Search your repos, or type owner/name" autocomplete="off" spellcheck="false" />
       </div>
       <div class="repo-pop__list" id="repo-list"></div>
       <div class="repo-pop__foot">
@@ -2709,6 +3041,9 @@
 
     pop.querySelectorAll(".repo-tab").forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
     pop.querySelector("#repo-manage").addEventListener("click", () => { closeRepoPicker(); openSettings(); });
+    pop.querySelector("#repo-refresh").addEventListener("click", () => {
+      if (providerHasToken(provider)) loadRepoList(listEl, provider, searchEl.value.trim(), true);
+    });
     searchEl.addEventListener("input", () => {
       clearTimeout(debounce);
       debounce = setTimeout(() => loadRepoList(listEl, provider, searchEl.value.trim()), 250);
@@ -2725,45 +3060,75 @@
     }, 0);
   }
 
-  async function loadRepoList(listEl, provider, q) {
-    listEl.innerHTML = `<div class="repo-spinner"></div>`;
+  function timeAgo(ts) {
+    if (!ts) return "";
+    const d = (Date.now() - new Date(ts).getTime()) / 1000;
+    if (d < 3600) return `${Math.max(1, Math.round(d / 60))}m ago`;
+    if (d < 86400) return `${Math.round(d / 3600)}h ago`;
+    if (d < 86400 * 30) return `${Math.round(d / 86400)}d ago`;
+    return new Date(ts).toLocaleDateString();
+  }
+  function renderRepoRows(listEl, provider, repos, q) {
+    if (!repos.length) {
+      listEl.innerHTML = `<div class="repo-pop__msg">${q ? "No matching repositories. Tip: type owner/name to open any public repo." : "No repositories found for this token."}</div>`;
+      return;
+    }
+    const current = selectedRepoLabel();
+    const lock = `<svg class="repo-item__ico" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>`;
+    const open = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>`;
+    const check = `<svg class="repo-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>`;
+    listEl.innerHTML = repos.slice(0, 400).map((x, i) => `
+      <button class="repo-item repo-item--rich${x.fullName === current ? " active" : ""}" type="button" data-i="${i}" title="${esc(x.description || x.fullName)}">
+        ${x.private ? lock : open}
+        <span class="repo-item__text"><span class="repo-item__name">${esc(x.fullName)}</span>
+        <span class="repo-item__meta">${[x.language, x.canPush === false ? "read-only" : "", x.archived ? "archived" : "", timeAgo(x.updatedAt)].filter(Boolean).map(esc).join(" · ")}</span></span>
+        ${x.fullName === current ? check : ""}
+      </button>`).join("") + (repos.length > 400 ? `<div class="repo-pop__msg">Showing 400 of ${repos.length} — search to narrow.</div>` : "");
+    listEl.querySelectorAll(".repo-item").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const repo = repos[parseInt(btn.dataset.i, 10)];
+        if (repo) { selectRepo(repo, provider); closeRepoPicker(); }
+      });
+    });
+  }
+  async function loadRepoList(listEl, provider, q, force) {
+    const cached = !q && repoListCache[provider];
+    if (cached && !force) renderRepoRows(listEl, provider, cached.repos, q);
+    else listEl.innerHTML = `<div class="repo-spinner"></div>`;
+    // Always revalidate in the background so new repos appear right away.
     try {
       const repos = await fetchRepos(provider, q);
-      if (!repos.length) {
-        listEl.innerHTML = `<div class="repo-pop__msg">${q ? "No matching repositories." : "No repositories found for this token."}</div>`;
-        return;
-      }
-      const current = selectedRepoLabel();
-      const lock = `<svg class="repo-item__ico" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>`;
-      const open = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M3 7h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>`;
-      const check = `<svg class="repo-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>`;
-      listEl.innerHTML = repos.map((x, i) => `
-        <button class="repo-item${x.fullName === current ? " active" : ""}" type="button" data-i="${i}">
-          ${x.private ? lock : open}
-          <span class="repo-item__name">${esc(x.fullName)}</span>
-          ${x.fullName === current ? check : ""}
-        </button>`).join("");
-      listEl.querySelectorAll(".repo-item").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const repo = repos[parseInt(btn.dataset.i, 10)];
-          if (repo) { selectRepo(repo, provider); closeRepoPicker(); }
-        });
-      });
+      if (!listEl.isConnected) return;
+      const same = cached && cached.repos.length === repos.length && cached.repos.every((r, i) => r.fullName === repos[i].fullName && r.updatedAt === repos[i].updatedAt);
+      if (!same || force || !cached) renderRepoRows(listEl, provider, repos, q);
+      const stamp = listEl.closest(".repo-pop")?.querySelector(".repo-pop__stamp");
+      if (stamp) stamp.textContent = `${repos.length} repos · updated just now`;
     } catch (err) {
+      if (!listEl.isConnected) return;
+      if (cached && !force) { toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error"); return; }
       listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)}</div>`;
     }
   }
 
   /* ---------- file browser + @file mentions ---------- */
-  let treeCache = null; // { fullName, files: [{path,size}] }
-
-  async function getTree() {
+  // File tree cache. Short TTL so every chat/turn sees the latest commits; the
+  // server uses GitHub ETags, so a refresh that finds no change is nearly free.
+  let treeCache = null; // { key, files: [{path,size}], at, sha, truncated }
+  let treeInflight = null;
+  const TREE_TTL = 30_000;
+  const repoKey = (r) => `${r.provider}|${r.fullName}|${r.branch || ""}`;
+  async function getTree(force) {
     const r = activeRepo();
     if (!r) return [];
-    if (treeCache && treeCache.fullName === r.fullName) return treeCache.files;
-    const data = await providerFetch("tree", {});
-    treeCache = { fullName: r.fullName, files: data.files || [] };
-    return treeCache.files;
+    const key = repoKey(r);
+    if (!force && treeCache && treeCache.key === key && Date.now() - treeCache.at < TREE_TTL) return treeCache.files;
+    if (treeInflight && treeInflight.key === key) return treeInflight.p;
+    const p = providerFetch("tree", {}).then((data) => {
+      treeCache = { key, files: data.files || [], at: Date.now(), sha: data.sha || "", truncated: !!data.truncated };
+      return treeCache.files;
+    }).finally(() => { if (treeInflight && treeInflight.key === key) treeInflight = null; });
+    treeInflight = { key, p };
+    return p;
   }
 
   async function insertFileIntoChat(path) {
@@ -3137,6 +3502,7 @@
       if (prData.url) toastLink(repo.provider === "gitlab" ? "View merge request" : "View pull request", prData.url);
       // These edits are now committed — drop them from the staged working copy.
       for (const e of edits) delete state.pendingEdits[e.path];
+      treeCache = null;
       renderChangesChip();
       renderMessages();
       return true;
@@ -3169,6 +3535,7 @@
     // Drop the edits we just pushed from the staged working copy.
     for (const e of edits) delete state.pendingEdits[e.path];
     renderChangesChip();
+    treeCache = null; // the branch moved — re-read the tree next time
 
     const summary = `Committed ${edits.length} file(s) to ${repo.fullName} on branch "${targetBranch}" — "${message}".`;
     if (!openPr) {
@@ -3678,19 +4045,27 @@ a{color:#22d3ee}</style></head>
   function applyProfile(id) {
     const p = state.settings.profiles.find((x) => x.id === id);
     if (!p) return;
-    if (p.model) { $("#set-model-custom").value = ""; const sel = $("#set-model"); if ([...sel.options].some((o) => o.value === p.model)) sel.value = p.model; else $("#set-model-custom").value = p.model; }
+    const prov = p.provider || "agentrouter";
+    if (p.model) {
+      $("#set-model-custom").value = ""; const sel = $("#set-model"); const v = `${prov}::${p.model}`;
+      if ([...sel.options].some((o) => o.value === v)) sel.value = v;
+      else { $("#set-model-custom").value = p.model; $("#set-model-custom-prov").value = prov; }
+    }
     let key = "";
     try { key = sessionStorage.getItem(profileKeyName(id)) || ""; } catch {}
-    if (key) $("#set-apikey").value = key;
+    if (key) (prov === "codecraft" ? $("#set-cckey") : $("#set-apikey")).value = key;
     toast(`Applied profile "${p.name}"`);
   }
   function saveCurrentProfile() {
     const name = (prompt("Name this profile:", "") || "").trim();
     if (!name) return;
     const id = uid();
-    const model = $("#set-model-custom").value.trim() || $("#set-model").value;
-    state.settings.profiles.push({ id, name, model });
-    const key = $("#set-apikey").value.trim();
+    const custom = $("#set-model-custom").value.trim();
+    const [selProv, ...selRest] = $("#set-model").value.split("::");
+    const provider = custom ? $("#set-model-custom-prov").value : selProv;
+    const model = custom || selRest.join("::");
+    state.settings.profiles.push({ id, name, model, provider });
+    const key = (provider === "codecraft" ? $("#set-cckey") : $("#set-apikey")).value.trim();
     if (key) { try { sessionStorage.setItem(profileKeyName(id), key); } catch {} }
     saveSettings(); renderProfiles();
     toast(`Saved profile "${name}"`, "success");
@@ -3956,6 +4331,254 @@ a{color:#22d3ee}</style></head>
   }
 
   /* ============================================================
+     Model picker (top bar) · effort panel · capability chips
+     ============================================================ */
+  const CAP_META = [
+    { key: "reasoning", label: "Reasoning", cls: "cap--reasoning", icon: "🧠" },
+    { key: "vision", label: "Vision", cls: "cap--vision", icon: "🖼️" },
+    { key: "tools", label: "Tools", cls: "cap--tools", icon: "🔧" },
+    { key: "streaming", label: "Streaming", cls: "cap--streaming", icon: "⚡" },
+    { key: "json", label: "JSON", cls: "cap--json", icon: "{}" },
+  ];
+
+  function renderCapChips() {
+    const box = $("#cap-chips");
+    if (!box) return;
+    const info = modelInfo();
+    box.innerHTML = CAP_META.filter((c) => info.caps?.[c.key]).map((c) => {
+      const on = c.key === "json" ? state.settings.jsonMode : true;
+      const title = c.key === "json" ? (on ? "JSON mode ON — click to turn off" : "Click to force JSON output")
+        : c.key === "reasoning" ? "Click to change reasoning effort"
+        : c.key === "vision" ? "This model can see images — attach or paste one"
+        : c.key === "tools" ? "Tool use: MAX can read/edit your repo & browse" : "Streaming responses";
+      return `<button type="button" class="cap-chip ${c.cls}${on ? "" : " cap-chip--off"}" data-cap="${c.key}" title="${esc(title)}">
+        <span aria-hidden="true">${c.icon}</span>${c.label}</button>`;
+    }).join("");
+    const pill = $("#effort-pill");
+    if (pill) {
+      pill.hidden = info.caps?.reasoning === false;
+      $("#effort-label").textContent = (EFFORTS.find((e) => e.id === state.settings.effort) || EFFORTS[1]).label;
+      pill.dataset.level = state.settings.effort;
+    }
+  }
+
+  let popEl = null;
+  function closePop() { if (popEl) { popEl.remove(); popEl = null; } }
+  function placePop(pop, anchor, where = "below") {
+    const r = anchor.getBoundingClientRect();
+    const w = pop.offsetWidth;
+    pop.style.left = `${Math.max(10, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - 10))}px`;
+    if (where === "above") pop.style.bottom = `${Math.max(10, window.innerHeight - r.top + 8)}px`;
+    else pop.style.top = `${r.bottom + 8}px`;
+  }
+  function dismissOnOutside(pop, anchor) {
+    setTimeout(() => {
+      const onDoc = (e) => {
+        if (popEl !== pop) { document.removeEventListener("mousedown", onDoc); return; }
+        if (!pop.contains(e.target) && !anchor.contains(e.target)) { closePop(); document.removeEventListener("mousedown", onDoc); }
+      };
+      document.addEventListener("mousedown", onDoc);
+    }, 0);
+  }
+
+  function openEffortPanel(anchor) {
+    if (popEl && popEl.classList.contains("effort-pop")) { closePop(); return; }
+    closePop();
+    const pop = document.createElement("div");
+    pop.className = "effort-pop";
+    pop.setAttribute("role", "listbox");
+    const hint = providerInfo(currentProvider()).style === "anthropic"
+      ? "Sets Claude's extended-thinking budget."
+      : "Sent as reasoning_effort. Models without reasoning ignore it.";
+    pop.innerHTML = `<div class="effort-pop__head">Reasoning effort</div>` +
+      EFFORTS.map((e) => `<button type="button" class="effort-opt${e.id === state.settings.effort ? " active" : ""}" data-e="${e.id}" role="option" aria-selected="${e.id === state.settings.effort}">
+        <span class="effort-opt__label">${e.label}</span><span class="effort-opt__hint">${e.hint}</span>
+        ${e.id === state.settings.effort ? `<svg class="effort-opt__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>` : ""}
+      </button>`).join("") +
+      `<div class="effort-pop__foot">${esc(hint)}</div>`;
+    document.body.appendChild(pop);
+    popEl = pop;
+    placePop(pop, anchor, "above");
+    pop.querySelectorAll(".effort-opt").forEach((b) => b.addEventListener("click", () => {
+      state.settings.effort = b.dataset.e; saveSettings(); renderCapChips(); closePop();
+      toast(`Reasoning effort: ${(EFFORTS.find((x) => x.id === b.dataset.e) || {}).label}`);
+    }));
+    dismissOnOutside(pop, anchor);
+  }
+
+  function capIcons(m) {
+    return CAP_META.filter((c) => m.caps?.[c.key] && c.key !== "streaming")
+      .map((c) => `<span class="mp-cap ${c.cls}" title="${c.label}">${c.icon}</span>`).join("");
+  }
+
+  function openModelPicker(anchor) {
+    if (popEl && popEl.classList.contains("model-pop")) { closePop(); return; }
+    closePop();
+    const pop = document.createElement("div");
+    pop.className = "model-pop";
+    const providers = state.config.providers || DEFAULT_PROVIDERS;
+    let tab = "all";
+    pop.innerHTML = `
+      <div class="model-pop__search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input type="text" placeholder="Search ${allModels().length} models…" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="model-pop__tabs">
+        <button type="button" class="mp-tab active" data-t="all">All</button>
+        ${providers.map((p) => `<button type="button" class="mp-tab" data-t="${esc(p.id)}">${esc(p.label)}${providerReady(p.id) ? "" : ` <span class="mp-nokey" title="No key yet">•</span>`}</button>`).join("")}
+      </div>
+      <div class="model-pop__list" role="listbox"></div>
+      <div class="model-pop__foot">
+        <input type="text" class="mp-custom" placeholder="Custom model id…" spellcheck="false" />
+        <select class="mp-custom-prov">${providers.map((p) => `<option value="${esc(p.id)}"${p.id === currentProvider() ? " selected" : ""}>${esc(p.label)}</option>`).join("")}</select>
+        <button type="button" class="btn btn--ghost btn--sm mp-custom-use">Use</button>
+      </div>`;
+    document.body.appendChild(pop);
+    popEl = pop;
+    const input = pop.querySelector("input");
+    const listEl = pop.querySelector(".model-pop__list");
+    let active = 0, shown = [];
+    const render = () => {
+      const q = input.value.trim().toLowerCase();
+      shown = allModels().filter((m) => (tab === "all" || m.provider === tab) &&
+        (!q || m.label.toLowerCase().includes(q) || m.id.toLowerCase().includes(q) || (m.family || "").toLowerCase().includes(q)));
+      const cur = `${currentProvider()}::${currentModel()}`;
+      let html = "", lastGroup = "";
+      shown.forEach((m, i) => {
+        const g = `${providerInfo(m.provider).label}`;
+        if (g !== lastGroup) {
+          html += `<div class="mp-group">${esc(g)}${providerReady(m.provider) ? "" : ` <button type="button" class="mp-addkey" data-addkey="${esc(m.provider)}">add key</button>`}</div>`;
+          lastGroup = g;
+        }
+        const sel = `${m.provider}::${m.id}` === cur;
+        html += `<button type="button" class="mp-item${sel ? " selected" : ""}${i === active ? " active" : ""}" data-i="${i}" role="option" aria-selected="${sel}">
+          <span class="mp-item__main"><span class="mp-item__label">${esc(m.label)}${m.recommended ? ` <span class="mp-badge">recommended</span>` : ""}</span>
+          <span class="mp-item__id">${esc(m.id)}${m.family ? ` · ${esc(m.family)}` : ""}</span></span>
+          <span class="mp-item__caps">${capIcons(m)}</span>
+          ${sel ? `<svg class="mp-item__check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>` : ""}
+        </button>`;
+      });
+      listEl.innerHTML = html || `<div class="repo-pop__msg">No models match — type a custom id below.</div>`;
+      listEl.querySelectorAll(".mp-item").forEach((b) => b.addEventListener("click", () => choose(shown[+b.dataset.i])));
+      listEl.querySelectorAll("[data-addkey]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); closePop(); openSettings("providers"); }));
+      listEl.querySelector(".mp-item.selected")?.scrollIntoView({ block: "nearest" });
+    };
+    const choose = (m) => {
+      if (!m) return;
+      closePop();
+      setModel(m.id, m.provider);
+      toast(`${m.label} · ${providerInfo(m.provider).label}${providerReady(m.provider) ? "" : " — add an API key in Settings"}`, providerReady(m.provider) ? "success" : "");
+    };
+    pop.querySelectorAll(".mp-tab").forEach((t) => t.addEventListener("click", () => {
+      tab = t.dataset.t; active = 0;
+      pop.querySelectorAll(".mp-tab").forEach((x) => x.classList.toggle("active", x === t));
+      render();
+    }));
+    input.addEventListener("input", () => { active = 0; render(); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        active = Math.max(0, Math.min(shown.length - 1, active + (e.key === "ArrowDown" ? 1 : -1)));
+        listEl.querySelectorAll(".mp-item").forEach((b) => b.classList.toggle("active", +b.dataset.i === active));
+        listEl.querySelector(".mp-item.active")?.scrollIntoView({ block: "nearest" });
+      } else if (e.key === "Enter") { e.preventDefault(); choose(shown[active]); }
+      else if (e.key === "Escape") closePop();
+    });
+    const useCustom = () => {
+      const id = pop.querySelector(".mp-custom").value.trim();
+      if (!id) return;
+      const prov = pop.querySelector(".mp-custom-prov").value;
+      closePop(); setModel(id, prov); toast(`Using custom model ${id}`, "success");
+    };
+    pop.querySelector(".mp-custom-use").addEventListener("click", useCustom);
+    pop.querySelector(".mp-custom").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); useCustom(); } });
+    render();
+    placePop(pop, anchor, "below");
+    setTimeout(() => input.focus(), 20);
+    dismissOnOutside(pop, anchor);
+  }
+
+  async function refreshProviderModels(provider, btn, out) {
+    setBtnBusy(btn, true);
+    if (out) { out.textContent = "Fetching model list…"; out.style.color = ""; }
+    try {
+      const keyInput = provider === "codecraft" ? $("#set-cckey") : $("#set-apikey");
+      const res = await fetch("/api/models/refresh", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, apiKey: keyInput?.value.trim() || providerKey(provider) || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      const known = new Set(state.config.models.filter((m) => m.provider === provider).map((m) => m.id));
+      const fresh = (data.models || []).filter((id) => !known.has(id));
+      state.settings.customModels = (state.settings.customModels || []).filter((m) => m.provider !== provider)
+        .concat(fresh.map((id) => ({ id, provider })));
+      saveSettings();
+      if (out) { out.textContent = `✓ ${data.models.length} models available${fresh.length ? ` — ${fresh.length} new added to the picker` : " — catalog is up to date"}.`; out.style.color = "#34d399"; }
+    } catch (err) {
+      if (out) { out.textContent = "✗ " + (err instanceof TypeError ? "Can't reach the MAX server." : err.message); out.style.color = "#ff6b8a"; }
+    } finally { setBtnBusy(btn, false); }
+  }
+
+  async function testProvider(provider, btn, out) {
+    setBtnBusy(btn, true);
+    out.textContent = "Pinging…"; out.style.color = "";
+    try {
+      const keyInput = provider === "codecraft" ? $("#set-cckey") : $("#set-apikey");
+      const model = provider === currentProvider() ? currentModel()
+        : ((state.config.models.find((m) => m.provider === provider && m.recommended) || state.config.models.find((m) => m.provider === provider) || {}).id);
+      const res = await fetch("/api/test", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, model, apiKey: keyInput?.value.trim() || providerKey(provider) || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      out.textContent = "✓ " + (data.message || "OK"); out.style.color = "#34d399";
+    } catch (err) {
+      out.textContent = "✗ " + (err instanceof TypeError ? "Can't reach the MAX server." : err.message); out.style.color = "#ff6b8a";
+    } finally { setBtnBusy(btn, false); }
+  }
+
+  /* ---------- welcome suggestions ---------- */
+  const SUGGESTIONS = {
+    create: [
+      ["Write a short story", "about a robot who learns to paint", "Write a short, vivid story about a robot who learns to paint. ~400 words."],
+      ["Draft an email", "professional and friendly", "Help me draft a professional, friendly email asking my manager for a project deadline extension."],
+      ["Plan my week", "a healthy weekly meal plan", "Create a weekly meal plan for a busy person: balanced, quick recipes, with a shopping list."],
+    ],
+    explore: [
+      ["Explain a concept", "how do transformers work?", "Explain how transformer neural networks work, from attention to training, with a simple analogy."],
+      ["Compare options", "HTTP/1.1 vs HTTP/2 vs HTTP/3", "Summarize the key differences between HTTP/1.1, HTTP/2 and HTTP/3 in a table."],
+      ["Research a topic", "pros & cons of solar at home", "What are the real pros and cons of home solar panels? Include costs, payback and pitfalls."],
+    ],
+    code: [
+      ["Build a web app", "a to-do app in one HTML file", "Build a beautiful, responsive to-do app as a single HTML file with localStorage. Make it runnable."],
+      ["Review my repo", "summarize the selected repository", "/summarize"],
+      ["Fix a bug", "debug the code I paste", "Find and fix the bug in this code, and explain the root cause:\n\n"],
+    ],
+    video: [
+      ["Logo reveal", "8s neon logo animation", "/video An 8 second neon logo reveal for the word MAX with glowing particles and a light sweep."],
+      ["Data story", "animated bar chart race", "/video A 10 second animated bar chart showing smartphone market share growing from 2015 to 2025, with labels."],
+      ["Space scene", "flying through a starfield", "/video A 10 second cinematic flight through a colorful starfield with a planet rising into view."],
+    ],
+  };
+  function renderSuggestions(cat = "create") {
+    const box = $("#suggestions");
+    if (!box) return;
+    box.innerHTML = (SUGGESTIONS[cat] || SUGGESTIONS.create).map(([title, sub, prompt]) => `
+      <button class="suggestion" type="button" data-prompt="${esc(prompt)}">
+        <span><b>${esc(title)}</b>${esc(sub)}</span>
+      </button>`).join("");
+    $$(".welcome-tab").forEach((t) => t.classList.toggle("active", t.dataset.cat === cat));
+  }
+
+  function applyPerfMode() {
+    const on = !!state.settings.perfMode;
+    document.documentElement.classList.toggle("perf", on);
+    window.MaxBg?.setEnabled(!on);
+  }
+
+  /* ============================================================
      Theme
      ============================================================ */
   function applyTheme(theme) {
@@ -3977,7 +4600,12 @@ a{color:#22d3ee}</style></head>
      Model pill + key status
      ============================================================ */
   function updateModelPill() {
-    $("#model-pill-name").textContent = currentModel();
+    const info = modelInfo();
+    $("#model-pill-name").textContent = info.label || currentModel();
+    const prov = $("#model-pill-prov");
+    if (prov) prov.textContent = providerInfo(currentProvider()).label.replace(/ API$/, "");
+    $("#model-pill").classList.toggle("model-pill--nokey", !providerReady());
+    renderCapChips();
   }
 
   // Running token + cost total for the active conversation.
@@ -4000,25 +4628,35 @@ a{color:#22d3ee}</style></head>
   }
   function updateKeyStatus() {
     const el = $("#key-status");
-    const hasClient = state.settings.apiKey && state.config.allowClientKey;
-    if (hasClient) { el.textContent = "Key: your key"; el.className = "key-status ok"; }
-    else if (state.config.hasServerKey) { el.textContent = "Key: server"; el.className = "key-status ok"; }
-    else { el.textContent = "No API key"; el.className = "key-status warn"; }
+    const p = currentProvider();
+    const label = providerInfo(p).label.replace(/ API$/, "");
+    if (providerKey(p) && state.config.allowClientKey) { el.textContent = `${label}: your key`; el.className = "key-status ok"; }
+    else if (providerInfo(p).hasServerKey) { el.textContent = `${label}: server key`; el.className = "key-status ok"; }
+    else { el.textContent = `No ${label} key`; el.className = "key-status warn"; el.style.cursor = "pointer"; }
+    el.title = "AI provider key status — click to manage keys";
   }
 
   /* ============================================================
      Settings modal
      ============================================================ */
-  function openSettings() {
+  function openSettings(section) {
     const s = state.settings;
-    // populate model select
+    // populate model select, grouped by provider (value = "provider::id")
     const sel = $("#set-model");
-    sel.innerHTML = state.config.models.map((m) => `<option value="${esc(m.id)}">${esc(m.label)}</option>`).join("");
-    const known = state.config.models.some((m) => m.id === (s.model || state.config.defaultModel));
-    if (known) { sel.value = s.model || state.config.defaultModel; $("#set-model-custom").value = ""; }
+    const providers = state.config.providers || DEFAULT_PROVIDERS;
+    sel.innerHTML = providers.map((p) => `<optgroup label="${esc(p.label)}">` +
+      allModels().filter((m) => m.provider === p.id).map((m) => `<option value="${esc(p.id + "::" + m.id)}">${esc(m.label)}</option>`).join("") +
+      `</optgroup>`).join("");
+    const curKey = `${currentProvider()}::${currentModel()}`;
+    if ([...sel.options].some((o) => o.value === curKey)) { sel.value = curKey; $("#set-model-custom").value = ""; }
     else { $("#set-model-custom").value = s.model || ""; }
+    $("#set-model-custom-prov").value = currentProvider();
 
     $("#set-apikey").value = s.apiKey || "";
+    $("#set-cckey").value = s.ccKey || "";
+    $("#set-remember").checked = !!s.rememberKeys;
+    $("#set-perf").checked = !!s.perfMode;
+    $("#cc-test-result").textContent = ""; $("#ar-test-result").textContent = "";
     $("#set-system").value = s.system || "";
     $("#set-maxtokens").value = s.maxTokens;
     $("#set-temp").value = s.temperature;
@@ -4057,24 +4695,33 @@ a{color:#22d3ee}</style></head>
     $("#gh-test-result").textContent = "";
 
     // api key help / visibility
-    const field = $("#apikey-field");
-    if (!state.config.allowClientKey) {
-      field.style.display = "none";
-    } else {
-      field.style.display = "";
-      $("#apikey-help").textContent = state.config.hasServerKey
-        ? "A server key is configured. Leave blank to use it, or enter your own to override."
-        : "No server key configured — enter your AgentRouter key (from agentrouter.org/console/token).";
-    }
+    const ar = providerInfo("agentrouter"), cc = providerInfo("codecraft");
+    $("#apikey-field").style.display = state.config.allowClientKey ? "" : "none";
+    $("#cckey-field").style.display = state.config.allowClientKey ? "" : "none";
+    $("#apikey-help").innerHTML = ar.hasServerKey
+      ? "A server key is configured. Leave blank to use it, or enter your own to override."
+      : `Get a key at <a href="${esc(ar.keyUrl)}" target="_blank" rel="noopener noreferrer">agentrouter.org</a>.`;
+    $("#cckey-help").innerHTML = cc.hasServerKey
+      ? "A server key is configured. Leave blank to use it, or paste your own to override."
+      : `Get a key at <a href="${esc(cc.keyUrl)}" target="_blank" rel="noopener noreferrer">codecraftapi.com</a> → API Keys.`;
     $("#settings-note").textContent = "";
     $("#settings-overlay").hidden = false;
+    if (section === "providers") setTimeout(() => { $("#providers-section")?.scrollIntoView({ block: "start" }); (s.ccKey || cc.hasServerKey ? $("#set-apikey") : $("#set-cckey")).focus(); }, 40);
   }
   function closeSettings() { $("#settings-overlay").hidden = true; }
 
   function saveSettingsFromModal() {
     const custom = $("#set-model-custom").value.trim();
+    state.settings.rememberKeys = $("#set-remember").checked;
     state.settings.apiKey = $("#set-apikey").value.trim();
-    state.settings.model = custom || $("#set-model").value;
+    state.settings.ccKey = $("#set-cckey").value.trim();
+    if (custom) { state.settings.model = custom; state.settings.aiProvider = $("#set-model-custom-prov").value; }
+    else {
+      const [prov, ...rest] = $("#set-model").value.split("::");
+      state.settings.aiProvider = prov; state.settings.model = rest.join("::");
+    }
+    state.settings.perfMode = $("#set-perf").checked;
+    applyPerfMode();
     state.settings.system = $("#set-system").value;
     state.settings.maxTokens = Math.max(256, Math.min(64000, parseInt($("#set-maxtokens").value, 10) || 4096));
     state.settings.temperature = parseFloat($("#set-temp").value);
@@ -4100,6 +4747,8 @@ a{color:#22d3ee}</style></head>
     updateModelPill();
     updateKeyStatus();
     updateAutoPill();
+    renderWelcomeStatus();
+    refreshGithubStatus();
 
     // Make the GitHub repo configured here MAX's working repo, so it can read
     // and edit it right away (otherwise the tools stay off until you pick a repo
@@ -4115,6 +4764,7 @@ a{color:#22d3ee}</style></head>
       }
     }
 
+    if (providerReady()) $$(".toast--nudge").forEach((t) => t.remove());
     toast("Settings saved", "success");
     closeSettings();
   }
@@ -4266,11 +4916,11 @@ a{color:#22d3ee}</style></head>
         if (!state.streaming) sendMessage(input.value);
       }
     });
-    // paste images
+    // paste images / files
     input.addEventListener("paste", (e) => {
       const items = [...(e.clipboardData?.items || [])];
-      const imgs = items.filter((it) => it.type.startsWith("image/")).map((it) => it.getAsFile()).filter(Boolean);
-      if (imgs.length) { e.preventDefault(); handleFiles(imgs); }
+      const files = items.filter((it) => it.kind === "file").map((it) => it.getAsFile()).filter(Boolean);
+      if (files.length) { e.preventDefault(); handleFiles(files); }
     });
 
     $("#stop-btn").addEventListener("click", stopStreaming);
@@ -4282,10 +4932,17 @@ a{color:#22d3ee}</style></head>
       const id = e.target.closest("[data-remove]")?.dataset.remove;
       if (id) { state.attachments = state.attachments.filter((a) => a.id !== id); renderAttachments(); }
     });
-    // drag & drop onto composer
-    const wrap = $(".composer-wrap");
-    ["dragover", "dragenter"].forEach((ev) => wrap.addEventListener(ev, (e) => { e.preventDefault(); }));
-    wrap.addEventListener("drop", (e) => { e.preventDefault(); if (e.dataTransfer?.files?.length) handleFiles(e.dataTransfer.files); });
+    // drag & drop anywhere in the window
+    let dragDepth = 0;
+    const isFileDrag = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+    window.addEventListener("dragenter", (e) => { if (!isFileDrag(e)) return; e.preventDefault(); dragDepth++; document.body.classList.add("drag-over"); });
+    window.addEventListener("dragover", (e) => { if (isFileDrag(e)) e.preventDefault(); });
+    window.addEventListener("dragleave", () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) document.body.classList.remove("drag-over"); });
+    window.addEventListener("drop", (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault(); dragDepth = 0; document.body.classList.remove("drag-over");
+      if (e.dataTransfer?.files?.length) handleFiles(e.dataTransfer.files);
+    });
 
     // new chat
     $("#new-chat-btn").addEventListener("click", () => {
@@ -4295,6 +4952,10 @@ a{color:#22d3ee}</style></head>
       if (existingEmpty) { selectConversation(existingEmpty.id); }
       else { newConversation(); renderConversations(); renderMessages(); }
       updateModelPill();
+      // Every new chat starts from a fresh view of your repos/connection.
+      treeCache = null;
+      refreshGithubStatus(true);
+      if (activeRepo()) getTree(true).catch(() => {});
       input.focus();
     });
 
@@ -4313,10 +4974,18 @@ a{color:#22d3ee}</style></head>
       state._searchDebounce = setTimeout(renderConversations, 200);
     });
 
-    // suggestions
+    // suggestions + welcome categories
+    $("#welcome-tabs")?.addEventListener("click", (e) => {
+      const t = e.target.closest(".welcome-tab");
+      if (t) renderSuggestions(t.dataset.cat);
+    });
     $("#suggestions").addEventListener("click", (e) => {
       const btn = e.target.closest(".suggestion");
-      if (btn) { input.value = btn.dataset.prompt; autoResize(input); updateCharCount(); updateSendState(); input.focus(); }
+      if (!btn) return;
+      const prompt = btn.dataset.prompt;
+      if (prompt === "/summarize") { input.value = ""; summarizeRepo(); return; }
+      input.value = prompt; autoResize(input); updateCharCount(); updateSendState(); input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
     });
 
     // sidebar toggles
@@ -4331,8 +5000,30 @@ a{color:#22d3ee}</style></head>
     // theme
     $("#theme-btn").addEventListener("click", toggleTheme);
 
-    // model pill -> open settings
-    $("#model-pill").addEventListener("click", openSettings);
+    // model picker, effort panel, capability chips
+    $("#model-pill").addEventListener("click", (e) => openModelPicker(e.currentTarget));
+    $("#key-status").addEventListener("click", () => openSettings("providers"));
+    $("#effort-pill").addEventListener("click", (e) => openEffortPanel(e.currentTarget));
+    $("#cap-chips").addEventListener("click", (e) => {
+      const chip = e.target.closest("[data-cap]");
+      if (!chip) return;
+      const cap = chip.dataset.cap;
+      if (cap === "json") {
+        state.settings.jsonMode = !state.settings.jsonMode; saveSettings(); renderCapChips();
+        toast(state.settings.jsonMode ? "JSON mode ON — replies will be pure JSON" : "JSON mode off");
+      } else if (cap === "reasoning") openEffortPanel($("#effort-pill").hidden ? chip : $("#effort-pill"));
+      else if (cap === "vision") $("#file-input").click();
+      else if (cap === "tools") { if (!activeRepo()) openRepoPicker($("#repo-chip")); else toast("Tools are on — MAX can read, edit & push this repo, and fetch web pages."); }
+    });
+    $("#branch-chip").addEventListener("click", (e) => openBranchPicker(e.currentTarget));
+    $("#gh-status").addEventListener("click", () => { if (state.ghStatus?.error) openSettings(); else refreshGithubStatus(true).then(() => toast("GitHub connection refreshed", "success")); });
+    $("#reveal-cckey").addEventListener("click", () => { const el = $("#set-cckey"); el.type = el.type === "password" ? "text" : "password"; });
+    $("#cc-test").addEventListener("click", (e) => testProvider("codecraft", e.currentTarget, $("#cc-test-result")));
+    $("#ar-test").addEventListener("click", (e) => testProvider("agentrouter", e.currentTarget, $("#ar-test-result")));
+    $("#cc-models").addEventListener("click", (e) => refreshProviderModels("codecraft", e.currentTarget, $("#cc-test-result")));
+    $("#ar-models").addEventListener("click", (e) => refreshProviderModels("agentrouter", e.currentTarget, $("#ar-test-result")));
+    // Coming back to the tab → re-check GitHub (repos/branches may have changed).
+    window.addEventListener("focus", () => { refreshGithubStatus(); if (treeCache) treeCache.at = 0; });
 
     // settings modal
     $("#settings-btn").addEventListener("click", openSettings);
@@ -4344,6 +5035,7 @@ a{color:#22d3ee}</style></head>
       const el = $("#set-apikey"); el.type = el.type === "password" ? "text" : "password";
     });
     $("#set-model").addEventListener("change", () => { $("#set-model-custom").value = ""; });
+    $("#set-perf").addEventListener("change", (e) => { state.settings.perfMode = e.target.checked; applyPerfMode(); });
     $("#set-autosteps").addEventListener("input", (e) => ($("#autosteps-val").textContent = e.target.value));
     $("#reveal-ghtoken").addEventListener("click", () => {
       const el = $("#set-ghtoken"); el.type = el.type === "password" ? "text" : "password";
@@ -4446,7 +5138,8 @@ a{color:#22d3ee}</style></head>
 
     // global keys
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); closeAdmin(); closeTreePanel(); closeSkills(); }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "m") { e.preventDefault(); openModelPicker($("#model-pill")); }
+      if (e.key === "Escape") { closePop(); closeSettings(); closeRename(); closeRepoPicker(); closeFilesPicker(); closeMention(); closeSlash(); closePalette(); closePowers(); closeAdmin(); closeTreePanel(); closeSkills(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") { e.preventDefault(); toggleFindBar(true); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); $("#new-chat-btn").click(); }
@@ -4511,13 +5204,23 @@ a{color:#22d3ee}</style></head>
           ...state.config,
           ...config,
           models: Array.isArray(config.models) && config.models.length ? config.models : DEFAULT_MODELS,
+          providers: Array.isArray(config.providers) && config.providers.length ? config.providers : DEFAULT_PROVIDERS,
         };
       }
     } catch {
       toast("Could not reach the MAX server.", "error");
     }
 
+    // Older versions stored only a model id (AgentRouter). Infer its provider.
+    if (state.settings.model && !state.settings.aiProvider) {
+      const hit = state.config.models.find((m) => m.id === state.settings.model);
+      state.settings.aiProvider = hit ? hit.provider : "agentrouter";
+      saveSettings();
+    }
+    applyPerfMode();
+
     bindEvents();
+    renderSuggestions("create");
 
     // sidebar default state on mobile
     if (window.innerWidth <= 820) setSidebarHidden(true);
@@ -4559,9 +5262,11 @@ a{color:#22d3ee}</style></head>
       navigator.serviceWorker.register("/sw.js").catch(() => {});
     }
 
-    // first-run nudge if no key at all
-    if (!state.config.hasServerKey && !state.settings.apiKey) {
-      setTimeout(() => toast("Add your AgentRouter API key in Settings to start chatting.", ""), 700);
+    refreshGithubStatus(true);
+
+    // first-run nudge if the selected provider has no key
+    if (!providerReady()) {
+      setTimeout(() => { if (!providerReady()) toast(`Add your ${providerInfo(currentProvider()).label} key in Settings → AI providers to start chatting.`, "nudge"); }, 700);
     }
   }
 

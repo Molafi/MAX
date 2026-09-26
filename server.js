@@ -17,6 +17,11 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlink
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import {
+  buildAnthropicBody, buildOpenAIBody, downgradeBody, createOpenAIStreamTranslator,
+  openAICompletionToSse, openAICompletionToAnthropic, normalizeEffort, sse,
+} from "./lib/providers.js";
+import { buildCatalog } from "./lib/models.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -52,12 +57,34 @@ function loadEnv() {
 }
 loadEnv();
 
+// AI providers. Both can be active at once; the UI picks one per request.
+//   codecraft   → OpenAI-compatible  ({base}/chat/completions, Bearer key)
+//   agentrouter → Anthropic-compatible ({base}/v1/messages)
+const PROVIDERS = {
+  codecraft: {
+    id: "codecraft", label: "CodeCraft API", style: "openai",
+    key: process.env.CODECRAFT_API_KEY || "",
+    baseUrl: (process.env.CODECRAFT_BASE_URL || "https://codecraftapi.com/v1").replace(/\/+$/, ""),
+    keyUrl: "https://codecraftapi.com/dashboard",
+  },
+  agentrouter: {
+    id: "agentrouter", label: "AgentRouter", style: "anthropic",
+    key: process.env.AGENTROUTER_API_KEY || "",
+    baseUrl: (process.env.AGENTROUTER_BASE_URL || "https://agentrouter.org").replace(/\/+$/, ""),
+    keyUrl: "https://agentrouter.org/console/token",
+  },
+};
+const providerEndpoint = (p) => (p.style === "openai" ? `${p.baseUrl}/chat/completions` : `${p.baseUrl}/v1/messages`);
+
 const CONFIG = {
   host: process.env.HOST || "127.0.0.1",
   port: parseInt(process.env.PORT || "8787", 10),
-  apiKey: process.env.AGENTROUTER_API_KEY || "",
-  baseUrl: (process.env.AGENTROUTER_BASE_URL || "https://agentrouter.org").replace(/\/+$/, ""),
-  defaultModel: process.env.DEFAULT_MODEL || "claude-opus-4-8",
+  // Legacy single-provider fields (AgentRouter) kept for compatibility.
+  apiKey: PROVIDERS.agentrouter.key,
+  baseUrl: PROVIDERS.agentrouter.baseUrl,
+  defaultProvider: PROVIDERS[process.env.DEFAULT_PROVIDER] ? process.env.DEFAULT_PROVIDER
+    : (PROVIDERS.agentrouter.key && !PROVIDERS.codecraft.key ? "agentrouter" : "codecraft"),
+  defaultModel: process.env.DEFAULT_MODEL || "",
   allowClientKey: (process.env.ALLOW_CLIENT_KEY || "true").toLowerCase() !== "false",
   rateLimitPerMin: parseInt(process.env.RATE_LIMIT_PER_MIN || "60", 10),
   upstreamTimeoutMs: parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10),
@@ -161,27 +188,16 @@ const POWER_CATEGORIES = ["AWS", "Security", "Database", "Observability", "Payme
 
 const START_TIME = Date.now();
 
-// Models allowed by the AgentRouter token configuration shown by the user.
-// Users can still enter a custom model ID in the UI if their token permits it.
-const MODELS = [
-  { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
-  { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
-  { id: "claude-opus-4-8", label: "Claude Opus 4.8 — recommended" },
-  { id: "glm-5.2", label: "GLM 5.2" },
-  { id: "gpt-5.5", label: "GPT-5.5" },
-  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
-  { id: "kimi-k3", label: "Kimi K3" },
-];
+// Full model catalog (CodeCraft + AgentRouter). Users can still type a custom id.
+const MODELS = buildCatalog();
+if (!CONFIG.defaultModel) {
+  CONFIG.defaultModel = CONFIG.defaultProvider === "agentrouter" ? "claude-opus-4-8" : "claude-opus-5";
+}
 
 /* ------------------------------------------------------------------ */
 /*  Tiny in-memory per-IP rate limiter                                 */
 /* ------------------------------------------------------------------ */
 const rateBuckets = new Map(); // ip -> { count, resetAt }
-// Periodic cleanup so the map can't grow unbounded from unique IPs.
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, b] of rateBuckets) if (now > b.resetAt) rateBuckets.delete(ip);
-}, 5 * 60_000).unref?.();
 function checkRateLimit(ip) {
   if (!CONFIG.rateLimitPerMin || CONFIG.rateLimitPerMin <= 0) return true;
   const now = Date.now();
@@ -193,7 +209,7 @@ function checkRateLimit(ip) {
   bucket.count += 1;
   return bucket.count <= CONFIG.rateLimitPerMin;
 }
-// periodic cleanup
+// Periodic cleanup so the map can't grow unbounded from unique IPs.
 setInterval(() => {
   const now = Date.now();
   for (const [ip, b] of rateBuckets) if (now > b.resetAt) rateBuckets.delete(ip);
@@ -274,17 +290,32 @@ async function serveStatic(req, res) {
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
-function applySecurityHeaders(res) {
+function applySecurityHeaders(res, pathname = "") {
   res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(self), geolocation=()");
+
+  // The preview/video sandbox runs untrusted, model-generated code. It is only
+  // ever loaded inside <iframe sandbox="allow-scripts"> (opaque origin: no
+  // cookies, no access to the app), so it gets its own permissive policy.
+  if (pathname === "/sandbox.html") {
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader(
+      "Content-Security-Policy",
+      "default-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; " +
+        "script-src 'unsafe-inline' 'unsafe-eval' https: blob: data:; style-src 'unsafe-inline' https:; " +
+        "img-src https: data: blob:; font-src https: data:; media-src https: data: blob:; connect-src https:; worker-src blob:"
+    );
+    return;
+  }
+  res.setHeader("X-Frame-Options", "DENY");
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; " +
       "script-src 'self' https://cdn.jsdelivr.net; " +
       "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; " +
-      "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'"
+      "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://avatars.githubusercontent.com; " +
+      "media-src 'self' blob: data:; frame-src 'self'; worker-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net"
   );
 }
 
@@ -602,10 +633,10 @@ async function handleConversationSave(req, res) {
   if (!safeId) return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid conversation ID." } });
   const file = path.join(CONVOS_DIR, `${prefix}${safeId}.json`);
   try {
-    // Limit size: max 2MB per conversation
+    // Limit size: max 12MB per conversation (attachments included)
     const json = JSON.stringify(payload);
-    if (Buffer.byteLength(json, "utf8") > 2 * 1024 * 1024) {
-      return sendJson(res, 413, { error: { type: "too_large", message: "Conversation is too large (max 2MB)." } });
+    if (Buffer.byteLength(json, "utf8") > 12 * 1024 * 1024) {
+      return sendJson(res, 413, { error: { type: "too_large", message: "Conversation is too large (max 12MB)." } });
     }
     writeFileSync(file, json, "utf8");
     return sendJson(res, 200, { ok: true, id: safeId });
@@ -634,9 +665,13 @@ function handleConversationDelete(req, res, id) {
 function handleConfig(req, res) {
   sendJson(res, 200, {
     defaultModel: CONFIG.defaultModel,
+    defaultProvider: CONFIG.defaultProvider,
     models: MODELS,
+    providers: Object.values(PROVIDERS).map((p) => ({
+      id: p.id, label: p.label, style: p.style, hasServerKey: Boolean(p.key), keyUrl: p.keyUrl,
+    })),
     allowClientKey: CONFIG.allowClientKey,
-    hasServerKey: Boolean(CONFIG.apiKey),
+    hasServerKey: Object.values(PROVIDERS).some((p) => p.key),
     github: {
       hasServerToken: Boolean(CONFIG.github.token),
       allowClientToken: CONFIG.github.allowClientToken,
@@ -656,7 +691,8 @@ function handleHealth(req, res) {
     ok: true,
     uptimeSeconds: Math.round((Date.now() - START_TIME) / 1000),
     node: process.version,
-    hasServerKey: Boolean(CONFIG.apiKey),
+    hasServerKey: Object.values(PROVIDERS).some((p) => p.key),
+    providers: Object.fromEntries(Object.values(PROVIDERS).map((p) => [p.id, { hasServerKey: Boolean(p.key) }])),
     github: { hasServerToken: Boolean(CONFIG.github.token) },
     authEnabled: CONFIG.auth.enabled,
   });
@@ -789,8 +825,106 @@ async function handleAdminUpdate(req, res, id, action) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  /api/chat  — streaming proxy to AgentRouter /v1/messages           */
+/*  /api/chat  — streaming proxy (CodeCraft/OpenAI + AgentRouter/Anthropic) */
 /* ------------------------------------------------------------------ */
+function resolveProvider(payload) {
+  const id = String(payload?.provider || CONFIG.defaultProvider).toLowerCase();
+  const prov = PROVIDERS[id] || PROVIDERS[CONFIG.defaultProvider];
+  const clientKey = CONFIG.allowClientKey ? String(payload?.apiKey || "").trim() : "";
+  return { prov, apiKey: clientKey || prov.key };
+}
+
+function upstreamHeaders(prov, apiKey, stream) {
+  if (prov.style === "openai") {
+    return {
+      "Content-Type": "application/json",
+      Accept: stream ? "text/event-stream" : "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "User-Agent": "MAX-chat/2.0",
+    };
+  }
+  return {
+    "Content-Type": "application/json",
+    Accept: stream ? "text/event-stream" : "application/json",
+    // AgentRouter accepts either header style; send both for compatibility.
+    "x-api-key": apiKey,
+    Authorization: `Bearer ${apiKey}`,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "claude-code-20250219",
+    // REQUIRED by AgentRouter — must match the Claude CLI wire image.
+    "User-Agent": CONFIG.upstreamUserAgent,
+    "x-app": "cli",
+  };
+}
+
+/**
+ * POST to the provider with retries for transient failures and automatic
+ * parameter downgrades when a model/gateway rejects an optional parameter
+ * (reasoning effort, stream_options, temperature, response_format …).
+ * Returns { upstream, body, notes } or throws.
+ */
+async function callUpstream(prov, apiKey, body, signal, state) {
+  const url = providerEndpoint(prov);
+  const headers = upstreamHeaders(prov, apiKey, body.stream);
+  let transientLeft = 2;
+  let downgradesLeft = 4;
+  let triedGeneric = false;
+  const notes = [];
+  for (let attempt = 0; ; attempt++) {
+    let upstream;
+    try {
+      upstream = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+    } catch (err) {
+      if (signal.aborted) throw err;
+      if (transientLeft-- > 0) { await delay(400 * 2 ** attempt); continue; }
+      throw err;
+    }
+    if (upstream.ok) return { upstream, body, notes };
+
+    if (RETRYABLE_STATUS.has(upstream.status) && transientLeft-- > 0 && !state.timedOut) {
+      try { await upstream.text(); } catch {}
+      await delay(500 * 2 ** attempt);
+      continue;
+    }
+    if ((upstream.status === 400 || upstream.status === 422) && downgradesLeft-- > 0) {
+      const text = await upstream.text().catch(() => "");
+      const next = downgradeBody(body, prov.style, text, triedGeneric);
+      if (next) {
+        if (next.generic) triedGeneric = true;
+        const changed = Object.keys({ ...body, ...next.body }).filter((k) => JSON.stringify(body[k]) !== JSON.stringify(next.body[k]));
+        notes.push(`HTTP ${upstream.status} → adjusted ${changed.join(", ")}`);
+        body = next.body;
+        continue;
+      }
+      // Could not fix it: hand back a Response-like object carrying the text.
+      return { upstream: { ok: false, status: upstream.status, text: async () => text, headers: upstream.headers }, body, notes };
+    }
+    return { upstream, body, notes };
+  }
+}
+
+/** Anthropic JSON message → SSE (for gateways that ignore stream:true). */
+function anthropicJsonToSse(json) {
+  let s = sse("message_start", { type: "message_start", message: { ...json, content: [], usage: { input_tokens: json?.usage?.input_tokens || 0, output_tokens: 0 } } });
+  (json?.content || []).forEach((b, i) => {
+    if (b.type === "text") {
+      s += sse("content_block_start", { type: "content_block_start", index: i, content_block: { type: "text", text: "" } });
+      s += sse("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "text_delta", text: b.text || "" } });
+    } else if (b.type === "tool_use") {
+      s += sse("content_block_start", { type: "content_block_start", index: i, content_block: { type: "tool_use", id: b.id, name: b.name, input: {} } });
+      s += sse("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input || {}) } });
+    } else if (b.type === "thinking") {
+      s += sse("content_block_start", { type: "content_block_start", index: i, content_block: { type: "thinking", thinking: "" } });
+      s += sse("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: b.thinking || "" } });
+      if (b.signature) s += sse("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: b.signature } });
+    } else return;
+    s += sse("content_block_stop", { type: "content_block_stop", index: i });
+  });
+  s += sse("message_delta", { type: "message_delta", delta: { stop_reason: json?.stop_reason || "end_turn" }, usage: json?.usage || {} });
+  s += sse("message_stop", { type: "message_stop" });
+  return s;
+}
+
 async function handleChat(req, res) {
   const ip = clientIp(req);
   if (!checkRateLimit(ip)) {
@@ -809,27 +943,20 @@ async function handleChat(req, res) {
     });
   }
 
-  // Resolve the API key: client-supplied (if allowed) takes precedence.
-  const clientKey = CONFIG.allowClientKey ? String(payload.apiKey || "").trim() : "";
-  const apiKey = clientKey || CONFIG.apiKey;
-
+  const { prov, apiKey } = resolveProvider(payload);
   if (!apiKey) {
     return sendJson(res, 401, {
       error: {
         type: "no_api_key",
-        message:
-          "No API key configured. Add AGENTROUTER_API_KEY to your .env file, or enter a key in Settings.",
+        message: `No ${prov.label} key configured. Add ${prov.id === "codecraft" ? "CODECRAFT_API_KEY" : "AGENTROUTER_API_KEY"} to .env, or paste your key in Settings → AI providers.`,
       },
     });
   }
 
-  // Build and validate the Anthropic Messages request body.
-  const model = typeof payload.model === "string" ? payload.model.trim() : CONFIG.defaultModel;
+  const model = typeof payload.model === "string" && payload.model.trim() ? payload.model.trim() : CONFIG.defaultModel;
   const messages = Array.isArray(payload.messages) ? payload.messages : [];
   if (!model || model.length > 120) {
-    return sendJson(res, 400, {
-      error: { type: "bad_request", message: "A valid model ID is required." },
-    });
+    return sendJson(res, 400, { error: { type: "bad_request", message: "A valid model ID is required." } });
   }
   if (!messages.length || !messages.every(isValidMessage)) {
     return sendJson(res, 400, {
@@ -837,169 +964,174 @@ async function handleChat(req, res) {
     });
   }
 
-  const body = {
+  // Canonical (Anthropic-shaped) body; translated per provider below.
+  const base = {
     model,
     max_tokens: clampInt(payload.max_tokens, 1, 64000, 8192),
     messages,
     stream: payload.stream !== false,
   };
-  if (payload.system) body.system = payload.system;
+  if (payload.system) base.system = payload.system;
   if (payload.temperature !== undefined && payload.temperature !== null) {
-    body.temperature = clampFloat(payload.temperature, 0, 1, 1);
+    base.temperature = clampFloat(payload.temperature, 0, 1, 1);
   }
-  // Agentic tool use: forward a sanitized tools list (and optional tool_choice)
-  // so the model can call MAX's read/search capabilities. The browser executes
-  // the tools and sends results back as tool_result blocks on the next turn.
   const tools = sanitizeTools(payload.tools);
   if (tools) {
-    body.tools = tools;
-    if (payload.tool_choice && typeof payload.tool_choice === "object") {
-      body.tool_choice = payload.tool_choice;
-    }
+    base.tools = tools;
+    if (payload.tool_choice && typeof payload.tool_choice === "object") base.tool_choice = payload.tool_choice;
   }
+  const effort = normalizeEffort(payload.effort);
+  const json = payload.json === true;
+  const body = prov.style === "openai"
+    ? buildOpenAIBody(base, { effort, json })
+    : buildAnthropicBody(base, { effort, model });
 
-  const upstreamUrl = `${CONFIG.baseUrl}/v1/messages`;
-
-  // Abort only when the response connection closes early, not when the request
-  // body finishes. The request `close` event can fire before fetch starts.
+  // Abort only when the response connection closes early.
   const controller = new AbortController();
-  let timedOut = false;
-  // This is an INACTIVITY timeout, not a hard total cap: it fires only if we go
-  // `upstreamTimeoutMs` with no progress. We re-arm it on every streamed chunk,
-  // so long but healthy responses (and multi-step agentic runs) aren't killed.
+  const st = { timedOut: false };
+  // INACTIVITY timeout, re-armed on every streamed chunk (long answers are fine).
   const idleMs = Math.max(1_000, CONFIG.upstreamTimeoutMs);
   let timeout = null;
   const armTimeout = () => {
     if (timeout) clearTimeout(timeout);
-    timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, idleMs);
+    timeout = setTimeout(() => { st.timedOut = true; controller.abort(); }, idleMs);
   };
   armTimeout();
-  const abortOnDisconnect = () => {
-    if (!res.writableEnded) controller.abort();
-  };
+  const abortOnDisconnect = () => { if (!res.writableEnded) controller.abort(); };
   res.once("close", abortOnDisconnect);
+  const cleanup = () => { clearTimeout(timeout); res.off("close", abortOnDisconnect); };
 
-  const upstreamHeaders = {
-    "Content-Type": "application/json",
-    Accept: body.stream ? "text/event-stream" : "application/json",
-    // AgentRouter accepts either header style; send both for compatibility.
-    "x-api-key": apiKey,
-    Authorization: `Bearer ${apiKey}`,
-    "anthropic-version": "2023-06-01",
-    "anthropic-beta": "claude-code-20250219",
-    // REQUIRED by AgentRouter — must match the Claude CLI wire image.
-    "User-Agent": CONFIG.upstreamUserAgent,
-    "x-app": "cli",
-  };
-  const upstreamBody = JSON.stringify(body);
-  const maxRetries = 2;
-
-  let upstream;
+  const upstreamUrl = providerEndpoint(prov);
+  let result;
   try {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        upstream = await fetch(upstreamUrl, {
-          method: "POST", headers: upstreamHeaders, body: upstreamBody, signal: controller.signal,
-        });
-      } catch (err) {
-        if (controller.signal.aborted && !timedOut) { clearTimeout(timeout); res.off("close", abortOnDisconnect); return; }
-        if (!timedOut && attempt < maxRetries) { await delay(400 * 2 ** attempt); continue; }
-        throw err;
-      }
-      // Transient upstream failures: back off and retry with a fresh request.
-      if (!upstream.ok && RETRYABLE_STATUS.has(upstream.status) && attempt < maxRetries && !timedOut) {
-        try { await upstream.text(); } catch {}
-        await delay(500 * 2 ** attempt);
-        continue;
-      }
-      break;
-    }
+    result = await callUpstream(prov, apiKey, body, controller.signal, st);
   } catch (err) {
-    clearTimeout(timeout);
-    res.off("close", abortOnDisconnect);
-    if (controller.signal.aborted && !timedOut) return; // client left
+    cleanup();
+    if (controller.signal.aborted && !st.timedOut) return; // client left
     const cause = err?.cause?.code || err?.cause?.message || err?.code || err?.message || "unknown error";
     console.error(`[MAX] Upstream fetch failed (${upstreamUrl}):`, cause);
-    return sendJson(res, timedOut ? 504 : 502, {
+    return sendJson(res, st.timedOut ? 504 : 502, {
       error: {
-        type: timedOut ? "timeout" : "network",
-        message: timedOut
-          ? "The AI provider took too long to respond. Please try again."
-          : `Could not reach the AI provider at ${upstreamUrl} (${cause}). Check your internet connection and AGENTROUTER_BASE_URL.`,
+        type: st.timedOut ? "timeout" : "network",
+        message: st.timedOut
+          ? `${prov.label} took too long to respond. Please try again.`
+          : `Could not reach ${prov.label} at ${upstreamUrl} (${cause}). Check your internet connection and the provider base URL.`,
       },
     });
   }
+  const { upstream, notes } = result;
+  if (notes.length) console.log(`[MAX] ${prov.id}/${model}: compatibility fallback (${notes.join("; ")})`);
 
-  // Non-OK upstream: relay the error as JSON.
   if (!upstream.ok) {
-    clearTimeout(timeout);
-    res.off("close", abortOnDisconnect);
+    cleanup();
     let detail = "";
-    try {
-      detail = await upstream.text();
-    } catch {}
-    let parsed;
-    try {
-      parsed = JSON.parse(detail);
-    } catch {
-      parsed = null;
+    try { detail = await upstream.text(); } catch {}
+    let parsed = null;
+    try { parsed = JSON.parse(detail); } catch {}
+    let message = parsed?.error?.message || parsed?.message || (typeof parsed?.error === "string" ? parsed.error : "") ||
+      detail || `Upstream returned HTTP ${upstream.status}`;
+    if (upstream.status === 401 || upstream.status === 403) {
+      message = `${prov.label} rejected the API key (${upstream.status}): ${message}`;
+    } else if (upstream.status === 404 && /model/i.test(message)) {
+      message = `${prov.label} doesn't recognise the model "${model}": ${message}`;
     }
-    const message =
-      parsed?.error?.message ||
-      parsed?.message ||
-      detail ||
-      `Upstream returned HTTP ${upstream.status}`;
     return sendJson(res, upstream.status, {
-      error: { type: mapStatusType(upstream.status), status: upstream.status, message },
+      error: { type: mapStatusType(upstream.status), status: upstream.status, message: String(message).slice(0, 2000), provider: prov.id },
     });
   }
 
-  // Non-streaming path: relay JSON directly.
-  if (!body.stream) {
+  const ctype = String(upstream.headers?.get?.("content-type") || "");
+  const isSse = /event-stream/i.test(ctype);
+
+  // Non-streaming request.
+  if (!result.body.stream) {
     try {
       const text = await upstream.text();
+      let out = text;
+      if (prov.style === "openai") {
+        try { out = JSON.stringify(openAICompletionToAnthropic(JSON.parse(text), model)); } catch {}
+      }
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(text);
-    } finally {
-      clearTimeout(timeout);
-      res.off("close", abortOnDisconnect);
-    }
+      res.end(out);
+    } finally { cleanup(); }
     return;
   }
 
-  // Streaming path: pipe the SSE stream straight through to the browser.
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
+    "X-Max-Provider": prov.id,
   });
+  // Heartbeat comments keep proxies from closing the connection during long
+  // silent "thinking" phases (ignored by the browser's SSE parser).
+  const heartbeat = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 15_000);
 
+  // Gateway ignored stream:true and returned a JSON body → synthesize events.
+  if (!isSse) {
+    try {
+      const text = await upstream.text();
+      const parsed = JSON.parse(text);
+      res.write(prov.style === "openai" ? openAICompletionToSse(parsed, model) : anthropicJsonToSse(parsed));
+    } catch (err) {
+      res.write(sse("error", { type: "error", error: { message: "Unexpected response from provider: " + (err?.message || "parse error") } }));
+    } finally {
+      clearInterval(heartbeat); cleanup();
+      if (!res.writableEnded) res.end();
+    }
+    return;
+  }
+
+  const translator = prov.style === "openai" ? createOpenAIStreamTranslator(model) : null;
   try {
     const reader = upstream.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (res.writableEnded || res.destroyed) break; // client went away
-      armTimeout(); // healthy progress → reset the inactivity timer
-      // value is a Uint8Array chunk of the SSE stream
-      res.write(Buffer.from(value));
+      if (res.writableEnded || res.destroyed) break;
+      armTimeout();
+      if (translator) {
+        const out = translator.push(value);
+        if (out) res.write(out);
+      } else {
+        res.write(Buffer.from(value));
+      }
     }
+    if (translator && !res.writableEnded && !res.destroyed) res.write(translator.end());
   } catch (err) {
-    if (!controller.signal.aborted && !res.writableEnded && !res.destroyed) {
-      // best-effort error event to the client stream
-      try {
-        res.write(`event: error\ndata: ${JSON.stringify({ message: err?.message || "stream error" })}\n\n`);
-      } catch {}
+    if (st.timedOut && !res.writableEnded && !res.destroyed) {
+      try { res.write(sse("error", { type: "error", error: { message: `${prov.label} went silent for too long (timeout).` } })); } catch {}
+    } else if (!controller.signal.aborted && !res.writableEnded && !res.destroyed) {
+      try { res.write(sse("error", { type: "error", error: { message: err?.message || "stream error" } })); } catch {}
     }
   } finally {
-    clearTimeout(timeout);
-    res.off("close", abortOnDisconnect);
+    clearInterval(heartbeat);
+    cleanup();
     if (!res.writableEnded) { try { res.end(); } catch {} }
   }
+}
+
+/** Refresh the model list straight from a provider's /models endpoint. */
+async function handleModelsRefresh(req, res) {
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req, 64 * 1024)) || "{}"); } catch {}
+  const { prov, apiKey } = resolveProvider(payload);
+  if (!apiKey) return sendJson(res, 401, { error: { type: "no_api_key", message: `Add a ${prov.label} key first.` } });
+  const url = prov.style === "openai" ? `${prov.baseUrl}/models` : `${prov.baseUrl}/v1/models`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const r = await fetch(url, { headers: upstreamHeaders(prov, apiKey, false), signal: controller.signal });
+    const text = await r.text().catch(() => "");
+    let json = null; try { json = JSON.parse(text); } catch {}
+    if (!r.ok) return sendJson(res, r.status, { error: { type: mapStatusType(r.status), message: json?.error?.message || `HTTP ${r.status}` } });
+    const list = Array.isArray(json?.data) ? json.data : Array.isArray(json) ? json : [];
+    const ids = list.map((x) => (typeof x === "string" ? x : x?.id)).filter((x) => typeof x === "string" && x.length < 120);
+    return sendJson(res, 200, { ok: true, provider: prov.id, models: ids });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach ${prov.label} (${err?.cause?.code || err?.message}).` } });
+  } finally { clearTimeout(timer); }
 }
 
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
@@ -1019,6 +1151,9 @@ function isValidMessage(message) {
     if (block.type === "tool_result") {
       return typeof block.tool_use_id === "string";
     }
+    // Extended-thinking blocks must be echoed back verbatim during tool loops.
+    if (block.type === "thinking") return typeof block.thinking === "string";
+    if (block.type === "redacted_thinking") return typeof block.data === "string";
     // Document blocks (e.g. PDF sent as base64)
     if (block.type === "document") {
       return block.source?.type === "base64" &&
@@ -1098,42 +1233,32 @@ function safeBranchName(name) {
 /* ------------------------------------------------------------------ */
 async function handleTest(req, res) {
   let payload = {};
-  try {
-    payload = JSON.parse((await readBody(req)) || "{}");
-  } catch {}
-  const clientKey = CONFIG.allowClientKey ? String(payload.apiKey || "").trim() : "";
-  const apiKey = clientKey || CONFIG.apiKey;
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const { prov, apiKey } = resolveProvider(payload);
   if (!apiKey) {
-    return sendJson(res, 401, { error: { type: "no_api_key", message: "No API key configured." } });
+    return sendJson(res, 401, { error: { type: "no_api_key", message: `No ${prov.label} key configured.` } });
   }
   const model = typeof payload.model === "string" && payload.model.trim() ? payload.model.trim() : CONFIG.defaultModel;
+  const base = { model, max_tokens: 16, messages: [{ role: "user", content: "ping" }], stream: false };
+  const body = prov.style === "openai" ? buildOpenAIBody(base, {}) : base;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
+  const timer = setTimeout(() => controller.abort(), 25_000);
+  const started = Date.now();
   try {
-    const r = await fetch(`${CONFIG.baseUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        Authorization: `Bearer ${apiKey}`,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "claude-code-20250219",
-        "User-Agent": CONFIG.upstreamUserAgent,
-        "x-app": "cli",
-      },
-      body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "ping" }] }),
-      signal: controller.signal,
-    });
+    const { upstream: r } = await callUpstream(prov, apiKey, body, controller.signal, { timedOut: false });
     const text = await r.text().catch(() => "");
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { const j = JSON.parse(text); msg = j?.error?.message || j?.message || msg; } catch {}
-      return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: msg } });
+      return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: `${prov.label}: ${msg}` } });
     }
-    return sendJson(res, 200, { ok: true, model, message: "Connection OK — the provider accepted the request." });
+    return sendJson(res, 200, {
+      ok: true, provider: prov.id, model, ms: Date.now() - started,
+      message: `${prov.label} OK — ${model} answered in ${Date.now() - started} ms.`,
+    });
   } catch (err) {
     const cause = err?.cause?.code || err?.cause?.message || err?.message || "unknown error";
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach the AI provider (${cause}).` } });
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach ${prov.label} (${cause}).` } });
   } finally {
     clearTimeout(timer);
   }
@@ -1152,27 +1277,45 @@ function resolveGithub(payload) {
   };
 }
 
-async function githubApi(token, method, apiPath, body) {
-  const url = `${CONFIG.github.apiBase}${apiPath}`;
+async function githubApi(token, method, apiPath, body, opts = {}) {
+  const url = apiPath.startsWith("http") ? apiPath : `${CONFIG.github.apiBase}${apiPath}`;
+  const accept = opts.accept || "application/vnd.github+json";
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25_000);
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs || 25_000);
+  const cacheable = method === "GET" && !opts.noCache;
+  const key = cacheable ? ghCacheKey(token, url, accept) : null;
+  const cached = key ? GH_ETAG_CACHE.get(key) : null;
   try {
     const r = await fetch(url, {
       method,
       headers: {
-        Accept: "application/vnd.github+json",
+        Accept: accept,
         Authorization: `Bearer ${token}`,
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "MAX-chat",
+        ...(cached?.etag ? { "If-None-Match": cached.etag } : {}),
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
+    if (r.status === 304 && cached) {
+      // refresh LRU position
+      GH_ETAG_CACHE.delete(key); GH_ETAG_CACHE.set(key, cached);
+      // A 304 carries no Link/pagination headers — merge the cached ones back in.
+      const headers = new Headers(cached.headers || {});
+      for (const [k, v] of r.headers) headers.set(k, v);
+      return { status: cached.status, ok: true, json: cached.json, text: cached.text, headers, cached: true };
+    }
     const text = await r.text().catch(() => "");
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch {}
-    return { status: r.status, ok: r.ok, json, text };
+    const etag = r.headers.get("etag");
+    if (key && r.ok && etag && text.length < 8 * 1024 * 1024) {
+      GH_ETAG_CACHE.set(key, { etag, status: r.status, text, json, headers: Object.fromEntries(r.headers) });
+      if (GH_ETAG_CACHE.size > GH_ETAG_MAX) GH_ETAG_CACHE.delete(GH_ETAG_CACHE.keys().next().value);
+    }
+    return { status: r.status, ok: r.ok, json, text, headers: r.headers };
   } finally {
     clearTimeout(timer);
   }
@@ -1181,6 +1324,14 @@ async function githubApi(token, method, apiPath, body) {
 function ghError(res, resp, fallback) {
   let message = resp?.json?.message || resp?.text || fallback || "GitHub request failed";
   const status = resp?.status || 502;
+  const remaining = resp?.headers?.get?.("x-ratelimit-remaining");
+  if ((status === 403 || status === 429) && (remaining === "0" || /rate limit/i.test(message))) {
+    const reset = Number(resp?.headers?.get?.("x-ratelimit-reset")) * 1000;
+    const mins = reset ? Math.max(1, Math.round((reset - Date.now()) / 60000)) : null;
+    message = `GitHub API rate limit reached${mins ? ` — it resets in about ${mins} minute${mins > 1 ? "s" : ""}` : ""}. ` +
+      "MAX caches responses to minimise calls; using a personal access token raises the limit to 5,000 requests/hour.";
+    return sendJson(res, 429, { error: { type: "rate_limit", status: 429, message } });
+  }
   // GitHub returns this generic 403 when a fine-grained token is missing the
   // right permission or the repo isn't in its allowed list. Give real guidance.
   if (/resource not accessible by (personal access token|integration)/i.test(message) ||
@@ -1194,6 +1345,8 @@ function ghError(res, resp, fallback) {
       "Then paste the new token in Settings → GitHub and try again.";
   } else if (status === 401) {
     message = "GitHub rejected the token (401). It may be invalid or expired — generate a new one and paste it in Settings → GitHub.";
+  } else if (status === 404 && !resp?.json?.message) {
+    message = fallback || "Not found on GitHub (check the repository name and that your token can see it).";
   }
   return sendJson(res, status, {
     error: { type: mapStatusType(status), status, message },
@@ -1205,27 +1358,32 @@ async function handleGithubTest(req, res) {
   try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
   const gh = resolveGithub(payload);
   if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
-  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
 
   try {
     const who = await githubApi(gh.token, "GET", "/user");
     if (!who.ok) return ghError(res, who, "Token rejected by GitHub.");
-    const repo = await githubApi(gh.token, "GET", `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}`);
-    if (!repo.ok) return ghError(res, repo, "Repository not found or not accessible.");
+    const login = who.json?.login;
+    const scopes = who.headers?.get?.("x-oauth-scopes") || "";
+    const rateRemaining = who.headers?.get?.("x-ratelimit-remaining");
+    const base = { ok: true, login, name: who.json?.name || "", avatarUrl: who.json?.avatar_url || "", scopes, rateRemaining };
+    // Owner/repo are optional: without them we just validate the token.
+    if (!gh.owner || !gh.repo) {
+      return sendJson(res, 200, { ...base, message: `Connected to GitHub as ${login}. Pick a repository with the repo chip.` });
+    }
+    const repo = await githubApi(gh.token, "GET", ghRepoRoot(gh));
+    if (!repo.ok) return ghError(res, repo, `Repository ${gh.owner}/${gh.repo} not found or not accessible with this token.`);
     const canPush = repo.json?.permissions?.push !== false;
     return sendJson(res, 200, {
-      ok: true,
-      login: who.json?.login,
+      ...base,
       repo: repo.json?.full_name,
       defaultBranch: repo.json?.default_branch,
       canPush,
       message: canPush
-        ? `Connected as ${who.json?.login}. Ready to push to ${repo.json?.full_name}.`
-        : `Connected as ${who.json?.login}, but this token cannot push to ${repo.json?.full_name}.`,
+        ? `Connected as ${login}. Ready to read & push to ${repo.json?.full_name}.`
+        : `Connected as ${login}, but this token can only READ ${repo.json?.full_name} (no push permission).`,
     });
   } catch (err) {
-    const cause = err?.cause?.code || err?.message || "unknown error";
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+    return ghNetErr(res, err);
   }
 }
 
@@ -1236,32 +1394,37 @@ async function handleGithubRepos(req, res) {
   if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided. Add one in Settings." } });
 
   const q = String(payload.q || "").trim().toLowerCase();
-  const perPage = clampInt(payload.perPage, 1, 100, 100);
-  const page = clampInt(payload.page, 1, 100, 1);
+  const MAX_PAGES = 10; // up to 1,000 repositories
+  const pageUrl = (p) => `/user/repos?per_page=100&page=${p}&sort=pushed&direction=desc&affiliation=owner,collaborator,organization_member`;
 
   try {
-    const r = await githubApi(
-      gh.token,
-      "GET",
-      `/user/repos?per_page=${perPage}&page=${page}&sort=updated&affiliation=owner,collaborator,organization_member`
-    );
-    if (!r.ok) return ghError(res, r, "Could not list repositories.");
-    const list = Array.isArray(r.json) ? r.json : [];
-    let repos = list.map((x) => ({
-      fullName: x.full_name,
-      owner: x.owner?.login || "",
-      name: x.name,
-      private: Boolean(x.private),
-      defaultBranch: x.default_branch || "main",
-      description: x.description || "",
-      updatedAt: x.updated_at || null,
-      canPush: x.permissions ? x.permissions.push !== false : true,
-    }));
-    if (q) repos = repos.filter((x) => x.fullName.toLowerCase().includes(q) || (x.description || "").toLowerCase().includes(q));
-    return sendJson(res, 200, { ok: true, repos, page, hasMore: list.length === perPage });
+    const first = await githubApi(gh.token, "GET", pageUrl(1));
+    if (!first.ok) return ghError(res, first, "Could not list repositories.");
+    let list = Array.isArray(first.json) ? first.json.slice() : [];
+    // Use the Link header to fetch the remaining pages in parallel.
+    const link = first.headers?.get?.("link") || "";
+    const last = Number((link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/) || [])[1] || 1);
+    const pages = Math.min(MAX_PAGES, last);
+    if (pages > 1) {
+      const rest = await Promise.all(
+        Array.from({ length: pages - 1 }, (_, i) => githubApi(gh.token, "GET", pageUrl(i + 2)).catch(() => null)));
+      for (const r of rest) if (r?.ok && Array.isArray(r.json)) list = list.concat(r.json);
+    }
+    let repos = list.map(mapGhRepo);
+    const seen = new Set(repos.map((r) => r.fullName.toLowerCase()));
+
+    if (q) {
+      repos = repos.filter((x) => x.fullName.toLowerCase().includes(q) || (x.description || "").toLowerCase().includes(q));
+      // "owner/repo" typed directly → look it up (works for any public repo too).
+      const direct = q.replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/+$/, "");
+      if (/^[\w.-]+\/[\w.-]+$/.test(direct) && !seen.has(direct)) {
+        const r = await githubApi(gh.token, "GET", `/repos/${direct.split("/").map(encodeURIComponent).join("/")}`);
+        if (r.ok && r.json?.full_name) repos.unshift(mapGhRepo(r.json));
+      }
+    }
+    return sendJson(res, 200, { ok: true, repos, total: list.length, truncated: last > MAX_PAGES, fetchedAt: Date.now() });
   } catch (err) {
-    const cause = err?.cause?.code || err?.message || "unknown error";
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+    return ghNetErr(res, err);
   }
 }
 
@@ -1319,6 +1482,66 @@ async function handleGithubPush(req, res) {
   }
 }
 
+// Conditional-request cache for GitHub GETs. GitHub answers If-None-Match with
+// 304 Not Modified (which does NOT count against the rate limit), so we can
+// re-check repos/trees/files on every chat and still always be fresh + fast.
+const GH_ETAG_CACHE = new Map(); // key -> { etag, status, text, json, headers }
+
+const GH_ETAG_MAX = 400;
+
+function ghCacheKey(token, url, accept) {
+  return crypto.createHash("sha256").update(`${token}\n${accept}\n${url}`).digest("hex");
+}
+
+const ghNetErr = (res, err) => sendJson(res, 502, {
+  error: { type: "network", message: `Could not reach GitHub (${err?.cause?.code || err?.name === "AbortError" && "timeout" || err?.message || "unknown error"}).` },
+});
+
+const ghRepoRoot = (gh) => `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}`;
+
+function mapGhRepo(x) {
+  return {
+    fullName: x.full_name,
+    owner: x.owner?.login || "",
+    name: x.name,
+    private: Boolean(x.private),
+    defaultBranch: x.default_branch || "main",
+    description: x.description || "",
+    updatedAt: x.pushed_at || x.updated_at || null,
+    language: x.language || "",
+    fork: Boolean(x.fork),
+    archived: Boolean(x.archived),
+    canPush: x.permissions ? x.permissions.push !== false : true,
+  };
+}
+
+async function handleGithubBranches(req, res) {
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gh = resolveGithub(payload);
+  if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
+  if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
+  try {
+    let branches = [];
+    for (let page = 1; page <= 3; page++) {
+      const r = await githubApi(gh.token, "GET", `${ghRepoRoot(gh)}/branches?per_page=100&page=${page}`);
+      if (!r.ok) { if (page === 1) return ghError(res, r, "Could not list branches."); break; }
+      const list = Array.isArray(r.json) ? r.json : [];
+      branches = branches.concat(list.map((b) => ({ name: b.name, protected: Boolean(b.protected), sha: b.commit?.sha || "" })));
+      if (list.length < 100) break;
+    }
+    return sendJson(res, 200, { ok: true, branches });
+  } catch (err) {
+    return ghNetErr(res, err);
+  }
+}
+
+function looksBinary(buf) {
+  const n = Math.min(buf.length, 8000);
+  for (let i = 0; i < n; i++) if (buf[i] === 0) return true;
+  return false;
+}
+
 function sanitizeRepoPath(p) {
   return String(p || "").trim().replace(/^\/+/, "").split("/")
     .filter((seg) => seg && seg !== "." && seg !== "..").join("/");
@@ -1332,17 +1555,19 @@ async function handleGithubTree(req, res) {
   if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
 
   try {
-    const r = await githubApi(gh.token, "GET",
-      `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/git/trees/${encodeURIComponent(gh.branch)}?recursive=1`);
-    if (!r.ok) return ghError(res, r, "Could not read the repository tree.");
+    const r = await githubApi(gh.token, "GET", `${ghRepoRoot(gh)}/git/trees/${encodeURIComponent(gh.branch)}?recursive=1`);
+    if (r.status === 409) return sendJson(res, 200, { ok: true, branch: gh.branch, sha: "", files: [], empty: true });
+    if (!r.ok) return ghError(res, r, `Could not read the repository tree for branch "${gh.branch}".`);
     const files = (r.json?.tree || [])
       .filter((t) => t.type === "blob")
       .slice(0, MAX_TREE_ENTRIES)
       .map((t) => ({ path: t.path, size: t.size || 0 }));
-    return sendJson(res, 200, { ok: true, branch: gh.branch, truncated: Boolean(r.json?.truncated), files });
+    return sendJson(res, 200, {
+      ok: true, branch: gh.branch, sha: r.json?.sha || "", truncated: Boolean(r.json?.truncated) || (r.json?.tree || []).length > MAX_TREE_ENTRIES,
+      files, cached: Boolean(r.cached),
+    });
   } catch (err) {
-    const cause = err?.cause?.code || err?.message || "unknown error";
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+    return ghNetErr(res, err);
   }
 }
 
@@ -1356,21 +1581,28 @@ async function handleGithubFile(req, res) {
   if (!filePath) return sendJson(res, 400, { error: { type: "bad_request", message: "A file path is required." } });
 
   const enc = filePath.split("/").map(encodeURIComponent).join("/");
+  const url = `${ghRepoRoot(gh)}/contents/${enc}?ref=${encodeURIComponent(gh.branch)}`;
   try {
-    const r = await githubApi(gh.token, "GET",
-      `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/contents/${enc}?ref=${encodeURIComponent(gh.branch)}`);
-    if (!r.ok) return ghError(res, r, "Could not read the file.");
+    const r = await githubApi(gh.token, "GET", url);
+    if (!r.ok) return ghError(res, r, `Could not read ${filePath} (not found on branch "${gh.branch}").`);
     if (Array.isArray(r.json)) return sendJson(res, 400, { error: { type: "bad_request", message: "That path is a directory, not a file." } });
     const size = r.json?.size || 0;
     if (size > MAX_FILE_BYTES) return sendJson(res, 413, { error: { type: "too_large", message: `File is too large to load (${Math.round(size / 1024)} KB, limit ${Math.round(MAX_FILE_BYTES / 1024)} KB).` } });
-    if (r.json?.encoding !== "base64" || typeof r.json?.content !== "string") {
-      return sendJson(res, 415, { error: { type: "unsupported", message: "This file type can't be loaded as text." } });
+    let buf;
+    if (r.json?.encoding === "base64" && typeof r.json?.content === "string" && (r.json.content || size === 0)) {
+      buf = Buffer.from(r.json.content, "base64");
+    } else {
+      // Files > 1 MB come back with encoding "none" — fetch the raw bytes instead.
+      const raw = await githubApi(gh.token, "GET", url, null, { accept: "application/vnd.github.raw" });
+      if (!raw.ok) return ghError(res, raw, "Could not read the file.");
+      buf = Buffer.from(raw.text || "", "utf8");
     }
-    const text = Buffer.from(r.json.content, "base64").toString("utf8");
-    return sendJson(res, 200, { ok: true, path: filePath, size, content: text });
+    if (looksBinary(buf)) {
+      return sendJson(res, 415, { error: { type: "unsupported", message: `${filePath} is a binary file (${Math.round(size / 1024)} KB) and can't be loaded as text.` } });
+    }
+    return sendJson(res, 200, { ok: true, path: filePath, size, sha: r.json?.sha || "", content: buf.toString("utf8") });
   } catch (err) {
-    const cause = err?.cause?.code || err?.message || "unknown error";
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+    return ghNetErr(res, err);
   }
 }
 
@@ -1404,11 +1636,13 @@ async function gitlabApi(token, method, apiPath, body) {
     });
     const text = await r.text().catch(() => "");
     let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
-    return { status: r.status, ok: r.ok, json, text };
+    return { status: r.status, ok: r.ok, json, text, headers: r.headers };
   } finally {
     clearTimeout(timer);
   }
 }
+
+// Follow GitLab's x-next-page header across pages.
 
 function glError(res, resp, fallback) {
   const message = resp?.json?.message || resp?.json?.error || resp?.text || fallback || "GitLab request failed";
@@ -1435,10 +1669,10 @@ async function handleGitlabRepos(req, res) {
   if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
   const q = String(payload.q || "").trim();
   try {
-    const r = await gitlabApi(gl.token, "GET",
-      `/projects?membership=true&simple=true&per_page=100&order_by=last_activity_at${q ? `&search=${encodeURIComponent(q)}` : ""}`);
-    if (!r.ok) return glError(res, r, "Could not list projects.");
-    const repos = (Array.isArray(r.json) ? r.json : []).map((p) => ({
+    const r = await gitlabAll(gl.token,
+      `/projects?membership=true&simple=true&order_by=last_activity_at${q ? `&search=${encodeURIComponent(q)}` : ""}`, 5);
+    if (r.error) return glError(res, r.error, "Could not list projects.");
+    const repos = r.items.map((p) => ({
       id: p.id,
       fullName: p.path_with_namespace,
       owner: p.namespace?.full_path || p.namespace?.path || "",
@@ -1446,8 +1680,9 @@ async function handleGitlabRepos(req, res) {
       private: p.visibility !== "public",
       defaultBranch: p.default_branch || "main",
       description: p.description || "",
+      updatedAt: p.last_activity_at || null,
     }));
-    return sendJson(res, 200, { ok: true, repos });
+    return sendJson(res, 200, { ok: true, repos, truncated: r.more, fetchedAt: Date.now() });
   } catch (err) {
     return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
   }
@@ -1459,14 +1694,45 @@ async function handleGitlabTree(req, res) {
   if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
   if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
   try {
-    const r = await gitlabApi(gl.token, "GET",
-      `/projects/${glProjectPath(gl.projectId)}/repository/tree?recursive=true&per_page=100&ref=${encodeURIComponent(gl.branch)}`);
-    if (!r.ok) return glError(res, r, "Could not read the repository tree.");
-    const files = (Array.isArray(r.json) ? r.json : [])
+    const r = await gitlabAll(gl.token,
+      `/projects/${glProjectPath(gl.projectId)}/repository/tree?recursive=true&ref=${encodeURIComponent(gl.branch)}`,
+      Math.ceil(MAX_TREE_ENTRIES / 100));
+    if (r.error) {
+      if (r.error.status === 404) return sendJson(res, 200, { ok: true, branch: gl.branch, files: [], empty: true });
+      return glError(res, r.error, "Could not read the repository tree.");
+    }
+    const files = r.items
       .filter((t) => t.type === "blob")
       .slice(0, MAX_TREE_ENTRIES)
       .map((t) => ({ path: t.path, size: 0 }));
-    return sendJson(res, 200, { ok: true, branch: gl.branch, files });
+    return sendJson(res, 200, { ok: true, branch: gl.branch, files, truncated: r.more });
+  } catch (err) {
+    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+  }
+}
+
+async function gitlabAll(token, apiPath, maxPages) {
+  let out = [];
+  let page = 1;
+  for (let i = 0; i < maxPages && page; i++) {
+    const sep = apiPath.includes("?") ? "&" : "?";
+    const r = await gitlabApi(token, "GET", `${apiPath}${sep}per_page=100&page=${page}`);
+    if (!r.ok) { if (i === 0) return { error: r }; break; }
+    if (Array.isArray(r.json)) out = out.concat(r.json);
+    page = Number(r.headers?.get?.("x-next-page")) || 0;
+  }
+  return { items: out, more: Boolean(page) };
+}
+
+async function handleGitlabBranches(req, res) {
+  let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
+  const gl = resolveGitlab(payload);
+  if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
+  if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
+  try {
+    const r = await gitlabAll(gl.token, `/projects/${glProjectPath(gl.projectId)}/repository/branches`, 3);
+    if (r.error) return glError(res, r.error, "Could not list branches.");
+    return sendJson(res, 200, { ok: true, branches: r.items.map((b) => ({ name: b.name, protected: Boolean(b.protected), sha: b.commit?.id || "" })) });
   } catch (err) {
     return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
   }
@@ -1525,6 +1791,8 @@ async function handleGitlabPush(req, res) {
 /* ------------------------------------------------------------------ */
 /*  Edit → commit → PR/MR (GitHub + GitLab)                            */
 /* ------------------------------------------------------------------ */
+// One atomic commit for any number of files via the Git Data API
+// (blobs → tree → commit → ref) — much faster than one commit per file.
 async function handleGithubCommit(req, res) {
   let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {
     return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
@@ -1536,53 +1804,65 @@ async function handleGithubCommit(req, res) {
   if (!files) return sendJson(res, 400, { error: { type: "bad_request", message: "files must be a non-empty array of { path, content } within the size limit." } });
 
   const base = gh.branch;
-  const newBranch = safeBranchName(payload.newBranch || defaultBranchName());
+  const target = safeBranchName(payload.newBranch || defaultBranchName());
   const message = String(payload.message || `MAX edit: ${files.map((f) => f.path).join(", ")}`).slice(0, 500);
-  const repoRoot = `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}`;
+  const root = ghRepoRoot(gh);
+  const refPath = (b) => `${root}/git/ref/heads/${b.split("/").map(encodeURIComponent).join("/")}`;
 
   try {
-    // Resolve base branch head SHA.
-    const ref = await githubApi(gh.token, "GET", `${repoRoot}/git/ref/heads/${encodeURIComponent(base)}`);
-    if (!ref.ok) return ghError(res, ref, `Could not find base branch "${base}".`);
-    const baseSha = ref.json?.object?.sha;
-
-    // Create the working branch if it doesn't already exist.
-    if (newBranch !== base) {
-      const exists = await githubApi(gh.token, "GET", `${repoRoot}/git/ref/heads/${encodeURIComponent(newBranch)}`);
-      if (!exists.ok) {
-        const create = await githubApi(gh.token, "POST", `${repoRoot}/git/refs`, { ref: `refs/heads/${newBranch}`, sha: baseSha });
-        if (!create.ok) return ghError(res, create, "Could not create the working branch.");
-      }
+    const baseRef = await githubApi(gh.token, "GET", refPath(base), null, { noCache: true });
+    if (!baseRef.ok) return ghError(res, baseRef, `Could not find base branch "${base}".`);
+    let parentSha = baseRef.json?.object?.sha;
+    let targetExists = target === base;
+    if (target !== base) {
+      const t = await githubApi(gh.token, "GET", refPath(target), null, { noCache: true });
+      if (t.ok) { targetExists = true; parentSha = t.json?.object?.sha || parentSha; }
     }
 
-    // Commit each file to the working branch (writes and deletions).
+    const parent = await githubApi(gh.token, "GET", `${root}/git/commits/${parentSha}`);
+    if (!parent.ok) return ghError(res, parent, "Could not read the branch head commit.");
+    const baseTree = parent.json?.tree?.sha;
+
+    // Existing paths (for safe deletions + preserving executable modes).
+    const modes = new Map();
+    let treeTruncated = false;
+    const tree = await githubApi(gh.token, "GET", `${root}/git/trees/${baseTree}?recursive=1`);
+    if (tree.ok) {
+      treeTruncated = Boolean(tree.json?.truncated);
+      for (const t of tree.json?.tree || []) if (t.type === "blob") modes.set(t.path, t.mode);
+    }
+
+    const entries = [];
     const committed = [];
     for (const f of files) {
-      const enc = f.path.split("/").map(encodeURIComponent).join("/");
-      const cbase = `${repoRoot}/contents/${enc}`;
-      let sha;
-      const ex = await githubApi(gh.token, "GET", `${cbase}?ref=${encodeURIComponent(newBranch)}`);
-      if (ex.ok && ex.json && !Array.isArray(ex.json)) sha = ex.json.sha;
-
       if (f.deleted) {
-        // Nothing to delete if it doesn't exist on the branch — skip quietly.
-        if (!sha) { committed.push({ path: f.path, deleted: true, skipped: true }); continue; }
-        const del = await githubApi(gh.token, "DELETE", cbase, { message, branch: newBranch, sha });
-        if (!del.ok) return ghError(res, del, `Failed to delete ${f.path}.`);
+        if (!modes.has(f.path) && !treeTruncated) { committed.push({ path: f.path, deleted: true, skipped: true }); continue; }
+        entries.push({ path: f.path, mode: modes.get(f.path) || "100644", type: "blob", sha: null });
         committed.push({ path: f.path, deleted: true });
-        continue;
+      } else {
+        entries.push({ path: f.path, mode: modes.get(f.path) || "100644", type: "blob", content: f.content });
+        committed.push({ path: f.path, updated: modes.has(f.path) });
       }
-
-      const put = await githubApi(gh.token, "PUT", cbase, {
-        message, branch: newBranch, content: Buffer.from(f.content, "utf8").toString("base64"), ...(sha ? { sha } : {}),
-      });
-      if (!put.ok) return ghError(res, put, `Failed to write ${f.path}.`);
-      committed.push({ path: f.path, updated: Boolean(sha) });
     }
-    return sendJson(res, 200, { ok: true, provider: "github", branch: newBranch, base, files: committed,
-      message: `Committed ${committed.length} file(s) to ${gh.owner}/${gh.repo}@${newBranch}.` });
+    if (!entries.length) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to commit (the files to delete don't exist)." } });
+
+    const newTree = await githubApi(gh.token, "POST", `${root}/git/trees`, { base_tree: baseTree, tree: entries });
+    if (!newTree.ok) return ghError(res, newTree, "Could not create the commit tree.");
+    const commit = await githubApi(gh.token, "POST", `${root}/git/commits`, { message, tree: newTree.json.sha, parents: [parentSha] });
+    if (!commit.ok) return ghError(res, commit, "Could not create the commit.");
+
+    const upd = targetExists
+      ? await githubApi(gh.token, "PATCH", `${root}/git/refs/heads/${target.split("/").map(encodeURIComponent).join("/")}`, { sha: commit.json.sha, force: false })
+      : await githubApi(gh.token, "POST", `${root}/git/refs`, { ref: `refs/heads/${target}`, sha: commit.json.sha });
+    if (!upd.ok) return ghError(res, upd, targetExists ? `Could not push to "${target}" (the branch may have moved — try again).` : "Could not create the working branch.");
+
+    return sendJson(res, 200, {
+      ok: true, provider: "github", branch: target, base, files: committed,
+      commitSha: commit.json.sha, commitUrl: commit.json.html_url || `https://github.com/${gh.owner}/${gh.repo}/commit/${commit.json.sha}`,
+      message: `Committed ${committed.filter((c) => !c.skipped).length} file(s) to ${gh.owner}/${gh.repo}@${target} in one commit.`,
+    });
   } catch (err) {
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${err?.cause?.code || err?.message}).` } });
+    return ghNetErr(res, err);
   }
 }
 
@@ -1792,8 +2072,8 @@ const server = http.createServer(async (req, res) => {
   res.on("error", (err) => console.warn("[MAX] response stream error:", err?.code || err?.message));
   req.on("error", (err) => console.warn("[MAX] request stream error:", err?.code || err?.message));
 
-  applySecurityHeaders(res);
   const { pathname } = new URL(req.url, "http://x");
+  applySecurityHeaders(res, pathname);
 
   try {
     // ---- Auth routes (always open) ----
@@ -1870,6 +2150,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === "/api/github/file" && req.method === "POST") {
       return await handleGithubFile(req, res);
+    }
+    if (pathname === "/api/github/branches" && req.method === "POST") {
+      return await handleGithubBranches(req, res);
+    }
+    if (pathname === "/api/gitlab/branches" && req.method === "POST") {
+      return await handleGitlabBranches(req, res);
+    }
+    if (pathname === "/api/models/refresh" && req.method === "POST") {
+      return await handleModelsRefresh(req, res);
     }
     if (pathname === "/api/gitlab/test" && req.method === "POST") {
       return await handleGitlabTest(req, res);
@@ -1961,9 +2250,10 @@ server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`│  MAX is running`);
   console.log(`│  ▶  http://${CONFIG.host}:${CONFIG.port}`);
   console.log(`│`);
-  console.log(`│  Server API key : ${CONFIG.apiKey ? "loaded ✓" : "NOT set (use Settings in the UI, or .env)"}`);
-  console.log(`│  Upstream       : ${CONFIG.baseUrl}/v1/messages`);
-  console.log(`│  Default model  : ${CONFIG.defaultModel}`);
+  for (const p of Object.values(PROVIDERS)) {
+    console.log(`│  ${p.label.padEnd(15)}: ${p.key ? "key loaded ✓" : "no server key (paste in Settings)"} → ${providerEndpoint(p)}`);
+  }
+  console.log(`│  Default model  : ${CONFIG.defaultModel} (${CONFIG.defaultProvider})`);
   console.log(`│  Rate limit     : ${CONFIG.rateLimitPerMin || "off"} req/min per IP`);
   console.log(`│  Timeout        : ${CONFIG.upstreamTimeoutMs} ms`);
   console.log(`│  GitHub token   : ${CONFIG.github.token ? "loaded ✓" : "not set (add in Settings, or .env)"}`);
