@@ -578,6 +578,7 @@ function _revokeToken(token) {
     const exp = data.exp || Date.now() + CONFIG.auth.sessionTtlHours * 3600_000;
     const payloadHash = crypto.createHash("sha256").update(payload).digest("hex");
     _revokedTokens.set(payloadHash, exp);
+    persistRevokedTokens();
   } catch {}
 }
 
