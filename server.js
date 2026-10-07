@@ -13,10 +13,12 @@
 
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import dns from "node:dns/promises";
+import net from "node:net";
 import {
   buildAnthropicBody, buildOpenAIBody, downgradeBody, createOpenAIStreamTranslator,
   openAICompletionToSse, openAICompletionToAnthropic, normalizeEffort, sse,
@@ -127,6 +129,57 @@ const CONFIG = {
 const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_BYTES || "524288", 10); // 512 KB
 const MAX_TREE_ENTRIES = 4000;
 const MAX_FETCH_BYTES = 2 * 1024 * 1024; // 2 MB cap on fetched web pages
+const MAX_LIST_FILES = 1000;
+
+/* ------------------------------------------------------------------ */
+/*  Structured JSON logger + graceful shutdown                         */
+/* ------------------------------------------------------------------ */
+function log(level, msg, meta = {}) {
+  const line = JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta });
+  try { console.log(line); } catch {}
+  try {
+    ensureDataDir();
+    appendFileSync(path.join(DATA_DIR, "app.log"), line + "\n");
+  } catch {}
+}
+
+/* ------------------------------------------------------------------ */
+/*  SSRF protection: block private IP ranges after DNS lookup          */
+/* ------------------------------------------------------------------ */
+function isPrivateIP(ip) {
+  if (!net.isIP(ip)) return false;
+  if (net.isIPv4(ip)) {
+    const p = ip.split(".").map(Number);
+    if (p[0] === 127) return true;
+    if (p[0] === 10) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 0) return true;
+    if (p[0] === 169 && p[1] === 254) return true;
+  } else {
+    if (ip === "::1") return true;
+    if (ip.startsWith("fc") || ip.startsWith("fd")) return true;
+    if (ip.startsWith("fe80:")) return true;
+    if (ip === "::") return true;
+  }
+  return false;
+}
+async function assertSafeUrl(urlStr) {
+  let u;
+  try { u = new URL(urlStr); } catch { throw new Error("Invalid URL"); }
+  if (!["http:", "https:"].includes(u.protocol)) throw new Error("Only http/https allowed");
+  const host = u.hostname;
+  if (host === "localhost" || host === "metadata.google.internal") throw new Error("Blocked host");
+  // DNS lookup and check all resolved IPs
+  try {
+    const addrs = await dns.lookup(host, { all: true });
+    for (const a of addrs) if (isPrivateIP(a.address)) throw new Error("Blocked private IP: " + a.address);
+  } catch (e) {
+    if (String(e.message).includes("Blocked")) throw e;
+    // If DNS fails, block if hostname is literal private IP
+    if (isPrivateIP(host)) throw new Error("Blocked private IP");
+  }
+}
 
 // Powers catalog. `status: "available"` powers work in MAX right now; the rest are
 // catalog entries you can wire up to their real backends (they open Details/links).
