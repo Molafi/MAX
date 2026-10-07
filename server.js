@@ -544,14 +544,30 @@ function ensureSuperAdmin() {
 let BOOTSTRAP_NOTICE = "";
 
 /* ---------- session tokens (stateless, HMAC-signed) ---------- */
-// In-memory revocation map: key = payloadHash, value = exp timestamp.
+// Persistent revocation map: key = payloadHash, value = exp timestamp.
+const REVOKED_FILE = path.join(DATA_DIR, "revoked.json");
 const _revokedTokens = new Map();
-// Periodically clean expired entries every 10 minutes.
+function loadRevokedTokens() {
+  try {
+    if (existsSync(REVOKED_FILE)) {
+      const arr = JSON.parse(readFileSync(REVOKED_FILE, "utf8"));
+      if (Array.isArray(arr)) for (const [h, exp] of arr) if (exp > Date.now()) _revokedTokens.set(h, exp);
+    }
+  } catch {}
+}
+function persistRevokedTokens() {
+  try {
+    ensureDataDir();
+    writeFileSync(REVOKED_FILE, JSON.stringify([..._revokedTokens.entries()]), { mode: 0o600 });
+  } catch {}
+}
+loadRevokedTokens();
+// Periodically clean expired entries every 10 minutes and persist.
 setInterval(() => {
   const now = Date.now();
-  for (const [hash, exp] of _revokedTokens) {
-    if (now > exp) _revokedTokens.delete(hash);
-  }
+  let changed = false;
+  for (const [hash, exp] of _revokedTokens) if (now > exp) { _revokedTokens.delete(hash); changed = true; }
+  if (changed) persistRevokedTokens();
 }, 10 * 60_000).unref();
 
 function _revokeToken(token) {
