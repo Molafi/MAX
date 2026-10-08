@@ -19,6 +19,59 @@
   let CC_SESSION_KEY = "max.ccKey.session.v1";
   const DONE_MARKER = "[[MAX_DONE]]";
 
+  /* ---------- Fix #9: listing timeout helper — never hang spinner >15s ---------- */
+  const LISTING_TIMEOUT_MS = 15000;
+  function withListingTimeout(promise, ms = LISTING_TIMEOUT_MS, controller) {
+    let t;
+    const timeout = new Promise((_, rej) => {
+      t = setTimeout(() => {
+        try { controller?.abort(); } catch {}
+        rej(new Error("Listing timed out after " + ms + "ms"));
+      }, ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+  }
+  function clearListingSpinner() {
+    const el = document.getElementById("tree-content");
+    if (el && el.querySelector(".spinner")) {
+      const sp = el.querySelector(".spinner");
+      if (sp) sp.remove();
+    }
+    const btn = document.getElementById("tree-btn");
+    if (btn) btn.disabled = false;
+  }
+  // Global failsafe: if #tree-content ever shows a spinner for >15s, auto-clear it
+  // and show a retry prompt. This works even if the original loadTree() forgets
+  // to clear on error/timeout — MAX's autonomous loop keeps running unaffected.
+  let _listingTimer = null;
+  function armListingFailsafe() {
+    clearTimeout(_listingTimer);
+    _listingTimer = setTimeout(() => {
+      const el = document.getElementById("tree-content");
+      if (!el) return;
+      const spinning = el.querySelector(".spinner, [class*='spin'], .loading");
+      if (!spinning) return;
+      clearListingSpinner();
+      if (!el.querySelector(".listing-retry")) {
+        const retry = document.createElement("div");
+        retry.className = "listing-retry";
+        retry.style.cssText = "padding:16px;text-align:center;color:var(--text-muted);font-size:13px";
+        retry.innerHTML = `<p>Listing failed or timed out.</p><button class="btn btn--primary btn--sm" onclick="window.__maxRetryListing&&window.__maxRetryListing()">[Failed - Retry]</button>`;
+        el.appendChild(retry);
+      }
+      const label = document.getElementById("tree-status");
+      if (label) label.textContent = "Listing timed out — click Retry";
+    }, LISTING_TIMEOUT_MS);
+  }
+  function disarmListingFailsafe() { clearTimeout(_listingTimer); clearListingSpinner(); }
+  // Hook into tree overlay open/close if present
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#tree-btn")) armListingFailsafe();
+    if (e.target.closest("#tree-close")) disarmListingFailsafe();
+  });
+  // Expose for manual retry from retry button or console
+  try { window.__maxRetryListing = () => location.reload(); } catch {}
+
   /* ---------- Skills catalog ---------- */
   const SKILLS_CATALOG = [
     {
