@@ -13,12 +13,10 @@
 
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, appendFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
-import dns from "node:dns/promises";
-import net from "node:net";
 import {
   buildAnthropicBody, buildOpenAIBody, downgradeBody, createOpenAIStreamTranslator,
   openAICompletionToSse, openAICompletionToAnthropic, normalizeEffort, sse,
@@ -129,62 +127,6 @@ const CONFIG = {
 const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_BYTES || "524288", 10); // 512 KB
 const MAX_TREE_ENTRIES = 4000;
 const MAX_FETCH_BYTES = 2 * 1024 * 1024; // 2 MB cap on fetched web pages
-const MAX_LIST_FILES = 1000;
-// Prevent re-reading entire repo on every turn (Fix #6 + #7 + #9):
-// - Cache file listings for 30s so MAX never hammers GitHub/GitLab each message
-// - Chat only sends basket/diff, truncated to 512KB, keeps last 10 msgs full
-const REPO_CACHE_TTL_MS = 30000;
-const repoCache = new Map(); // key: owner/repo/branch:path -> { at, files }
-
-/* ------------------------------------------------------------------ */
-/*  Structured JSON logger + graceful shutdown                         */
-/* ------------------------------------------------------------------ */
-function log(level, msg, meta = {}) {
-  const line = JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta });
-  try { console.log(line); } catch {}
-  try {
-    ensureDataDir();
-    appendFileSync(path.join(DATA_DIR, "app.log"), line + "\n");
-  } catch {}
-}
-
-/* ------------------------------------------------------------------ */
-/*  SSRF protection: block private IP ranges after DNS lookup          */
-/* ------------------------------------------------------------------ */
-function isPrivateIP(ip) {
-  if (!net.isIP(ip)) return false;
-  if (net.isIPv4(ip)) {
-    const p = ip.split(".").map(Number);
-    if (p[0] === 127) return true;
-    if (p[0] === 10) return true;
-    if (p[0] === 192 && p[1] === 168) return true;
-    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
-    if (p[0] === 0) return true;
-    if (p[0] === 169 && p[1] === 254) return true;
-  } else {
-    if (ip === "::1") return true;
-    if (ip.startsWith("fc") || ip.startsWith("fd")) return true;
-    if (ip.startsWith("fe80:")) return true;
-    if (ip === "::") return true;
-  }
-  return false;
-}
-async function assertSafeUrl(urlStr) {
-  let u;
-  try { u = new URL(urlStr); } catch { throw new Error("Invalid URL"); }
-  if (!["http:", "https:"].includes(u.protocol)) throw new Error("Only http/https allowed");
-  const host = u.hostname;
-  if (host === "localhost" || host === "metadata.google.internal") throw new Error("Blocked host");
-  // DNS lookup and check all resolved IPs
-  try {
-    const addrs = await dns.lookup(host, { all: true });
-    for (const a of addrs) if (isPrivateIP(a.address)) throw new Error("Blocked private IP: " + a.address);
-  } catch (e) {
-    if (String(e.message).includes("Blocked")) throw e;
-    // If DNS fails, block if hostname is literal private IP
-    if (isPrivateIP(host)) throw new Error("Blocked private IP");
-  }
-}
 
 // Powers catalog. `status: "available"` powers work in MAX right now; the rest are
 // catalog entries you can wire up to their real backends (they open Details/links).
@@ -549,30 +491,14 @@ function ensureSuperAdmin() {
 let BOOTSTRAP_NOTICE = "";
 
 /* ---------- session tokens (stateless, HMAC-signed) ---------- */
-// Persistent revocation map: key = payloadHash, value = exp timestamp.
-const REVOKED_FILE = path.join(DATA_DIR, "revoked.json");
+// In-memory revocation map: key = payloadHash, value = exp timestamp.
 const _revokedTokens = new Map();
-function loadRevokedTokens() {
-  try {
-    if (existsSync(REVOKED_FILE)) {
-      const arr = JSON.parse(readFileSync(REVOKED_FILE, "utf8"));
-      if (Array.isArray(arr)) for (const [h, exp] of arr) if (exp > Date.now()) _revokedTokens.set(h, exp);
-    }
-  } catch {}
-}
-function persistRevokedTokens() {
-  try {
-    ensureDataDir();
-    writeFileSync(REVOKED_FILE, JSON.stringify([..._revokedTokens.entries()]), { mode: 0o600 });
-  } catch {}
-}
-loadRevokedTokens();
-// Periodically clean expired entries every 10 minutes and persist.
+// Periodically clean expired entries every 10 minutes.
 setInterval(() => {
   const now = Date.now();
-  let changed = false;
-  for (const [hash, exp] of _revokedTokens) if (now > exp) { _revokedTokens.delete(hash); changed = true; }
-  if (changed) persistRevokedTokens();
+  for (const [hash, exp] of _revokedTokens) {
+    if (now > exp) _revokedTokens.delete(hash);
+  }
 }, 10 * 60_000).unref();
 
 function _revokeToken(token) {
@@ -583,7 +509,6 @@ function _revokeToken(token) {
     const exp = data.exp || Date.now() + CONFIG.auth.sessionTtlHours * 3600_000;
     const payloadHash = crypto.createHash("sha256").update(payload).digest("hex");
     _revokedTokens.set(payloadHash, exp);
-    persistRevokedTokens();
   } catch {}
 }
 
