@@ -19,6 +19,33 @@
   let CC_SESSION_KEY = "max.ccKey.session.v1";
   const DONE_MARKER = "[[MAX_DONE]]";
 
+  /* ---------- Fix #1: Standalone Chat Mode - repo 100% OPTIONAL ---------- */
+  function updateStandaloneBadge(){
+    const hasRepo = !!((state.settings.github && state.settings.github.owner && state.settings.github.repo) || (state.settings.gitlab && state.settings.gitlab.token));
+    let badge = document.getElementById("standalone-badge");
+    if(!hasRepo){
+      if(!badge){
+        const c = document.querySelector(".topbar__center");
+        if(c){
+          badge=document.createElement("span");
+          badge.id="standalone-badge";
+          badge.textContent="Standalone Chat Mode";
+          badge.style.cssText="font-size:11px;padding:3px 8px;border-radius:999px;background:rgba(52,211,153,.15);color:#34d399;border:1px solid rgba(52,211,153,.3);margin-left:8px";
+          c.appendChild(badge);
+        }
+      }
+      if(badge) badge.hidden=false;
+    } else if(badge) badge.hidden=true;
+    const cb=document.getElementById("commit-btn"), pb=document.getElementById("push-btn"), tb=document.getElementById("tree-btn");
+    if(cb) cb.disabled=!hasRepo;
+    if(pb) pb.disabled=!hasRepo;
+    // Never disable composer/model picker when repo=null - standalone chat must work
+    const sb=document.getElementById("send-btn"), inp=document.getElementById("input"), mp=document.getElementById("model-pill");
+    if(inp) inp.disabled=false;
+    if(mp) mp.disabled=false;
+    try{ if(typeof updateSendState==="function") updateSendState(); }catch{}
+  }
+  try{ document.addEventListener("DOMContentLoaded", ()=>{ updateStandaloneBadge(); setTimeout(updateStandaloneBadge,800); }); setInterval(updateStandaloneBadge,1500);}catch{}
   /* ---------- Fix #9: listing timeout helper — never hang spinner >15s ---------- */
   const LISTING_TIMEOUT_MS = 15000;
   function withListingTimeout(promise, ms = LISTING_TIMEOUT_MS, controller) {
