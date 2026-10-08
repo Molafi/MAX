@@ -130,6 +130,11 @@ const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_BYTES || "524288", 10); // 
 const MAX_TREE_ENTRIES = 4000;
 const MAX_FETCH_BYTES = 2 * 1024 * 1024; // 2 MB cap on fetched web pages
 const MAX_LIST_FILES = 1000;
+// Prevent re-reading entire repo on every turn (Fix #6 + #7 + #9):
+// - Cache file listings for 30s so MAX never hammers GitHub/GitLab each message
+// - Chat only sends basket/diff, truncated to 512KB, keeps last 10 msgs full
+const REPO_CACHE_TTL_MS = 30000;
+const repoCache = new Map(); // key: owner/repo/branch:path -> { at, files }
 
 /* ------------------------------------------------------------------ */
 /*  Structured JSON logger + graceful shutdown                         */
