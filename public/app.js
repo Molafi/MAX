@@ -3168,8 +3168,17 @@
   // File tree cache. Short TTL so every chat/turn sees the latest commits; the
   // server uses GitHub ETags, so a refresh that finds no change is nearly free.
   let treeCache = null; // { key, files: [{path,size}], at, sha, truncated }
+  // Timeout wrapper for async operations (prevents hanging indefinitely)
+  function withTimeout(promise, ms, errorMsg = "Operation timed out") {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(errorMsg)), ms);
+      promise.then(resolve, reject).finally(() => clearTimeout(timer));
+    });
+  }
+
   let treeInflight = null;
   const TREE_TTL = 30_000;
+  const TREE_TIMEOUT = 12_000; // Fail fast if listing hangs
   const repoKey = (r) => `${r.provider}|${r.fullName}|${r.branch || ""}`;
   async function getTree(force) {
     const r = activeRepo();
@@ -3177,7 +3186,7 @@
     const key = repoKey(r);
     if (!force && treeCache && treeCache.key === key && Date.now() - treeCache.at < TREE_TTL) return treeCache.files;
     if (treeInflight && treeInflight.key === key) return treeInflight.p;
-    const p = providerFetch("tree", {}).then((data) => {
+    const p = withTimeout(providerFetch("tree", {}), TREE_TIMEOUT, "Listing repository files timed out").then((data) => {
       treeCache = { key, files: data.files || [], at: Date.now(), sha: data.sha || "", truncated: !!data.truncated };
       return treeCache.files;
     }).finally(() => { if (treeInflight && treeInflight.key === key) treeInflight = null; });
@@ -3275,12 +3284,26 @@
   async function loadTreePanel() {
     const content = $("#tree-content");
     content.innerHTML = `<div class="repo-spinner" style="margin:30px auto"></div>`;
+
+    // Timeout protection: clear spinner after 15s if still loading
+    const timeoutId = setTimeout(() => {
+      if (content.querySelector(".repo-spinner")) {
+        content.innerHTML = `<div class="repo-pop__msg">✗ Timeout listing repository files. <button class="btn-retry" style="margin-left:8px;padding:4px 10px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer">Retry</button></div>`;
+        const retryBtn = content.querySelector(".btn-retry");
+        if (retryBtn) retryBtn.addEventListener("click", () => loadTreePanel());
+      }
+    }, 15000);
+
     try {
       const files = (await getTree()).filter((f) => !isBinaryPath(f.path));
+      clearTimeout(timeoutId);
       renderTree(files, "");
       $("#tree-filter").addEventListener("input", () => renderTree(files, $("#tree-filter").value.trim()));
     } catch (err) {
-      content.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)}</div>`;
+      clearTimeout(timeoutId);
+      content.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)} <button class="btn-retry" style="margin-left:8px;padding:4px 10px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer">Retry</button></div>`;
+      const retryBtn = content.querySelector(".btn-retry");
+      if (retryBtn) retryBtn.addEventListener("click", () => loadTreePanel());
     }
   }
 
