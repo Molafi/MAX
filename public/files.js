@@ -17,6 +17,7 @@
   const TEXT_CAP = 200_000;            // chars of extracted text per file
   const IMAGE_MAX_EDGE = 1600;         // px — plenty for vision models
   const IMAGE_KEEP_BYTES = 1_500_000;  // keep originals below this size
+  const IMAGE_SEND_MAX_BYTES = 1_900_000; // stay under the server's 2 MB/image limit
   const PDF_INLINE_MAX = 10 * 1024 * 1024; // keep raw PDF for native document reading
   const VISION_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
   const PDFJS = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/";
@@ -300,6 +301,11 @@
       ctx.drawImage(img, 0, 0, c.width, c.height);
       let blob = await canvasToBlob(c, "image/webp", 0.9);
       if (!blob || blob.type !== "image/webp") blob = await canvasToBlob(c, file.type === "image/png" ? "image/png" : "image/jpeg", 0.9);
+      // The server accepts at most 2 MB per image: step JPEG quality down if needed.
+      for (const q of [0.82, 0.7, 0.55]) {
+        if (!blob || blob.size <= IMAGE_SEND_MAX_BYTES) break;
+        blob = await canvasToBlob(c, "image/jpeg", q);
+      }
       return { media_type: blob.type, dataUrl: await readAsDataURL(blob), width: c.width, height: c.height, resized: scale < 1, converted: !VISION_TYPES.has(file.type) };
     } finally {
       URL.revokeObjectURL(url);

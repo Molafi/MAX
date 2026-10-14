@@ -1036,3 +1036,22 @@ body.drag-over::after {
 .md .vcard__btn { color: var(--text); text-decoration: none; }
 .md .vcard__btn--primary { color: #fff; }
 .opt-pop, .effort-pop { overflow-y: auto; }
+
+/* ---------- Standalone chat badge + resilient loaders ---------- */
+.standalone-badge {
+  font-size: 11px; font-weight: 600; letter-spacing: .01em; white-space: nowrap;
+  padding: 3px 9px; border-radius: 999px;
+  background: rgba(52, 211, 153, .14); color: #34d399; border: 1px solid rgba(52, 211, 153, .32);
+}
+.standalone-badge[hidden] { display: none; }
+@media (max-width: 640px) { .standalone-badge { display: none; } }
+.foot-btn:disabled { opacity: .38; cursor: not-allowed; }
+.load-fail { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 18px 14px; text-align: center; color: var(--text-muted, #9aa); font-size: 13px; }
+.load-fail__msg { max-width: 420px; white-space: pre-wrap; word-break: break-word; }
+.img-fail {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-width: 120px; min-height: 64px;
+  padding: 8px 10px; border-radius: 10px; border: 1px dashed var(--border-strong, #555); background: var(--surface-2, transparent);
+  color: var(--text-muted, #9aa); font-size: 12px; cursor: pointer;
+}
+.img-fail:hover { color: var(--text, #fff); }
+.conv-sentinel { height: 1px; }

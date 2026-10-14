@@ -545,7 +545,7 @@
       customModels: [],  // [{id, provider}] discovered via "Refresh models"
       video: null,       // video generation preferences (see videoDefaults)
       system: "You are MAX, a helpful, friendly and concise AI assistant. Use Markdown for formatting when helpful.",
-      maxTokens: 8192,
+      maxTokens: 4096,   // per reply; raise in Settings for very long outputs
       temperature: 1.0,
       autonomous: false,
       autoMaxSteps: 6,
@@ -633,27 +633,62 @@
     } catch {}
     state.activeId = localStorage.getItem(LS.active) || null;
   }
-  // If storage is full, drop heavy attachment payloads (images/PDF bytes) from
-  // older messages — the text stays, and the server copy still has everything.
-  function compactForStorage() {
-    let freed = 0;
-    const convos = [...state.conversations].sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
-    for (const c of convos) {
-      if (c.id === state.activeId) continue;
-      for (const m of c.messages || []) {
-        for (const a of m.images || []) {
-          if (a.dataUrl) { freed += a.dataUrl.length; delete a.dataUrl; a.stripped = true; }
-          if (a.images) { freed += JSON.stringify(a.images).length; delete a.images; }
-        }
-      }
-      if (freed > 2_000_000) break;
-    }
-    return freed;
+  // Build a SMALLER COPY of the history for localStorage when it's full.
+  // IMPORTANT: this never mutates state — images keep their dataUrl in memory
+  // (so they still render and still reach the model) and the server sync keeps
+  // the full copy. Levels: 1 = strip attachment bytes from other chats,
+  // 2 = strip from all chats, 3 = also keep only the 40 most recent chats.
+  function compactForStorage(level) {
+    const stripMsg = (m) => {
+      if (!m.images || !m.images.length) return m;
+      return { ...m, images: m.images.map((a) => {
+        if (!a || (!a.dataUrl && !a.images)) return a;
+        const { dataUrl, images, ...rest } = a;
+        return { ...rest, stripped: true };
+      }) };
+    };
+    let convos = state.conversations;
+    if (level >= 3) convos = [...convos].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 40);
+    return convos.map((c) => (level === 1 && c.id === state.activeId) ? c : { ...c, messages: (c.messages || []).map(stripMsg) });
   }
+  // Re-hydrate images stripped from the LOCAL copy using the server copy.
+  const hasStripped = (convo) => (convo?.messages || []).some((m) => (m.images || []).some((a) => a?.stripped && !a.dataUrl));
+  // Resolves the number of images restored, or -1 if the server copy could NOT
+  // be checked (network / 5xx) — callers must not overwrite the server then.
+  async function rehydrateStripped(convo) {
+    if (!hasStripped(convo)) return 0;
+    try {
+      const res = await fetch(`/api/conversations/${encodeURIComponent(convo.id)}`);
+      if (res.status === 404) return 0; // server has no copy: nothing to lose
+      if (!res.ok) return -1;
+      const full = await res.json();
+      const byId = new Map((full.messages || []).map((m) => [m.id, m]));
+      let fixed = 0;
+      for (const m of convo.messages || []) {
+        const src = byId.get(m.id);
+        if (!src || !m.images) continue;
+        m.images = m.images.map((a, i) => {
+          const s = src.images?.[i];
+          if (a?.stripped && !a.dataUrl && s?.dataUrl) { fixed++; const { stripped, ...rest } = a; return { ...rest, dataUrl: s.dataUrl, images: s.images }; }
+          return a;
+        });
+      }
+      return fixed;
+    } catch { return -1; }
+  }
+  const _tooBigWarned = new Set();
+  let storageWarned = false;
   const saveConvos = () => {
     let ok = safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations));
-    if (!ok && compactForStorage()) ok = safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations));
-    if (!ok) toast("Conversation history could not be saved locally (storage full). It is still synced to the server.", "error");
+    for (let level = 1; !ok && level <= 3; level++) {
+      ok = safeStorageSet(localStorage, LS.convos, JSON.stringify(compactForStorage(level)));
+    }
+    // Never block chatting: warn ONCE per session, then keep going (server sync
+    // still has the full history).
+    if (!ok && !storageWarned) {
+      storageWarned = true;
+      toast("Browser storage is full — chat history is only being saved to the server. You can keep chatting.", "error");
+    }
     // Auto-sync to server in the background (fire and forget)
     syncConvosToServer();
   };
@@ -673,13 +708,32 @@
       for (const id of ids) {
         const c = state.conversations.find((x) => x.id === id);
         if (!c || !c.messages || !c.messages.length) continue;
-        fetch("/api/conversations", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(c),
-        }).catch(() => { _dirtyConvos.add(id); }); // re-queue on failure
+        (async () => {
+          // Never overwrite the server's full copy with a locally-compacted one:
+          // restore stripped images first; if the server can't be checked, wait.
+          const restored = await rehydrateStripped(c);
+          if (restored < 0 && hasStripped(c)) throw new Error("server copy unavailable");
+          const res = await fetch("/api/conversations", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(c),
+          });
+          if (res.status === 413) {
+            if (!_tooBigWarned.has(id)) {
+              _tooBigWarned.add(id);
+              toast(`"${String(c.title).slice(0, 40)}" is too large to back up on the server (12 MB limit) — newer messages are only saved in this browser.`, "error");
+            }
+            return; // retrying can't help
+          }
+          if (!res.ok && res.status !== 400) throw new Error(`HTTP ${res.status}`);
+        })().catch(() => { _dirtyConvos.add(id); scheduleSyncRetry(); }); // re-queue on failure
       }
     }, 3000); // debounce 3s to batch rapid changes
+  }
+  let _syncRetry = null;
+  function scheduleSyncRetry() {
+    if (_syncRetry) return;
+    _syncRetry = setTimeout(() => { _syncRetry = null; if (_dirtyConvos.size) syncConvosToServer(); }, 30_000);
   }
 
   async function loadConvosFromServer() {
@@ -698,8 +752,9 @@
           const full = await fetch(`/api/conversations/${encodeURIComponent(meta.id)}`);
           if (!full.ok) continue;
           const convo = await full.json();
-          if (convo && convo.id && Array.isArray(convo.messages)) {
-            state.conversations.push(convo);
+          const repaired = repairConversations([convo]).list[0];
+          if (repaired) {
+            state.conversations.push(repaired);
             added++;
           }
         } catch {}
@@ -786,9 +841,41 @@
     return "Older";
   }
 
+  // Repair malformed conversations ONCE (on load), not on every render.
+  // Anything unrecoverable is dropped instead of crashing the whole sidebar.
+  function repairConversations(list) {
+    const seen = new Set();
+    const out = [];
+    let fixed = 0;
+    for (const c of Array.isArray(list) ? list : []) {
+      if (!c || typeof c !== "object" || typeof c.id !== "string" || !c.id || seen.has(c.id)) { fixed++; continue; }
+      seen.add(c.id);
+      if (typeof c.title !== "string" || !c.title) { c.title = "Untitled chat"; fixed++; }
+      if (!Array.isArray(c.messages)) { c.messages = []; fixed++; }
+      const before = c.messages.length;
+      c.messages = c.messages.filter((m) => m && typeof m === "object" && (m.role === "user" || m.role === "assistant"));
+      for (const m of c.messages) {
+        if (m.content != null && typeof m.content !== "string") { m.content = String(m.content); fixed++; }
+        if (m.images && !Array.isArray(m.images)) { delete m.images; fixed++; }
+      }
+      if (c.messages.length !== before) fixed++;
+      if (!Number.isFinite(c.updatedAt)) { c.updatedAt = Number(c.createdAt) || Date.now(); fixed++; }
+      if (!Number.isFinite(c.createdAt)) c.createdAt = c.updatedAt;
+      out.push(c);
+    }
+    return { list: out, fixed };
+  }
+
+  // Sidebar is rendered in windows: the first CONV_PAGE rows, then more as an
+  // IntersectionObserver sentinel scrolls into view. Hundreds of chats stay fast.
+  const CONV_PAGE = 30;
+  let convLimit = CONV_PAGE;
+  let convLastQuery = "";
+  let convObserver = null;
   function renderConversations() {
     const list = $("#conversation-list");
     const q = $("#search-input").value.trim().toLowerCase();
+    if (q !== convLastQuery) { convLastQuery = q; convLimit = CONV_PAGE; list.scrollTop = 0; }
     let convos = [...state.conversations].sort((a, b) =>
       (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.updatedAt - a.updatedAt);
     if (q) {
@@ -803,10 +890,15 @@
       return;
     }
 
+    // Always include the active chat even if it's beyond the current window.
+    const total = convos.length;
+    const activeIdx = convos.findIndex((c) => c.id === state.activeId);
+    if (activeIdx >= convLimit) convLimit = Math.ceil((activeIdx + 1) / CONV_PAGE) * CONV_PAGE;
+    convos = convos.slice(0, convLimit);
+
     let html = "";
     let lastGroup = "";
     const anyPinned = convos.some((c) => c.pinned) && !q;
-    let pinnedHeaderDone = false;
     for (const c of convos) {
       let g;
       if (anyPinned && c.pinned) { g = "Pinned"; }
@@ -825,7 +917,28 @@
           </button>
         </div>`;
     }
+    if (total > convos.length) html += `<div class="conv-sentinel" aria-hidden="true"></div>`;
     list.innerHTML = html;
+
+    convObserver?.disconnect();
+    const sentinel = list.querySelector(".conv-sentinel");
+    if (sentinel) {
+      if ("IntersectionObserver" in window) {
+        convObserver = new IntersectionObserver((entries) => {
+          if (entries.some((e) => e.isIntersecting)) {
+            convObserver.disconnect();
+            convLimit += CONV_PAGE;
+            const top = list.scrollTop;
+            renderConversations();
+            list.scrollTop = top;
+          }
+        }, { root: list, rootMargin: "200px" });
+        convObserver.observe(sentinel);
+      } else {
+        convLimit = total; // very old browser: render everything once
+        renderConversations();
+      }
+    }
   }
 
   /* ============================================================
@@ -1457,27 +1570,66 @@
     return blocks;
   }
 
+  // Token budget: only the most recent HISTORY_FULL messages are sent verbatim.
+  // Older turns are condensed (text clipped, attachments → one-line notes), so a
+  // long chat no longer re-sends every image / pasted file on every turn.
+  const HISTORY_FULL = 10;
+  const HISTORY_OLD_CHARS = 1200;
+  function condenseOld(m) {
+    let text = String(m.content || "");
+    // Drop pasted file blocks / basket context from old turns entirely.
+    text = text.replace(/```[\s\S]*?```/g, (blk) => (blk.length > 400 ? "```\n… (code block omitted from older history)\n```" : blk));
+    if (text.length > HISTORY_OLD_CHARS) text = text.slice(0, HISTORY_OLD_CHARS) + " … (older message truncated)";
+    const att = (m.images || []).map((a) => a.name || a.fileName || a.kind || "file");
+    if (att.length) text = `[Earlier attachment${att.length > 1 ? "s" : ""}: ${att.join(", ")}]\n${text}`;
+    return text.trim() || "(earlier message)";
+  }
   function buildApiMessages(convo) {
     const style = providerInfo(currentProvider()).style;
     const out = [];
-    for (const m of convo.messages) {
+    const cut = Math.max(0, convo.messages.length - HISTORY_FULL);
+    if (cut > 0) out.push({ role: "user", content: `(Context note: ${cut} earlier message(s) in this chat are condensed below to save tokens. Ask the user if you need details from them.)` });
+    convo.messages.forEach((m, idx) => {
+      if (idx < cut) {
+        if (m.role === "assistant" && !m.content && !m.videos?.length) return;
+        out.push({ role: m.role === "assistant" ? "assistant" : "user", content: condenseOld(m) });
+        return;
+      }
+      buildOne(m);
+    });
+    return mergeSameRole(out);
+
+    function buildOne(m) {
       if (m.role === "user" && m.images && m.images.length) {
         const content = [];
         for (const a of m.images) content.push(...attachmentBlocks(a, style));
         if (m.content) content.push({ type: "text", text: m.content });
         if (!content.length) content.push({ type: "text", text: "(attachment)" });
         out.push({ role: "user", content });
-        continue;
+        return;
       }
       if (m.role === "assistant" && m.videos?.length) {
         const note = m.videos.map((v) => `[Video generated with ${v.label}: "${String(v.prompt || "").slice(0, 400)}" — ${v.status}${v.error ? ` (${String(v.error).slice(0, 160)})` : ""}]`).join("\n");
         const text = m.kind === "video" ? note : `${m.content || ""}\n\n${note}`.trim();
         out.push({ role: "assistant", content: text });
-        continue;
+        return;
       }
-      if (!m.content && m.role === "assistant") continue; // never send empty assistant turns
+      if (!m.content && m.role === "assistant") return; // never send empty assistant turns
       out.push({ role: m.role, content: m.content || "(empty)" });
     }
+  }
+  // Providers require alternating roles; skipped empty assistant turns (or the
+  // context note) can leave two user turns in a row — merge them.
+  function mergeSameRole(msgs) {
+    const out = [];
+    const asBlocks = (c) => (typeof c === "string" ? [{ type: "text", text: c }] : c);
+    for (const m of msgs) {
+      const prev = out[out.length - 1];
+      if (prev && prev.role === m.role) {
+        prev.content = [...asBlocks(prev.content), ...asBlocks(m.content)];
+      } else out.push({ ...m });
+    }
+    while (out.length && out[0].role !== "user") out.shift();
     return out;
   }
 
@@ -1546,7 +1698,7 @@
     sys += powersSystemNote();
     sys += skillsSystemNote();
     if (state.settings.autonomous) {
-      sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line.`;
+      sys += `\n\n[Autonomous mode] Work through the user's request across multiple steps on your own initiative. Make reasonable assumptions instead of asking clarifying questions. After finishing each step you will be prompted to continue. When the ENTIRE task is fully complete, end your final message with the exact marker ${DONE_MARKER} on its own line. After each step MAX automatically syntax-checks your staged .js/.json edits (node --check / JSON.parse); if a check fails you will receive the errors — fix them before declaring done. Prefer small edit_file changes over rewriting whole files.`;
     }
     if (extra) sys += `\n\n${extra}`;
     return sys.trim() || undefined;
@@ -1627,7 +1779,43 @@
   }
 
   /* ---------- autonomous multi-step loop ---------- */
-  function clampSteps(n) { return Math.max(2, Math.min(15, parseInt(n, 10) || 6)); }
+  function clampSteps(n) { return Math.max(6, Math.min(15, parseInt(n, 10) || 6)); }
+
+  // Syntax-check staged JS/JSON edits on the server (node --check / JSON.parse,
+  // nothing is executed). Resolves { checked, ok, failures: [{path, error}] }.
+  const VERIFIABLE_RE = /\.(m?js|cjs|json)$/i;
+  const VERIFY_MAX_BYTES = 512 * 1024; // server MAX_FILE_BYTES
+  const byteLen = (s) => new Blob([s || ""]).size;
+  // Resolves { checked, ok, failures, skipped: [paths], unavailable?: reason }.
+  // `unavailable` means the checker could not run — callers must NOT treat that
+  // as a pass silently (it is surfaced to the user and the model).
+  async function verifyStagedEdits() {
+    const all = pendingEditsList().filter((e) => !e.deleted && VERIFIABLE_RE.test(e.path));
+    const skipped = all.filter((e) => byteLen(e.content) > VERIFY_MAX_BYTES).map((e) => e.path);
+    const files = all.filter((e) => !skipped.includes(e.path)).slice(0, 50).map((e) => ({ path: e.path, content: e.content }));
+    if (all.length > 50 + skipped.length) skipped.push(...all.slice(50 + skipped.length).map((e) => e.path));
+    if (!files.length) return { checked: 0, ok: true, failures: [], skipped };
+    try {
+      const data = await fetchJsonWithTimeout("/api/verify", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ files }),
+      }, 30_000, "Verifying edits");
+      const failures = (data.results || []).filter((r) => !r.ok).map((r) => ({ path: r.path, error: r.error || "failed" }));
+      return { checked: files.length, ok: failures.length === 0, failures, skipped };
+    } catch (err) {
+      return { checked: 0, ok: true, failures: [], skipped: files.map((f) => f.path).concat(skipped), unavailable: errText(err) };
+    }
+  }
+  // Full-content hash (FNV-1a) so ANY edit — even a same-length one-char fix —
+  // triggers re-verification.
+  function hashStr(s) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (h >>> 0).toString(36);
+  }
+  const editsSignature = () => pendingEditsList().map((e) => `${e.path}:${e.deleted ? "D" : `${(e.content || "").length}.${hashStr(e.content || "")}`}`).join("|");
+  function autoLog(step, max, event, extra = {}) {
+    try { console.info(JSON.stringify({ ts: new Date().toISOString(), scope: "autonomous", step, max, event, ...extra })); } catch {}
+  }
 
   async function runAutonomousLoop(convo) {
     const max = clampSteps(state.settings.autoMaxSteps);
@@ -1644,24 +1832,68 @@
     state.autoRunning = true;
     updateAutoPill();
 
+    // apply edits → verify → (fail) feed errors back and loop → (pass + done) stop.
+    let lastSig = editsSignature();
+    let lastVerify = { ok: true, failures: [], checked: 0 };
+    let errorRetries = 0;
     try {
       for (let step = 1; step <= max; step++) {
         setAutoPillStep(step, max);
+        autoLog(step, max, "step.start");
         await streamAssistant(convo);
 
         const last = convo.messages[convo.messages.length - 1];
-        // Stop the loop on: user stop, an error/aborted turn, or the done marker.
-        if (state.autoStop) break;
-        if (!last || last.role !== "assistant" || last.stopped) break;
+        if (state.autoStop) { autoLog(step, max, "stopped.user"); break; }
+        if (!last || last.role !== "assistant" || last.stopped) {
+          // A failed turn: give it one more chance before giving up (never stop
+          // after a single attempt), but don't burn steps on a dead provider.
+          if (errorRetries++ < 1 && step < max && !last?.stopped) {
+            autoLog(step, max, "turn.error.retry");
+            continue;
+          }
+          autoLog(step, max, "stopped.error");
+          break;
+        }
+        errorRetries = 0;
 
-        if (last.content.includes(DONE_MARKER)) {
+        const saidDone = last.content.includes(DONE_MARKER);
+        if (saidDone) {
           last.content = last.content.replace(/\s*\[\[MAX_DONE\]\]\s*/g, "").trim();
           saveConvos();
           renderMessages();
-          if (state.settings.autoPush && activeRepo()) {
-            // Auto-push disabled — MAX only pushes code, not conversations.
-            // toast("Autonomous run complete — pushing to your repo…");
-            // pushConversation(convo.id);
+        }
+
+        // Verify whenever the staged edits changed this step — and keep
+        // re-verifying while the last check is failing or couldn't run.
+        const sig = editsSignature();
+        if (sig !== lastSig || !lastVerify.ok || lastVerify.unavailable) {
+          lastSig = sig;
+          setStreamLabel?.("Verifying edits…");
+          lastVerify = await verifyStagedEdits();
+          autoLog(step, max, "verify", { checked: lastVerify.checked, ok: lastVerify.ok, failures: lastVerify.failures.map((f) => f.path), skipped: lastVerify.skipped, unavailable: lastVerify.unavailable });
+          if (lastVerify.unavailable) toast(`⚠ Couldn't verify edits (${lastVerify.unavailable}) — review them before committing.`, "error");
+          else if (lastVerify.checked) toast(lastVerify.ok ? `✓ Verified ${lastVerify.checked} file(s) — syntax OK` : `✗ ${lastVerify.failures.length} file(s) failed verification — MAX is fixing them`, lastVerify.ok ? "success" : "error");
+          if (lastVerify.skipped?.length && !lastVerify.unavailable) toast(`Not syntax-checked (too large): ${lastVerify.skipped.slice(0, 3).join(", ")}${lastVerify.skipped.length > 3 ? "…" : ""}`, "");
+        }
+
+        if (!lastVerify.ok) {
+          if (step >= max) { toast(`Autonomous run hit ${max} steps with failing checks — review the staged changes.`, "error"); break; }
+          const report = lastVerify.failures.map((f) => `• ${f.path}\n${String(f.error).slice(0, 700)}`).join("\n\n");
+          convo.messages.push({
+            id: uid(), role: "user", auto: true,
+            content: `Automatic verification FAILED for your staged edits (node --check / JSON.parse):\n\n${report}\n\nRead the affected lines with read_repo_file, fix them with edit_file, and continue. Only end with ${DONE_MARKER} once everything passes.`,
+          });
+          touchConvo(convo);
+          renderMessages();
+          continue;
+        }
+        if (saidDone) {
+          autoLog(step, max, "done", { verified: lastVerify.checked, unverified: lastVerify.skipped });
+          // Tell the user plainly if "done" happened without a real check.
+          if (lastVerify.unavailable || lastVerify.skipped?.length) {
+            convo.messages.push({ id: uid(), role: "assistant", auto: true,
+              content: `⚠ Finished, but ${lastVerify.unavailable ? `verification couldn't run (${lastVerify.unavailable})` : `these files were too large to syntax-check: ${lastVerify.skipped.join(", ")}`}. Review the staged changes before committing.` });
+            touchConvo(convo); renderMessages();
           }
           break;
         }
@@ -1716,9 +1948,11 @@
     },
     read_repo_file: {
       name: "read_repo_file",
-      description: "Read the full text contents of a file in the selected repository. Reflects any changes you've already staged this session.",
+      description: "Read a text file from the selected repository, returned with line numbers (\"12: code\"). Reflects changes you've already staged this session. For big files pass start_line/end_line to read only the part you need.",
       input_schema: { type: "object", properties: {
         path: { type: "string", description: "Repository-relative path, e.g. 'src/app.js'." },
+        start_line: { type: "integer", description: "Optional 1-based first line to read." },
+        end_line: { type: "integer", description: "Optional 1-based last line to read (inclusive)." },
       }, required: ["path"] },
     },
     write_file: {
@@ -1846,6 +2080,33 @@
     });
   }
 
+  const VENDOR_DIR_RE = /^((?:.*\/)?(?:node_modules|vendor|dist|build|out|\.next|\.nuxt|coverage|__pycache__|\.venv|venv|target|\.gradle|Pods|bower_components))\//;
+  const READ_CAP_CHARS = 60_000;
+  // Render a file for the model as "N: line" with an optional 1-based line range.
+  // Line numbers are a reading aid only (edit_file must use the raw text).
+  function formatFileForModel(path, content, startLine, endLine, staged = "") {
+    const lines = String(content || "").split("\n");
+    const total = lines.length;
+    let from = Math.max(1, parseInt(startLine, 10) || 1);
+    let to = Math.min(total, parseInt(endLine, 10) || total);
+    if (from > total) return `File ${path} has only ${total} line(s); start_line ${from} is past the end.`;
+    if (to < from) to = from;
+    const width = String(to).length;
+    const out = [];
+    let used = 0;
+    let i = from;
+    for (; i <= to; i++) {
+      const row = `${String(i).padStart(width, " ")}: ${lines[i - 1]}`;
+      if (used + row.length + 1 > READ_CAP_CHARS && out.length) break;
+      out.push(row);
+      used += row.length + 1;
+    }
+    const lastShown = i - 1;
+    const range = from === 1 && lastShown === total ? `${total} lines` : `lines ${from}-${lastShown} of ${total}`;
+    const more = lastShown < to ? `\n… (output capped — continue with start_line: ${lastShown + 1})` : "";
+    return `File ${path} (${range})${staged}. Line numbers are for reference only — do NOT include them in edit_file old_str/new_str.\n\n${out.join("\n")}${more}`;
+  }
+
   // Execute one tool locally and return a string result for the model.
   async function executeTool(name, input, ctx = {}) {
     input = input || {};
@@ -1854,12 +2115,30 @@
         if (!activeRepo()) return "Error: no repository is selected.";
         const files = await getTree();
         let paths = files.map((f) => f.path);
-        if (input.filter) { const q = String(input.filter).toLowerCase(); paths = paths.filter((p) => p.toLowerCase().includes(q)); }
+        const q = input.filter ? String(input.filter).toLowerCase() : "";
+        if (q) paths = paths.filter((p) => p.toLowerCase().includes(q));
+        // Without a filter, collapse vendored/build/binary noise so the model
+        // gets the real project layout for far fewer tokens.
+        let hidden = 0;
+        const collapsed = new Map();
+        if (!q) {
+          paths = paths.filter((p) => {
+            const vd = p.match(VENDOR_DIR_RE);
+            if (vd) { hidden++; collapsed.set(vd[1], (collapsed.get(vd[1]) || 0) + 1); return false; }
+            if (isBinaryPath(p) && !/\.(svg|lock)$/i.test(p)) { hidden++; return false; }
+            return true;
+          });
+        }
         const total = paths.length;
         const shown = paths.slice(0, 600);
         const r = activeRepo();
-        return `Repository ${r.fullName} (branch ${r.branch || "main"}) — ${total} file(s)${input.filter ? ` matching "${input.filter}"` : ""}:\n` +
-          shown.join("\n") + (total > shown.length ? `\n… (${total - shown.length} more; narrow with a filter)` : "");
+        const notes = [];
+        if (total > shown.length) notes.push(`… (${total - shown.length} more; narrow with a filter)`);
+        if (collapsed.size) notes.push(`(Collapsed vendored/build folders: ${[...collapsed].map(([d, n]) => `${d}/ ${n} files`).join(", ")} — pass a filter to list them.)`);
+        else if (hidden) notes.push(`(${hidden} binary file(s) hidden.)`);
+        if (treeCache?.truncated) notes.push("(The repository is very large; this listing is partial.)");
+        return `Repository ${r.fullName} (branch ${r.branch || "main"}) — ${total} file(s)${q ? ` matching "${input.filter}"` : ""}:\n` +
+          shown.join("\n") + (notes.length ? "\n" + notes.join("\n") : "");
       }
       case "search_repo": {
         if (!activeRepo()) return "Error: no repository is selected.";
@@ -1876,12 +2155,8 @@
         const wf = await readWorkingFile(path);
         if (wf.deleted) return `File ${path} is staged for deletion.`;
         if (!wf.exists) return `File ${path} does not exist in the repository. Use write_file to create it.`;
-        let content = wf.content;
-        const CAP = 60000;
-        let note = "";
-        if (content.length > CAP) { content = content.slice(0, CAP); note = `\n… (truncated at ${CAP} characters — read a narrower part if you need more)`; }
         const staged = state.pendingEdits[path] ? " (includes your staged, uncommitted changes)" : "";
-        return `File ${path} (${content.length} chars)${staged}:\n\n${content}${note}`;
+        return formatFileForModel(path, wf.content, input.start_line, input.end_line, staged);
       }
       case "write_file": {
         if (!activeRepo()) return "Error: no repository is selected.";
@@ -2032,6 +2307,22 @@
     // Coalesced to one paint per animation frame (see appendStreamingAssistant).
     const rerender = () => stream.setAgent(ctx.priorText + curText, true, (ctx.priorThinking || "") + curThinking, ctx.toolRuns);
 
+    // Parse a tool_use block's streamed JSON once. Some gateways send the full
+    // input in content_block_start (no deltas) — keep that. A body cut off by
+    // max_tokens is flagged instead of silently becoming {}.
+    const finalizeToolBlock = (b) => {
+      if (!b || b.type !== "tool_use" || b.done) return;
+      b.done = true;
+      let input = b.startInput && typeof b.startInput === "object" ? b.startInput : {};
+      if (b.json) {
+        try { input = JSON.parse(b.json); }
+        catch { b.parseError = true; }
+      }
+      b.input = input;
+      const run = ctx.toolRuns.find((r) => r.id === b.id);
+      if (run) { run.input = input; rerender(); }
+    };
+
     const consumeRecord = (record) => {
       if (!record?.data) return false;
       if (record.data.trim() === "[DONE]") return true;
@@ -2047,7 +2338,7 @@
         case "content_block_start": {
           const cb = evt.content_block || {};
           if (cb.type === "tool_use") {
-            blocks[evt.index] = { type: "tool_use", id: cb.id, name: cb.name, json: "" };
+            blocks[evt.index] = { type: "tool_use", id: cb.id, name: cb.name, json: "", startInput: cb.input && Object.keys(cb.input).length ? cb.input : null };
             ctx.toolRuns.push({ id: cb.id, name: cb.name, input: null, status: "running", result: null });
             rerender();
           } else if (cb.type === "thinking") {
@@ -2076,14 +2367,7 @@
           break;
         }
         case "content_block_stop": {
-          const b = blocks[evt.index];
-          if (b && b.type === "tool_use") {
-            let input = {};
-            try { input = b.json ? JSON.parse(b.json) : {}; } catch { input = {}; }
-            b.input = input;
-            const run = ctx.toolRuns.find((r) => r.id === b.id);
-            if (run) { run.input = input; rerender(); }
-          }
+          finalizeToolBlock(blocks[evt.index]);
           break;
         }
         case "message_delta":
@@ -2114,6 +2398,9 @@
       }
     }
 
+    // Streams that end without content_block_stop (dropped connection, gateway
+    // quirks) still get their tool inputs parsed.
+    for (const b of Object.values(blocks)) finalizeToolBlock(b);
     const orderedIdx = Object.keys(blocks).map(Number).sort((a, b) => a - b);
     let text = "";
     const toolUses = [];
@@ -2121,7 +2408,7 @@
     for (const i of orderedIdx) {
       const b = blocks[i];
       if (b.type === "text") text += b.text || "";
-      else if (b.type === "tool_use") toolUses.push({ id: b.id, name: b.name, input: b.input || {} });
+      else if (b.type === "tool_use" && b.id && b.name) toolUses.push({ id: b.id, name: b.name, input: b.input || {}, parseError: Boolean(b.parseError) });
       else if (b.type === "thinking" && b.signature) thinkingBlocks.push({ type: "thinking", thinking: b.thinking, signature: b.signature });
       else if (b.type === "redacted_thinking" && b.data) thinkingBlocks.push({ type: "redacted_thinking", data: b.data });
     }
@@ -2196,7 +2483,9 @@
         if (turn.thinking) finalThinking = finalThinking ? finalThinking + "\n\n" + turn.thinking : turn.thinking;
         if (turn.text) finalText = finalText ? finalText + "\n\n" + turn.text : turn.text;
 
-        const wantsTools = turn.stopReason === "tool_use" && turn.toolUses.length;
+        // "max_tokens" with tool calls = the reply was cut mid-call: still answer
+        // every tool_use (with an explanatory error) so the model can recover.
+        const wantsTools = turn.toolUses.length && (turn.stopReason === "tool_use" || turn.stopReason === "max_tokens");
         if (!wantsTools || state.autoStop || state.abort.signal.aborted) break;
 
         // Record the assistant tool-use turn in the working history…
@@ -2213,6 +2502,15 @@
           const run = toolRuns.find((r) => r.id === tu.id) || { id: tu.id, name: tu.name, input: tu.input, status: "running" };
           setStreamLabel(describeToolRun(run));
           let result, ok = true;
+          if (tu.parseError) {
+            ok = false;
+            result = `Error: the arguments for ${tu.name} were cut off (the reply hit the max_tokens limit of ${state.settings.maxTokens}) so the call was NOT run. ` +
+              (tu.name === "write_file" ? "Use edit_file with small, targeted replacements instead of rewriting the whole file, or split the work into several smaller calls." : "Retry with shorter arguments.");
+            run.status = "error"; run.result = result;
+            stream.setAgent(finalText, true, finalThinking, toolRuns);
+            resultBlocks.push({ type: "tool_result", tool_use_id: tu.id, content: result, is_error: true });
+            continue;
+          }
           try { result = await executeTool(tu.name, tu.input, { videos: turnVideos, convo }); }
           catch (e) {
             ok = false;
@@ -2502,9 +2800,17 @@
     const name = a.name || a.fileName || "file";
     const size = a.size || a.fileSize;
     if ((a.kind === "image" || (!a.kind && (a.media_type || "").startsWith("image/"))) && a.dataUrl) {
+      // data-max-img → watched by the global image guard (onerror + 8 s timeout).
       return `<div class="attachment" data-id="${esc(a.id || "")}" title="${esc(name)}">
-        <img src="${a.dataUrl}" alt="${esc(name)}" loading="lazy" decoding="async">
+        <img src="${esc(a.dataUrl)}" alt="${esc(name)}" loading="lazy" decoding="async" data-max-img>
         ${removable ? `<button class="attachment__remove" data-remove="${esc(a.id)}" title="Remove" type="button">×</button>` : ""}
+      </div>`;
+    }
+    if ((a.kind === "image" || (!a.kind && (a.media_type || "").startsWith("image/"))) && a.stripped) {
+      return `<div class="attachment attachment--file" data-id="${esc(a.id || "")}" title="${esc(name)}">
+        <span class="attachment__icon">🖼️</span>
+        <span class="attachment__text"><span class="attachment__name">${esc(name)}</span>
+        <span class="attachment__meta">not stored in this browser (storage full) — restored from the server backup when available</span></span>
       </div>`;
     }
     if (a.pending) {
@@ -2527,6 +2833,62 @@
       ${removable ? `<button class="attachment__remove" data-remove="${esc(a.id)}" title="Remove" type="button">×</button>` : ""}
     </div>`;
   }
+  /* ---------- image guard: never leave an image spinning ---------- */
+  // Every <img> in chat/attachments gets: lazy loading, an error handler and an
+  // 8 s watchdog. A failed/stuck image is swapped for "[Image failed to load –
+  // retry]"; clicking retries with a cache-busting reload.
+  const IMG_TIMEOUT_MS = 8000;
+  function guardImage(img) {
+    if (!img || img.dataset.guarded) return;
+    img.dataset.guarded = "1";
+    if (!img.getAttribute("loading")) img.loading = "lazy";
+    img.decoding = "async";
+    const fail = () => {
+      if (!img.isConnected || img.dataset.failed) return;
+      img.dataset.failed = "1";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "img-fail";
+      btn.textContent = "🖼️ Image failed to load – retry";
+      btn.title = img.alt || "Retry loading this image";
+      btn.addEventListener("click", (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const src = img.getAttribute("src") || "";
+        delete img.dataset.failed; delete img.dataset.guarded;
+        // data: URLs can't be cache-busted; http(s) ones get a fresh query param.
+        img.src = /^https?:/i.test(src) ? src.replace(/([?&])_r=\d+/, "").replace(/(\?|$)/, (m) => (m ? `?_r=${Date.now()}&` : `?_r=${Date.now()}`)) : src;
+        btn.replaceWith(img);
+        guardImage(img);
+      });
+      img.replaceWith(btn);
+    };
+    img.addEventListener("error", fail, { once: true });
+    if (img.complete) { if (!img.naturalWidth && img.getAttribute("src")) fail(); return; }
+    // Lazy images off-screen haven't started yet — only time out once visible.
+    const startWatch = () => setTimeout(() => { if (!img.complete || !img.naturalWidth) fail(); }, IMG_TIMEOUT_MS);
+    if ("IntersectionObserver" in window && img.loading === "lazy") {
+      const io = new IntersectionObserver((entries) => {
+        if (entries.some((e) => e.isIntersecting)) { io.disconnect(); startWatch(); }
+      });
+      io.observe(img);
+    } else startWatch();
+  }
+  function guardImagesIn(root) {
+    if (!root) return;
+    root.querySelectorAll("img").forEach(guardImage);
+  }
+  function installImageGuard() {
+    const roots = [$("#chat"), $("#attachments")].filter(Boolean);
+    roots.forEach(guardImagesIn);
+    const mo = new MutationObserver((muts) => {
+      for (const m of muts) for (const n of m.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        if (n.tagName === "IMG") guardImage(n); else guardImagesIn(n);
+      }
+    });
+    roots.forEach((r) => mo.observe(r, { childList: true, subtree: true }));
+  }
+
   function renderAttachments() {
     $("#attachments").innerHTML = state.attachments.map((a) => attachmentChipHtml(a, true)).join("");
     updateSendState();
@@ -2845,6 +3207,36 @@
       const bc = $("#branch-chip");
       if (bc) bc.hidden = true;
     }
+    updateStandaloneBadge();
+  }
+
+  // Standalone chat: a repository is 100% optional. With no repo, show a green
+  // "Standalone Chat Mode" badge and disable ONLY the repo tools (file tree,
+  // commit/push). The composer, Send button and model picker always stay enabled.
+  function updateStandaloneBadge() {
+    const standalone = !activeRepo();
+    let badge = $("#standalone-badge");
+    if (!badge) {
+      const host = $(".topbar__center");
+      if (!host) return;
+      badge = document.createElement("span");
+      badge.id = "standalone-badge";
+      badge.className = "standalone-badge";
+      badge.textContent = "Standalone Chat Mode";
+      badge.title = "Chatting without a repository. Pick one with the repo chip to let MAX read, edit & push code.";
+      host.appendChild(badge);
+    }
+    badge.hidden = !standalone;
+    const tree = $("#tree-btn");
+    if (tree) {
+      tree.disabled = standalone;
+      tree.title = standalone ? "Browse repository files (pick a repository first)" : "Browse repository files";
+    }
+    if (standalone) { closeTreePanel(); closeFilesPicker(); }
+    // Never lock the composer because of the repo state.
+    const input = $("#input"); if (input) input.disabled = false;
+    const pill = $("#model-pill"); if (pill) pill.disabled = false;
+    updateSendState();
   }
 
   function selectRepo(repo, provider) {
@@ -2914,17 +3306,65 @@
     return true;
   }
 
-  async function providerFetch(path, extra) {
+  /* ---------- listing timeouts: no repo request may hang the UI ---------- */
+  const LISTING_TIMEOUT_MS = 15_000;
+  // Race `promise` against a deadline; on timeout abort `controller` (cancels the
+  // real HTTP request) and reject with a readable error.
+  function withListingTimeout(promise, ms = LISTING_TIMEOUT_MS, controller, what = "Listing repository files") {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        try { controller?.abort(); } catch {}
+        const e = new Error(`${what} timed out after ${Math.round(ms / 1000)}s.`);
+        e.name = "TimeoutError";
+        reject(e);
+      }, ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+  // fetch() + JSON with a hard deadline. Network / timeout / HTTP errors all reject.
+  async function fetchJsonWithTimeout(url, init = {}, ms = LISTING_TIMEOUT_MS, what) {
+    const controller = new AbortController();
+    const run = (async () => {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      return data;
+    })();
+    return withListingTimeout(run, ms, controller, what);
+  }
+  // Failsafe for any loader element: if it still shows a spinner after `ms`,
+  // replace it with a "[Failed - Retry]" prompt. Returns a disarm function.
+  function armListingFailsafe(el, onRetry, ms = LISTING_TIMEOUT_MS + 1000) {
+    const t = setTimeout(() => {
+      if (el && el.isConnected && el.querySelector(".repo-spinner")) {
+        renderLoadFail(el, "Still loading after " + Math.round(ms / 1000) + "s — the request seems stuck.", onRetry);
+      }
+    }, ms);
+    return () => clearTimeout(t);
+  }
+  function errText(err) {
+    if (err?.name === "TimeoutError") return err.message;
+    if (err instanceof TypeError || err?.name === "AbortError") return "Can't reach the MAX server.";
+    return err?.message || String(err);
+  }
+  function renderLoadFail(el, message, onRetry) {
+    if (!el) return;
+    el.innerHTML = `<div class="load-fail"><div class="load-fail__msg">✗ ${esc(message)}</div>${onRetry ? `<button type="button" class="btn btn--primary btn--sm load-fail__retry">[Failed - Retry]</button>` : ""}</div>`;
+    const b = el.querySelector(".load-fail__retry");
+    if (b) b.addEventListener("click", (e) => { e.stopPropagation(); onRetry(); });
+  }
+
+  async function providerFetch(path, extra, ms) {
     const r = activeRepo();
+    if (!r) throw new Error("No repository is selected.");
     const body = { token: providerToken(r.provider) || undefined, branch: r.branch, ...extra };
     if (r.provider === "gitlab") body.projectId = r.projectId ?? r.fullName;
     else { body.owner = r.owner; body.repo = r.name; }
-    const res = await fetch(`/api/${r.provider}/${path}`, {
+    const what = path === "tree" ? "Listing repository files" : path === "branches" ? "Loading branches" : `Loading ${extra?.path || path}`;
+    return fetchJsonWithTimeout(`/api/${r.provider}/${path}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
-    return data;
+    }, ms || (path === "file" ? 25_000 : LISTING_TIMEOUT_MS), what);
   }
 
   const repoListCache = {}; // provider -> { repos, at }
@@ -2932,12 +3372,10 @@
   async function fetchRepos(provider, q) {
     if (!q && repoListInflight[provider]) return repoListInflight[provider];
     const run = (async () => {
-      const res = await fetch(`/api/${provider}/repos`, {
+      const data = await fetchJsonWithTimeout(`/api/${provider}/repos`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: providerToken(provider) || undefined, q: q || undefined }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+      }, 20_000, "Loading repositories");
       const repos = data.repos || [];
       if (!q) repoListCache[provider] = { repos, at: Date.now() };
       return repos;
@@ -3010,15 +3448,21 @@
         || `<div class="repo-pop__msg">No branches match.</div>`;
       listEl.querySelectorAll("[data-b]").forEach((b) => b.addEventListener("click", () => { closePop(); switchBranch(b.dataset.b); }));
     };
-    try {
-      const data = await providerFetch("branches", {});
-      branches = data.branches || [];
-      render();
-      input.addEventListener("input", render);
-      setTimeout(() => input.focus(), 20);
-    } catch (err) {
-      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err.message)}</div>`;
-    }
+    input.addEventListener("input", () => render());
+    const load = async () => {
+      listEl.innerHTML = `<div class="repo-spinner"></div>`;
+      const disarm = armListingFailsafe(listEl, load);
+      try {
+        const data = await providerFetch("branches", {});
+        branches = data.branches || [];
+        if (!listEl.isConnected) return;
+        render();
+        setTimeout(() => input.focus(), 20);
+      } catch (err) {
+        if (listEl.isConnected) renderLoadFail(listEl, errText(err), load);
+      } finally { disarm(); }
+    };
+    load();
   }
   function switchBranch(name) {
     const r = activeRepo();
@@ -3149,6 +3593,8 @@
     const cached = !q && repoListCache[provider];
     if (cached && !force) renderRepoRows(listEl, provider, cached.repos, q);
     else listEl.innerHTML = `<div class="repo-spinner"></div>`;
+    const retry = () => loadRepoList(listEl, provider, q, true);
+    const disarm = armListingFailsafe(listEl, retry, 21_000);
     // Always revalidate in the background so new repos appear right away.
     try {
       const repos = await fetchRepos(provider, q);
@@ -3159,37 +3605,40 @@
       if (stamp) stamp.textContent = `${repos.length} repos · updated just now`;
     } catch (err) {
       if (!listEl.isConnected) return;
-      if (cached && !force) { toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error"); return; }
-      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)}</div>`;
-    }
+      if (cached && !force) { toast(errText(err), "error"); return; }
+      renderLoadFail(listEl, errText(err), retry);
+    } finally { disarm(); }
   }
 
   /* ---------- file browser + @file mentions ---------- */
   // File tree cache. Short TTL so every chat/turn sees the latest commits; the
   // server uses GitHub ETags, so a refresh that finds no change is nearly free.
   let treeCache = null; // { key, files: [{path,size}], at, sha, truncated }
-  // Timeout wrapper for async operations (prevents hanging indefinitely)
-  function withTimeout(promise, ms, errorMsg = "Operation timed out") {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(errorMsg)), ms);
-      promise.then(resolve, reject).finally(() => clearTimeout(timer));
-    });
-  }
-
   let treeInflight = null;
   const TREE_TTL = 30_000;
-  const TREE_TIMEOUT = 12_000; // Fail fast if listing hangs
+  const TREE_PAGE = 1000;      // server MAX_LIST_FILES
+  const TREE_MAX_PAGES = 4;    // server MAX_TREE_ENTRIES = 4000
   const repoKey = (r) => `${r.provider}|${r.fullName}|${r.branch || ""}`;
   async function getTree(force) {
     const r = activeRepo();
-    if (!r) return [];
+    if (!r) return []; // standalone chat: never list anything
     const key = repoKey(r);
     if (!force && treeCache && treeCache.key === key && Date.now() - treeCache.at < TREE_TTL) return treeCache.files;
     if (treeInflight && treeInflight.key === key) return treeInflight.p;
-    const p = withTimeout(providerFetch("tree", {}), TREE_TIMEOUT, "Listing repository files timed out").then((data) => {
-      treeCache = { key, files: data.files || [], at: Date.now(), sha: data.sha || "", truncated: !!data.truncated };
-      return treeCache.files;
-    }).finally(() => { if (treeInflight && treeInflight.key === key) treeInflight = null; });
+    const run = (async () => {
+      // Page through the listing; every page has its own 15 s timeout, and the
+      // whole walk is capped so it can never spin forever.
+      let files = [], offset = 0, first = null;
+      for (let page = 0; page < TREE_MAX_PAGES && offset !== null; page++) {
+        const data = await providerFetch("tree", { offset, limit: TREE_PAGE });
+        if (!first) first = data;
+        files = files.concat(data.files || []);
+        offset = typeof data.nextOffset === "number" && data.nextOffset > offset ? data.nextOffset : null;
+      }
+      treeCache = { key, files, at: Date.now(), sha: first?.sha || "", truncated: Boolean(first?.truncated) || offset !== null };
+      return files;
+    })();
+    const p = withListingTimeout(run, LISTING_TIMEOUT_MS * 2).finally(() => { if (treeInflight && treeInflight.key === key) treeInflight = null; });
     treeInflight = { key, p };
     return p;
   }
@@ -3202,7 +3651,7 @@
       const data = await providerFetch("file", { path });
       const input = $("#input");
       const lang = (path.split(".").pop() || "").toLowerCase();
-      const block = `\n\nFile \`${path}\` from ${r.fullName}:\n\`\`\`${lang}\n${data.content}\n\`\`\`\n`;
+      const block = `\n\nFile \`${path}\` from ${r.fullName}:\n\`\`\`${lang}\n${capText(data.content, CONTEXT_FILE_CHARS)}\n\`\`\`\n`;
       input.value = (input.value + block).trimStart();
       autoResize(input); updateCharCount(); updateSendState(); input.focus();
       toast(`Inserted ${path} (${Math.round((data.size || data.content.length) / 1024) || 1} KB)`, "success");
@@ -3255,14 +3704,20 @@
         e.stopPropagation(); addToBasket(shown[parseInt(btn.dataset.add, 10)].path);
       }));
     };
-    try {
-      files = (await getTree()).filter((f) => !isBinaryPath(f.path));
-      render("");
-      searchEl.addEventListener("input", () => render(searchEl.value.trim()));
-      setTimeout(() => searchEl.focus(), 20);
-    } catch (err) {
-      listEl.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)}</div>`;
-    }
+    searchEl.addEventListener("input", () => render(searchEl.value.trim()));
+    const load = async (force) => {
+      listEl.innerHTML = `<div class="repo-spinner"></div>`;
+      const disarm = armListingFailsafe(listEl, () => load(true));
+      try {
+        files = (await getTree(force)).filter((f) => !isBinaryPath(f.path));
+        if (!listEl.isConnected) return;
+        render(searchEl.value.trim());
+        setTimeout(() => searchEl.focus(), 20);
+      } catch (err) {
+        if (listEl.isConnected) renderLoadFail(listEl, errText(err), () => load(true));
+      } finally { disarm(); }
+    };
+    load(false);
     setTimeout(() => {
       const onDoc = (e) => { if (filesPickerEl && !filesPickerEl.contains(e.target) && !anchorBtn.contains(e.target)) { closeFilesPicker(); document.removeEventListener("mousedown", onDoc); } };
       document.addEventListener("mousedown", onDoc);
@@ -3281,30 +3736,27 @@
   }
   function closeTreePanel() { $("#tree-overlay").hidden = true; }
 
-  async function loadTreePanel() {
+  let treeLoadSeq = 0;
+  async function loadTreePanel(force) {
     const content = $("#tree-content");
+    const filter = $("#tree-filter");
+    const seq = ++treeLoadSeq; // ignore results from an older (retried) load
     content.innerHTML = `<div class="repo-spinner" style="margin:30px auto"></div>`;
-
-    // Timeout protection: clear spinner after 15s if still loading
-    const timeoutId = setTimeout(() => {
-      if (content.querySelector(".repo-spinner")) {
-        content.innerHTML = `<div class="repo-pop__msg">✗ Timeout listing repository files. <button class="btn-retry" style="margin-left:8px;padding:4px 10px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer">Retry</button></div>`;
-        const retryBtn = content.querySelector(".btn-retry");
-        if (retryBtn) retryBtn.addEventListener("click", () => loadTreePanel());
-      }
-    }, 15000);
-
+    filter.oninput = null;
+    // Failsafe: the spinner is cleared on success, error, timeout — and, as a
+    // last resort, by this timer. It can never spin for more than ~15 s.
+    const disarm = armListingFailsafe(content, () => loadTreePanel(true));
     try {
-      const files = (await getTree()).filter((f) => !isBinaryPath(f.path));
-      clearTimeout(timeoutId);
-      renderTree(files, "");
-      $("#tree-filter").addEventListener("input", () => renderTree(files, $("#tree-filter").value.trim()));
+      const files = (await getTree(force)).filter((f) => !isBinaryPath(f.path));
+      if (seq !== treeLoadSeq) return;
+      renderTree(files, filter.value.trim());
+      // Assign (not addEventListener) so re-opening doesn't stack handlers.
+      filter.oninput = () => renderTree(files, filter.value.trim());
+      if (treeCache?.truncated) toast("Large repository — showing the first files only.", "");
     } catch (err) {
-      clearTimeout(timeoutId);
-      content.innerHTML = `<div class="repo-pop__msg">✗ ${esc(err instanceof TypeError ? "Can't reach the MAX server." : err.message)} <button class="btn-retry" style="margin-left:8px;padding:4px 10px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer">Retry</button></div>`;
-      const retryBtn = content.querySelector(".btn-retry");
-      if (retryBtn) retryBtn.addEventListener("click", () => loadTreePanel());
-    }
+      if (seq !== treeLoadSeq) return;
+      renderLoadFail(content, errText(err), () => loadTreePanel(true));
+    } finally { disarm(); }
   }
 
   function renderTree(files, filter) {
@@ -3401,17 +3853,39 @@
     items[mentionActive]?.scrollIntoView({ block: "nearest" });
   }
 
-  async function maybeMention(input) {
+  let mentionSeq = 0;
+  let mentionTimer = null;
+  function maybeMention(input) {
+    clearTimeout(mentionTimer);
     const repo = activeRepo();
+    const m = input.value.slice(0, input.selectionStart).match(/(?:^|\s)@([\w./-]*)$/);
+    if (!repo || !m) { mentionSeq++; closeMention(); return; }
+    mentionTimer = setTimeout(() => runMention(input), 120); // debounce typing
+  }
+  async function runMention(input) {
+    const seq = ++mentionSeq;
+    let files = [];
+    try { files = await getTree(); } catch (err) {
+      if (seq === mentionSeq) { closeMention(); toast(`@mention: ${errText(err)}`, "error"); }
+      return;
+    }
+    // Re-read the caret AFTER the await: the user may have kept typing (or
+    // deleted the "@") while the tree loaded — never act on a stale query.
+    if (seq !== mentionSeq) return;
     const pos = input.selectionStart;
-    const before = input.value.slice(0, pos);
-    const m = before.match(/(?:^|\s)@([\w./-]*)$/);
-    if (!repo || !m) { closeMention(); return; }
+    const m = input.value.slice(0, pos).match(/(?:^|\s)@([\w./-]*)$/);
+    if (!m || !activeRepo()) { closeMention(); return; }
     mentionStart = pos - m[1].length - 1; // index of '@'
     const query = m[1].toLowerCase();
-    let files = [];
-    try { files = await getTree(); } catch { closeMention(); return; }
-    mentionMatches = files.filter((f) => !isBinaryPath(f.path) && f.path.toLowerCase().includes(query)).slice(0, 30);
+    // Rank: basename prefix > path prefix > substring; shorter paths first.
+    const score = (p) => {
+      const lp = p.toLowerCase(), base = lp.slice(lp.lastIndexOf("/") + 1);
+      return (base.startsWith(query) ? 0 : lp.startsWith(query) ? 1 : 2) * 1000 + lp.length;
+    };
+    mentionMatches = files
+      .filter((f) => !isBinaryPath(f.path) && f.path.toLowerCase().includes(query))
+      .sort((a, b) => score(a.path) - score(b.path))
+      .slice(0, 30);
     if (!mentionMatches.length) { closeMention(); return; }
     renderMention(input);
   }
@@ -3421,24 +3895,32 @@
       mentionEl = document.createElement("div");
       mentionEl.className = "repo-pop mention-pop";
       document.body.appendChild(mentionEl);
-      const rect = $(".composer").getBoundingClientRect();
-      mentionEl.style.left = `${rect.left}px`;
-      mentionEl.style.bottom = `${window.innerHeight - rect.top + 8}px`;
-      mentionEl.style.width = `${Math.min(rect.width, 420)}px`;
     }
+    // Re-position every render: the composer grows as you type.
+    const rect = $(".composer").getBoundingClientRect();
+    mentionEl.style.left = `${rect.left}px`;
+    mentionEl.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+    mentionEl.style.width = `${Math.min(rect.width, 420)}px`;
     mentionActive = 0;
     const fileIco = `<svg class="repo-item__ico" viewBox="0 0 24 24"><path d="M14 3v5h5"/><path d="M6 2h9l5 5v13a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1z"/></svg>`;
     mentionEl.innerHTML = `<div class="repo-pop__list">` + mentionMatches.map((f, i) =>
       `<button class="repo-item${i === 0 ? " active" : ""}" type="button" data-i="${i}">${fileIco}<span class="repo-item__name">${esc(f.path)}</span></button>`).join("") + `</div>`;
     mentionEl.querySelectorAll(".repo-item").forEach((btn) => btn.addEventListener("click", () => {
       const file = mentionMatches[parseInt(btn.dataset.i, 10)];
-      // remove the "@query" token, then insert the file content
+      // Replace the "@query" token with a short `path` reference and stage the
+      // file in the context basket (sent once, size-capped) instead of pasting
+      // the whole file into the textarea.
       if (mentionStart >= 0) {
-        input.value = input.value.slice(0, mentionStart) + input.value.slice(input.selectionStart);
-        autoResize(input); updateCharCount();
+        const end = input.selectionStart;
+        const ref = `\`${file.path}\` `;
+        input.value = input.value.slice(0, mentionStart) + ref + input.value.slice(end);
+        const caret = mentionStart + ref.length;
+        input.setSelectionRange(caret, caret);
+        autoResize(input); updateCharCount(); updateSendState();
       }
       closeMention();
-      insertFileIntoChat(file.path);
+      input.focus();
+      addToBasket(file.path);
     }));
   }
 
@@ -4009,7 +4491,7 @@ a{color:#22d3ee}</style></head>
       state.basket.push({ path, content: data.content || "" });
       renderBasket();
       toast(`Staged ${path}`, "success");
-    } catch (err) { toast(err instanceof TypeError ? "Can't reach the MAX server." : err.message, "error"); }
+    } catch (err) { toast(errText(err), "error"); }
   }
   function clearBasket() { state.basket = []; renderBasket(); }
   function renderBasket() {
@@ -4029,12 +4511,22 @@ a{color:#22d3ee}</style></head>
     if (count) count.textContent = n;
     chip.title = n ? `Review ${n} staged change${n > 1 ? "s" : ""} and commit` : "";
   }
+  // Per-file and total caps for files sent as context — keeps token cost bounded.
+  const CONTEXT_FILE_CHARS = 60_000;
+  const CONTEXT_TOTAL_CHARS = 150_000;
+  function capText(text, max, label) {
+    const s = String(text || "");
+    return s.length <= max ? s : `${s.slice(0, max)}\n… (${label || "truncated"}: ${s.length - max} more characters not sent — use read_repo_file with start_line/end_line for the rest)`;
+  }
   function basketPrefix() {
     if (!state.basket.length) return "";
     const repo = activeRepo();
+    let budget = CONTEXT_TOTAL_CHARS;
     const blocks = state.basket.map((f) => {
       const lang = (f.path.split(".").pop() || "").toLowerCase();
-      return `File \`${f.path}\`${repo ? ` from ${repo.fullName}` : ""}:\n\`\`\`${lang}\n${f.content}\n\`\`\``;
+      const body = capText(f.content, Math.max(2000, Math.min(CONTEXT_FILE_CHARS, budget)), "truncated");
+      budget = Math.max(0, budget - body.length);
+      return `File \`${f.path}\`${repo ? ` from ${repo.fullName}` : ""}:\n\`\`\`${lang}\n${body}\n\`\`\``;
     });
     return `Context files:\n\n${blocks.join("\n\n")}\n\n`;
   }
@@ -5914,6 +6406,9 @@ a{color:#22d3ee}</style></head>
     updateRepoChip();
     updateUsagePill();
     if (window.innerWidth <= 820) setSidebarHidden(true);
+    // Images trimmed from the local copy (storage full) come back from the server.
+    const c = activeConvo();
+    rehydrateStripped(c).then((fixed) => { if (fixed > 0 && state.activeId === id) renderMessages(); });
   }
 
   /* ============================================================
@@ -6113,8 +6608,8 @@ a{color:#22d3ee}</style></head>
     input.addEventListener("keydown", (e) => {
       if (mentionEl) {
         if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); moveMention(e.key === "ArrowDown" ? 1 : -1); }
-        else if (e.key === "Enter" && !e.shiftKey) { const a = mentionEl.querySelector(".repo-item.active"); if (a) { e.preventDefault(); a.click(); } }
-        else if (e.key === "Escape") { closeMention(); }
+        else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") { const a = mentionEl.querySelector(".repo-item.active"); if (a) { e.preventDefault(); a.click(); } }
+        else if (e.key === "Escape") { e.preventDefault(); mentionSeq++; closeMention(); }
       } else if (slashEl) {
         const items = [...slashEl.querySelectorAll(".repo-item")];
         let idx = items.findIndex((x) => x.classList.contains("active"));
@@ -6237,6 +6732,11 @@ a{color:#22d3ee}</style></head>
     }
 
     loadState();
+    {
+      const r = repairConversations(state.conversations);
+      state.conversations = r.list;
+      if (r.fixed) safeStorageSet(localStorage, LS.convos, JSON.stringify(state.conversations));
+    }
 
     // Merge any server-persisted conversations not in localStorage (e.g. after browser clear)
     await loadConvosFromServer();
@@ -6288,17 +6788,18 @@ a{color:#22d3ee}</style></head>
     updateRepoChip();
     renderWelcomeStatus();
     updateSkillsBadge();
+    installImageGuard();
     try {
       renderConversations();
       renderMessages();
     } catch (e) {
-      console.error("Corrupted conversation state, resetting:", e);
-      state.conversations = [];
+      // Don't wipe history: just open a fresh view. The data stays in storage
+      // and on the server, and the composer keeps working.
+      console.error("Could not render the saved conversation:", e);
       state.activeId = null;
-      safeStorageSet(localStorage, LS.convos, "[]");
-      renderConversations();
-      renderMessages();
-      toast("Chat history was corrupted and has been reset.", "error");
+      try { renderConversations(); } catch {}
+      try { renderMessages(); } catch {}
+      toast("One conversation couldn't be displayed — started a fresh view. Your history is kept.", "error");
     }
     updateCharCount();
     updateSendState();

@@ -258,7 +258,21 @@ Browser ──POST /api/chat──▶ server.js ───┤
 Turn on **Auto** (the topbar pill, or Settings → Autonomous mode). Now when you
 send a task, MAX plans and executes it over several turns automatically, showing
 `Auto · step N/max` while it works. It stops when the task is complete, when it
-reaches the step limit, or when you press **Stop**. Adjust the step cap in Settings.
+reaches the step limit (6–15, set in Settings), or when you press **Stop**.
+
+Each step runs **apply edits → verify → fix**. Staged `.js/.mjs/.cjs/.json` edits
+are syntax-checked on the server (`POST /api/verify`, using `node --check` and
+`JSON.parse`; nothing is executed). If a check fails, MAX gets the errors and
+keeps fixing them. It can't finish while a check is failing. A failed turn gets
+one retry before the run stops. Every step is logged to the browser console as JSON.
+The repository's own `npm test` is not run, because MAX edits a remote repo
+through the GitHub/GitLab API and never runs that repo's code.
+
+## 💬 Standalone chat
+
+A repository is optional. With no repo selected, the top bar shows
+**Standalone Chat Mode**, chat works normally, and only the repo tools (file tree,
+commit/push) are disabled. `/api/chat` only needs a model, messages and an API key.
 
 ## 🐙 Push chats to GitHub
 
@@ -309,6 +323,34 @@ Prefer the old single‑user experience? Set `AUTH_ENABLED=false` and there's no
 - **Port already in use** — Change `PORT` in `.env` (e.g. `PORT=3000`).
 - **Code blocks / markdown not styled** — Those libraries load from a CDN; make sure you
   have internet access on first load.
+- **"Listing repository files" spins** — It can't spin forever anymore. The server
+  gives GitHub/GitLab 12 s to list a tree, the browser gives up at 15 s, and the
+  panel then shows **[Failed - Retry]**. Large repos are listed in pages of 1,000
+  files (up to 4,000).
+- **A push failed** — Pushes re-read the file's latest `sha` and retry
+  409/422/429/5xx responses up to 3 times (1 s → 2 s → 4 s). A missing branch is
+  created from the default branch. `GET /api/github/status` shows the token, rate
+  limit and the result of the last write. Details are in `data/app.log`.
+- **"Browser storage is full"** — Chat keeps working. MAX saves a smaller local
+  copy (attachment bytes removed) and the server keeps the full history, so images
+  are restored from there when you open the chat.
+
+## 🧪 Tests & logs
+
+```bash
+npm test            # node --test tests/*.test.js — no dependencies, about 10 s
+```
+
+The tests cover standalone chat (against a mock provider), image limits, push
+retries and branch creation (against a mock GitHub), tree pagination, SSRF
+blocking, `/api/verify`, logout revocation surviving a restart, JSON logging and
+graceful shutdown.
+
+Server logs are JSON lines (`{ts, level, msg, …}`) written to stdout and
+`data/app.log`. The log rotates at 5 MB, and tokens and keys are redacted. Use
+`LOG_LEVEL=debug|info|warn|error` to set the level and `MAX_DATA_DIR` to move
+`data/`. `SIGTERM`/`SIGINT` stop the server gracefully: open requests finish
+(up to 10 s) and logs are flushed before exit.
 
 ---
 
@@ -320,7 +362,12 @@ MAX/
 ├── lib/
 │   ├── providers.js   # OpenAI ⇄ Anthropic request/stream translation + fallbacks
 │   ├── models.js      # Chat model catalog (provider, capabilities)
-│   └── video.js       # Video generation: OpenRouter / Veo / gateway adapters + job manager
+│   ├── video.js       # Video generation: OpenRouter / Veo / gateway adapters + job manager
+│   ├── logger.js      # Structured JSON logger (data/app.log, rotation, secret redaction)
+│   ├── netguard.js    # SSRF guard: DNS-checked, rebinding-safe fetch for web_fetch
+│   ├── retry.js       # Exponential backoff used for GitHub/GitLab writes
+│   └── verify.js      # Syntax checks for staged edits (node --check / JSON.parse)
+├── tests/             # node --test suites (npm test)
 ├── package.json
 ├── .env.example       # Copy to .env and add your key
 └── public/

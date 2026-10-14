@@ -13,7 +13,7 @@
 
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, renameSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
@@ -23,10 +23,17 @@ import {
 } from "./lib/providers.js";
 import { buildCatalog } from "./lib/models.js";
 import { createVideoService } from "./lib/video.js";
+import { createLogger } from "./lib/logger.js";
+import { fetchPublic, BlockedUrlError } from "./lib/netguard.js";
+import { retryWithBackoff, isRetryableStatus } from "./lib/retry.js";
+import { verifyFiles } from "./lib/verify.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
-const DATA_DIR = path.join(__dirname, "data");
+// MAX_DATA_DIR lets tests / deployments keep users, logs and chats elsewhere.
+const DATA_DIR = process.env.MAX_DATA_DIR ? path.resolve(process.env.MAX_DATA_DIR) : path.join(__dirname, "data");
+// Structured JSON logs → stdout + data/app.log (secrets are redacted).
+const log = createLogger({ dir: DATA_DIR, stdout: process.env.LOG_STDOUT !== "false" });
 
 /* ------------------------------------------------------------------ */
 /*  Minimal .env loader (no dotenv dependency)                         */
@@ -127,6 +134,10 @@ const CONFIG = {
 const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_BYTES || "524288", 10); // 512 KB
 const MAX_TREE_ENTRIES = 4000;
 const MAX_FETCH_BYTES = 2 * 1024 * 1024; // 2 MB cap on fetched web pages
+const MAX_LIST_FILES = 1000; // default page size for /api/{github,gitlab}/tree
+const TREE_TIMEOUT_MS = 12_000; // upstream budget for listing a repo tree (the UI gives up at 15 s)
+const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // per image sent to /api/chat (decoded size)
+const DEFAULT_MAX_TOKENS = 4096;
 
 // Powers catalog. `status: "available"` powers work in MAX right now; the rest are
 // catalog entries you can wire up to their real backends (they open Details/links).
@@ -395,7 +406,7 @@ function loadUsers() {
 function saveUsers() {
   ensureDataDir();
   try { writeFileSync(USERS_FILE, JSON.stringify(usersCache, null, 2), { mode: 0o600 }); }
-  catch (err) { console.error("[MAX] Could not save users:", err.message); }
+  catch (err) { log.error("auth.users.save_failed", { error: err }); }
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
@@ -492,13 +503,42 @@ let BOOTSTRAP_NOTICE = "";
 
 /* ---------- session tokens (stateless, HMAC-signed) ---------- */
 // In-memory revocation map: key = payloadHash, value = exp timestamp.
+// Persisted to data/revoked.json so a logout survives a server restart.
+const REVOKED_FILE = path.join(DATA_DIR, "revoked.json");
 const _revokedTokens = new Map();
+function loadRevokedTokens() {
+  try {
+    if (!existsSync(REVOKED_FILE)) return;
+    const arr = JSON.parse(readFileSync(REVOKED_FILE, "utf8"));
+    const now = Date.now();
+    if (Array.isArray(arr)) {
+      for (const e of arr) {
+        if (Array.isArray(e) && typeof e[0] === "string" && Number(e[1]) > now) _revokedTokens.set(e[0], Number(e[1]));
+      }
+    }
+  } catch (err) {
+    log.warn("auth.revoked.load_failed", { error: err });
+  }
+}
+function persistRevokedTokens() {
+  ensureDataDir();
+  const tmp = `${REVOKED_FILE}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify([..._revokedTokens.entries()]), { mode: 0o600 });
+    renameSync(tmp, REVOKED_FILE); // atomic replace: a crash never leaves half a file
+  } catch (err) {
+    log.warn("auth.revoked.save_failed", { error: err });
+  }
+}
+loadRevokedTokens();
 // Periodically clean expired entries every 10 minutes.
 setInterval(() => {
   const now = Date.now();
+  let changed = false;
   for (const [hash, exp] of _revokedTokens) {
-    if (now > exp) _revokedTokens.delete(hash);
+    if (now > exp) { _revokedTokens.delete(hash); changed = true; }
   }
+  if (changed) persistRevokedTokens();
 }, 10 * 60_000).unref();
 
 function _revokeToken(token) {
@@ -509,6 +549,7 @@ function _revokeToken(token) {
     const exp = data.exp || Date.now() + CONFIG.auth.sessionTtlHours * 3600_000;
     const payloadHash = crypto.createHash("sha256").update(payload).digest("hex");
     _revokedTokens.set(payloadHash, exp);
+    persistRevokedTokens();
   } catch {}
 }
 
@@ -960,16 +1001,22 @@ async function handleChat(req, res) {
   if (!model || model.length > 120) {
     return sendJson(res, 400, { error: { type: "bad_request", message: "A valid model ID is required." } });
   }
+  const badImage = findInvalidImage(messages);
+  if (badImage) {
+    return sendJson(res, badImage.status, { error: { type: badImage.type, message: badImage.message } });
+  }
   if (!messages.length || !messages.every(isValidMessage)) {
     return sendJson(res, 400, {
       error: { type: "bad_request", message: "messages must be a non-empty array of valid user/assistant messages." },
     });
   }
+  // A repository is OPTIONAL: /api/chat never needs repo/owner/token. Repo
+  // context only reaches the model through the browser's tool calls.
 
   // Canonical (Anthropic-shaped) body; translated per provider below.
   const base = {
     model,
-    max_tokens: clampInt(payload.max_tokens, 1, 64000, 8192),
+    max_tokens: clampInt(payload.max_tokens, 1, 64000, DEFAULT_MAX_TOKENS),
     messages,
     stream: payload.stream !== false,
   };
@@ -1011,7 +1058,7 @@ async function handleChat(req, res) {
     cleanup();
     if (controller.signal.aborted && !st.timedOut) return; // client left
     const cause = err?.cause?.code || err?.cause?.message || err?.code || err?.message || "unknown error";
-    console.error(`[MAX] Upstream fetch failed (${upstreamUrl}):`, cause);
+    log.error("chat.upstream_failed", { provider: prov.id, model, url: upstreamUrl, cause, timedOut: st.timedOut });
     return sendJson(res, st.timedOut ? 504 : 502, {
       error: {
         type: st.timedOut ? "timeout" : "network",
@@ -1022,12 +1069,13 @@ async function handleChat(req, res) {
     });
   }
   const { upstream, notes } = result;
-  if (notes.length) console.log(`[MAX] ${prov.id}/${model}: compatibility fallback (${notes.join("; ")})`);
+  if (notes.length) log.info("chat.compat_fallback", { provider: prov.id, model, notes });
 
   if (!upstream.ok) {
     cleanup();
     let detail = "";
     try { detail = await upstream.text(); } catch {}
+    log.warn("chat.upstream_error", { provider: prov.id, model, status: upstream.status });
     let parsed = null;
     try { parsed = JSON.parse(detail); } catch {}
     let message = parsed?.error?.message || parsed?.message || (typeof parsed?.error === "string" ? parsed.error : "") ||
@@ -1137,6 +1185,32 @@ async function handleModelsRefresh(req, res) {
 }
 
 const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const base64Bytes = (b64) => {
+  const s = String(b64 || "");
+  const pad = s.endsWith("==") ? 2 : s.endsWith("=") ? 1 : 0;
+  return Math.floor((s.length * 3) / 4) - pad;
+};
+
+// Returns { status, type, message } for the first unsupported/oversized image
+// block, or null. Gives the user a precise reason instead of a generic 400.
+function findInvalidImage(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (const m of messages) {
+    if (!m || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (!b || b.type !== "image") continue;
+      const mt = b.source?.media_type;
+      if (b.source?.type !== "base64" || !ALLOWED_IMAGE_TYPES.has(mt)) {
+        return { status: 415, type: "unsupported_image", message: `Unsupported image type "${mt || "unknown"}". Use JPEG, PNG, WebP or GIF.` };
+      }
+      const bytes = base64Bytes(b.source.data);
+      if (bytes > MAX_IMAGE_BYTES) {
+        return { status: 413, type: "image_too_large", message: `An image is ${(bytes / 1048576).toFixed(1)} MB; the limit is ${MAX_IMAGE_BYTES / 1048576} MB per image. Resize it and try again.` };
+      }
+    }
+  }
+  return null;
+}
 
 function isValidMessage(message) {
   if (!message || !["user", "assistant"].includes(message.role)) return false;
@@ -1203,6 +1277,49 @@ function mapStatusType(status) {
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ---------- reliable git writes: retry 409/422/429/5xx with 1s → 2s → 4s ---------- */
+// githubApi/gitlabApi return results instead of throwing, so a write attempt
+// throws this to ask retryWithBackoff for another (fresh-sha) attempt.
+class RetryableHttpError extends Error {
+  constructor(resp, what) {
+    super(`${what}: HTTP ${resp?.status}`);
+    this.name = "RetryableHttpError";
+    this.resp = resp;
+    this.status = resp?.status;
+  }
+}
+const WRITE_RETRY = { retries: 3, baseMs: 1000, factor: 2, maxMs: 4000 };
+const isNetworkError = (err) => !(err instanceof RetryableHttpError) &&
+  (err?.name === "AbortError" || err instanceof TypeError || /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket/i.test(String(err?.cause?.code || err?.message || "")));
+// A hard rate limit (remaining = 0) won't clear in 4 s — fail fast instead.
+const rateLimitExhausted = (resp) => resp?.headers?.get?.("x-ratelimit-remaining") === "0";
+/** Throw if `resp` failed with a status worth retrying; otherwise return it. */
+function retryable(resp, what) {
+  if (resp && !resp.ok && isRetryableStatus(resp.status) && !rateLimitExhausted(resp)) throw new RetryableHttpError(resp, what);
+  return resp;
+}
+// Last write per provider, surfaced by /api/github/status.
+const WRITE_STATUS = { github: null, gitlab: null };
+async function withWriteRetry(event, meta, fn) {
+  const started = Date.now();
+  let attempts = 0;
+  try {
+    const out = await retryWithBackoff(async (attempt) => { attempts = attempt; return fn(attempt); }, {
+      ...WRITE_RETRY,
+      shouldRetry: (err) => err instanceof RetryableHttpError || isNetworkError(err),
+      onRetry: (err, attempt, waitMs) => log.warn(`${event}.retry`, { ...meta, attempt, waitMs, status: err?.status, error: err?.message }),
+    });
+    return { out, attempts, ms: Date.now() - started };
+  } catch (err) {
+    err.attempts = err.attempts || attempts;
+    throw err;
+  }
+}
+function recordWrite(provider, entry) {
+  WRITE_STATUS[provider] = { at: new Date().toISOString(), ...entry };
+  log[entry.ok ? "info" : "warn"](`${provider}.write.${entry.ok ? "ok" : "failed"}`, entry);
+}
 
 // Sanitize + validate a set of file edits for committing. Each entry is either
 // a write { path, content } or a deletion { path, deleted:true }.
@@ -1323,8 +1440,11 @@ async function githubApi(token, method, apiPath, body, opts = {}) {
   }
 }
 
-function ghError(res, resp, fallback) {
+// `override` (optional) leads the message, e.g. "Push failed after 4 attempts";
+// GitHub's own detail is appended so nothing useful is lost.
+function ghError(res, resp, fallback, override) {
   let message = resp?.json?.message || resp?.text || fallback || "GitHub request failed";
+  if (override) message = resp?.json?.message ? `${override} (GitHub: ${String(resp.json.message).slice(0, 300)})` : override;
   const status = resp?.status || 502;
   const remaining = resp?.headers?.get?.("x-ratelimit-remaining");
   if ((status === 403 || status === 429) && (remaining === "0" || /rate limit/i.test(message))) {
@@ -1389,6 +1509,60 @@ async function handleGithubTest(req, res) {
   }
 }
 
+// GET (server token) or POST { token? } — connection + rate-limit health and the
+// outcome of the most recent push/commit, so flaky pushes are diagnosable.
+async function handleGithubStatus(req, res) {
+  let payload = {};
+  if (req.method === "POST") { try { payload = JSON.parse((await readBody(req, 64 * 1024)) || "{}"); } catch {} }
+  const gh = resolveGithub(payload);
+  const base = {
+    ok: true, provider: "github",
+    tokenSource: gh.token ? (CONFIG.github.allowClientToken && payload.token ? "client" : "server") : "none",
+    lastWrite: WRITE_STATUS.github, lastGitlabWrite: WRITE_STATUS.gitlab,
+  };
+  if (!gh.token) return sendJson(res, 200, { ...base, connected: false, message: "No GitHub token configured." });
+  try {
+    // /rate_limit does not count against the rate limit.
+    const [who, rate] = await Promise.all([
+      githubApi(gh.token, "GET", "/user", null, { timeoutMs: 10_000 }),
+      githubApi(gh.token, "GET", "/rate_limit", null, { noCache: true, timeoutMs: 10_000 }),
+    ]);
+    const core = rate.json?.resources?.core || {};
+    return sendJson(res, 200, {
+      ...base,
+      connected: who.ok,
+      status: who.status,
+      login: who.json?.login || null,
+      scopes: who.headers?.get?.("x-oauth-scopes") || "",
+      rate: rate.ok ? { limit: core.limit, remaining: core.remaining, resetAt: core.reset ? new Date(core.reset * 1000).toISOString() : null } : null,
+      message: who.ok ? `Connected as ${who.json?.login}.` : (who.json?.message || `GitHub answered HTTP ${who.status}.`),
+    });
+  } catch (err) {
+    return sendJson(res, 200, { ...base, connected: false, message: `Could not reach GitHub (${err?.name === "AbortError" ? "timeout" : err?.cause?.code || err?.message}).` });
+  }
+}
+
+// POST { files: [{ path, content } | { path, deleted }] } → syntax-check staged
+// edits WITHOUT executing them (node --check for JS, JSON.parse for JSON).
+// Used by Autonomous mode's apply → verify → fix loop.
+async function handleVerify(req, res) {
+  if (!checkRateLimit(clientIp(req))) return sendJson(res, 429, { error: { type: "rate_limit", message: "Too many requests." } });
+  let payload = {};
+  try { payload = JSON.parse((await readBody(req, 8 * 1024 * 1024)) || "{}"); } catch {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Invalid JSON body." } });
+  }
+  if (Array.isArray(payload.files) && payload.files.length > 50) {
+    return sendJson(res, 400, { error: { type: "bad_request", message: "Verify at most 50 files per request." } });
+  }
+  const files = normalizeFiles(payload.files);
+  if (!files) return sendJson(res, 400, { error: { type: "bad_request", message: "files must be a non-empty array of { path, content } within the size limit." } });
+  const started = Date.now();
+  const result = await verifyFiles(files, { timeoutMs: 10_000 });
+  const failed = result.results.filter((r) => !r.ok).map((r) => r.path);
+  log[result.ok ? "info" : "warn"]("verify.done", { files: files.length, failed, ms: Date.now() - started });
+  return sendJson(res, 200, { ok: result.ok, results: result.results, ms: Date.now() - started });
+}
+
 async function handleGithubRepos(req, res) {
   let payload = {};
   try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
@@ -1451,37 +1625,87 @@ async function handleGithubPush(req, res) {
   const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
   const base = `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/contents/${encodedPath}`;
 
+  const meta = { repo: `${gh.owner}/${gh.repo}`, branch: gh.branch, path: filePath };
   try {
-    // Look up existing file to obtain its sha (needed to update in place).
-    let sha;
-    const existing = await githubApi(gh.token, "GET", `${base}?ref=${encodeURIComponent(gh.branch)}`);
-    if (existing.ok && existing.json && !Array.isArray(existing.json)) sha = existing.json.sha;
-    else if (existing.status !== 404) {
-      // 404 is fine (new file); anything else that isn't ok is a real error.
-      if (!existing.ok) return ghError(res, existing, "Could not read the target path.");
-    }
+    // Make sure the branch exists (create it from the default branch if not).
+    const br = await ensureGithubBranch(gh);
+    if (br.fail) return ghError(res, br.fail, br.message);
 
-    const put = await githubApi(gh.token, "PUT", base, {
-      message,
-      content: Buffer.from(content, "utf8").toString("base64"),
-      branch: gh.branch,
-      ...(sha ? { sha } : {}),
+    const { out, attempts } = await withWriteRetry("github.push", meta, async () => {
+      // ALWAYS re-fetch the latest sha right before the PUT (no ETag cache), so a
+      // concurrent commit can't make us send a stale sha (→ 409/422).
+      let sha;
+      const existing = retryable(await githubApi(gh.token, "GET", `${base}?ref=${encodeURIComponent(gh.branch)}`, null, { noCache: true }), "read sha");
+      if (existing.ok && existing.json && !Array.isArray(existing.json)) sha = existing.json.sha;
+      else if (existing.ok && Array.isArray(existing.json)) return { fail: { status: 400, json: { message: `${filePath} is a directory.` } } };
+      else if (existing.status !== 404) return { fail: existing, message: "Could not read the target path." };
+      // Already identical on the branch (e.g. a previous attempt's PUT landed but
+      // its response was lost) → don't create another commit.
+      if (sha && typeof existing.json?.content === "string" &&
+          Buffer.from(existing.json.content, "base64").equals(Buffer.from(content, "utf8"))) {
+        return { put: { json: { content: { html_url: existing.json.html_url }, commit: {} } }, sha, unchanged: true };
+      }
+
+      const put = retryable(await githubApi(gh.token, "PUT", base, {
+        message,
+        content: Buffer.from(content, "utf8").toString("base64"),
+        branch: gh.branch,
+        ...(sha ? { sha } : {}),
+      }), "put contents");
+      if (!put.ok) return { fail: put, message: "Push failed." };
+      return { put, sha };
     });
-    if (!put.ok) return ghError(res, put, "Push failed.");
-
+    if (out.fail) {
+      recordWrite("github", { ok: false, kind: "push", ...meta, status: out.fail.status, attempts });
+      return ghError(res, out.fail, out.message);
+    }
+    const { put, sha, unchanged } = out;
+    recordWrite("github", { ok: true, kind: "push", ...meta, attempts, branchCreated: br.created, commitSha: put.json?.commit?.sha, unchanged: Boolean(unchanged) });
+    if (unchanged) {
+      return sendJson(res, 200, {
+        ok: true, path: filePath, updated: false, unchanged: true, attempts, htmlUrl: put.json?.content?.html_url,
+        message: `${filePath} on ${gh.owner}/${gh.repo}@${gh.branch} is already up to date.`,
+      });
+    }
     return sendJson(res, 200, {
       ok: true,
       path: filePath,
       updated: Boolean(sha),
+      attempts,
+      branchCreated: br.created,
       htmlUrl: put.json?.content?.html_url,
       commitUrl: put.json?.commit?.html_url,
       commitSha: put.json?.commit?.sha,
-      message: `${sha ? "Updated" : "Created"} ${filePath} on ${gh.owner}/${gh.repo}@${gh.branch}.`,
+      message: `${sha ? "Updated" : "Created"} ${filePath} on ${gh.owner}/${gh.repo}@${gh.branch}${br.created ? " (new branch)" : ""}.`,
     });
   } catch (err) {
-    const cause = err?.cause?.code || err?.message || "unknown error";
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitHub (${cause}).` } });
+    recordWrite("github", { ok: false, kind: "push", ...meta, attempts: err.attempts, status: err.status, error: err.message });
+    if (err instanceof RetryableHttpError) return ghError(res, err.resp, null, `Push failed after ${err.attempts} attempts (GitHub kept answering HTTP ${err.status}). Try again in a moment.`);
+    return ghNetErr(res, err);
   }
+}
+
+// Ensure gh.branch exists; if it doesn't (404), create it from the repo's
+// default branch. Resolves { ok, created } or { fail, message }.
+async function ensureGithubBranch(gh) {
+  const root = ghRepoRoot(gh);
+  const refUrl = (b) => `${root}/git/ref/heads/${b.split("/").map(encodeURIComponent).join("/")}`;
+  const ref = await githubApi(gh.token, "GET", refUrl(gh.branch), null, { noCache: true });
+  if (ref.ok) return { ok: true, created: false };
+  // 409 = empty repository: the Contents API creates the first commit itself.
+  if (ref.status === 409) return { ok: true, created: false };
+  if (ref.status !== 404) return { fail: ref, message: `Could not check branch "${gh.branch}".` };
+  const repo = await githubApi(gh.token, "GET", root);
+  if (!repo.ok) return { fail: repo, message: `Repository ${gh.owner}/${gh.repo} not found or not accessible.` };
+  const def = repo.json?.default_branch || "main";
+  if (def === gh.branch) return { ok: true, created: false };
+  const defRef = await githubApi(gh.token, "GET", refUrl(def), null, { noCache: true });
+  if (!defRef.ok) return defRef.status === 409 ? { ok: true, created: false } : { fail: defRef, message: `Could not read default branch "${def}".` };
+  const made = await githubApi(gh.token, "POST", `${root}/git/refs`, { ref: `refs/heads/${gh.branch}`, sha: defRef.json?.object?.sha });
+  // 422 "Reference already exists" = someone created it concurrently — fine.
+  if (!made.ok && made.status !== 422) return { fail: made, message: `Could not create branch "${gh.branch}".` };
+  log.info("github.branch.created", { repo: `${gh.owner}/${gh.repo}`, branch: gh.branch, from: def });
+  return { ok: true, created: made.ok };
 }
 
 // Conditional-request cache for GitHub GETs. GitHub answers If-None-Match with
@@ -1556,21 +1780,61 @@ async function handleGithubTree(req, res) {
   if (!gh.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitHub token provided." } });
   if (!gh.owner || !gh.repo) return sendJson(res, 400, { error: { type: "bad_request", message: "Owner and repository are required." } });
 
+  const snapKey = treeSnapshotKey("github", gh.token, `${gh.owner}/${gh.repo}`, gh.branch);
+  const snap = getTreeSnapshot(snapKey, payload);
+  if (snap) return sendJson(res, 200, { ok: true, branch: gh.branch, sha: snap.sha, cached: true, ...pageFiles(snap.all, payload, snap.truncated) });
   try {
-    const r = await githubApi(gh.token, "GET", `${ghRepoRoot(gh)}/git/trees/${encodeURIComponent(gh.branch)}?recursive=1`);
-    if (r.status === 409) return sendJson(res, 200, { ok: true, branch: gh.branch, sha: "", files: [], empty: true });
+    // Hard upstream budget: the tree endpoint must answer (or fail) — never hang.
+    const r = await githubApi(gh.token, "GET", `${ghRepoRoot(gh)}/git/trees/${encodeURIComponent(gh.branch)}?recursive=1`, null, { timeoutMs: TREE_TIMEOUT_MS });
+    if (r.status === 409) return sendJson(res, 200, { ok: true, branch: gh.branch, sha: "", files: [], total: 0, offset: 0, nextOffset: null, empty: true });
     if (!r.ok) return ghError(res, r, `Could not read the repository tree for branch "${gh.branch}".`);
-    const files = (r.json?.tree || [])
-      .filter((t) => t.type === "blob")
-      .slice(0, MAX_TREE_ENTRIES)
-      .map((t) => ({ path: t.path, size: t.size || 0 }));
+    const all = (r.json?.tree || []).filter((t) => t.type === "blob").map((t) => ({ path: t.path, size: t.size || 0 }));
+    putTreeSnapshot(snapKey, { all, truncated: Boolean(r.json?.truncated), sha: r.json?.sha || "" });
     return sendJson(res, 200, {
-      ok: true, branch: gh.branch, sha: r.json?.sha || "", truncated: Boolean(r.json?.truncated) || (r.json?.tree || []).length > MAX_TREE_ENTRIES,
-      files, cached: Boolean(r.cached),
+      ok: true, branch: gh.branch, sha: r.json?.sha || "", cached: Boolean(r.cached),
+      ...pageFiles(all, payload, Boolean(r.json?.truncated)),
     });
   } catch (err) {
+    if (err?.name === "AbortError") {
+      log.warn("github.tree.timeout", { repo: `${gh.owner}/${gh.repo}`, branch: gh.branch, ms: TREE_TIMEOUT_MS });
+      return sendJson(res, 504, { error: { type: "timeout", message: `GitHub took longer than ${TREE_TIMEOUT_MS / 1000}s to list the files. Try again.` } });
+    }
     return ghNetErr(res, err);
   }
+}
+
+// Snapshot of the last full listing per (provider, repo, branch, token). Page 1
+// (offset 0) always refreshes it; later pages are served from it, so paging is
+// fast and every page comes from the SAME snapshot (no skipped/duplicate files).
+const TREE_SNAPSHOTS = new Map(); // key -> { at, all, truncated, sha }
+const TREE_SNAPSHOT_TTL = 120_000;
+function treeSnapshotKey(provider, token, repo, branch) {
+  return crypto.createHash("sha256").update(`${provider}\n${token}\n${repo}\n${branch}`).digest("hex");
+}
+function getTreeSnapshot(key, payload) {
+  if (!(clampInt(payload?.offset, 0, 1e9, 0) > 0)) return null;
+  const s = TREE_SNAPSHOTS.get(key);
+  return s && Date.now() - s.at < TREE_SNAPSHOT_TTL ? s : null;
+}
+function putTreeSnapshot(key, snap) {
+  TREE_SNAPSHOTS.delete(key);
+  TREE_SNAPSHOTS.set(key, { at: Date.now(), ...snap });
+  while (TREE_SNAPSHOTS.size > 50) TREE_SNAPSHOTS.delete(TREE_SNAPSHOTS.keys().next().value);
+}
+
+// Page a file list: payload.offset (default 0) + payload.limit (default
+// MAX_LIST_FILES, max MAX_TREE_ENTRIES). `nextOffset` is null on the last page.
+function pageFiles(all, payload, upstreamTruncated) {
+  const capped = all.slice(0, MAX_TREE_ENTRIES);
+  const offset = clampInt(payload?.offset, 0, capped.length, 0);
+  const limit = clampInt(payload?.limit, 1, MAX_TREE_ENTRIES, MAX_LIST_FILES);
+  const files = capped.slice(offset, offset + limit);
+  const end = offset + files.length;
+  return {
+    files, offset, total: capped.length,
+    nextOffset: end < capped.length ? end : null,
+    truncated: Boolean(upstreamTruncated) || all.length > MAX_TREE_ENTRIES,
+  };
 }
 
 async function handleGithubFile(req, res) {
@@ -1620,10 +1884,10 @@ function resolveGitlab(payload) {
   };
 }
 
-async function gitlabApi(token, method, apiPath, body) {
+async function gitlabApi(token, method, apiPath, body, opts = {}) {
   const url = `${CONFIG.gitlab.apiBase}${apiPath}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25_000);
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, opts.timeoutMs || 25_000));
   try {
     const r = await fetch(url, {
       method,
@@ -1646,9 +1910,11 @@ async function gitlabApi(token, method, apiPath, body) {
 
 // Follow GitLab's x-next-page header across pages.
 
-function glError(res, resp, fallback) {
-  const message = resp?.json?.message || resp?.json?.error || resp?.text || fallback || "GitLab request failed";
-  return sendJson(res, resp?.status || 502, { error: { type: mapStatusType(resp?.status || 502), status: resp?.status, message: typeof message === "string" ? message : fallback } });
+function glError(res, resp, fallback, override) {
+  let message = resp?.json?.message || resp?.json?.error || resp?.text || fallback || "GitLab request failed";
+  if (typeof message !== "string") message = JSON.stringify(message).slice(0, 300) || fallback;
+  if (override) message = `${override} (GitLab: ${String(message).slice(0, 300)})`;
+  return sendJson(res, resp?.status || 502, { error: { type: mapStatusType(resp?.status || 502), status: resp?.status, message } });
 }
 const glProjectPath = (id) => encodeURIComponent(id);
 
@@ -1695,30 +1961,42 @@ async function handleGitlabTree(req, res) {
   const gl = resolveGitlab(payload);
   if (!gl.token) return sendJson(res, 401, { error: { type: "no_token", message: "No GitLab token provided." } });
   if (!gl.projectId) return sendJson(res, 400, { error: { type: "bad_request", message: "A project is required." } });
+  const snapKey = treeSnapshotKey("gitlab", gl.token, gl.projectId, gl.branch);
+  const snap = getTreeSnapshot(snapKey, payload);
+  if (snap) return sendJson(res, 200, { ok: true, branch: gl.branch, cached: true, ...pageFiles(snap.all, payload, snap.truncated) });
   try {
     const r = await gitlabAll(gl.token,
       `/projects/${glProjectPath(gl.projectId)}/repository/tree?recursive=true&ref=${encodeURIComponent(gl.branch)}`,
-      Math.ceil(MAX_TREE_ENTRIES / 100));
+      Math.ceil(MAX_TREE_ENTRIES / 100), { deadlineMs: TREE_TIMEOUT_MS });
     if (r.error) {
-      if (r.error.status === 404) return sendJson(res, 200, { ok: true, branch: gl.branch, files: [], empty: true });
+      if (r.error.status === 404) return sendJson(res, 200, { ok: true, branch: gl.branch, files: [], total: 0, offset: 0, nextOffset: null, empty: true });
       return glError(res, r.error, "Could not read the repository tree.");
     }
-    const files = r.items
-      .filter((t) => t.type === "blob")
-      .slice(0, MAX_TREE_ENTRIES)
-      .map((t) => ({ path: t.path, size: 0 }));
-    return sendJson(res, 200, { ok: true, branch: gl.branch, files, truncated: r.more });
+    const all = r.items.filter((t) => t.type === "blob").map((t) => ({ path: t.path, size: 0 }));
+    putTreeSnapshot(snapKey, { all, truncated: r.more, sha: "" });
+    return sendJson(res, 200, { ok: true, branch: gl.branch, ...pageFiles(all, payload, r.more) });
   } catch (err) {
-    return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
+    return sendJson(res, err?.name === "AbortError" ? 504 : 502, { error: { type: "network", message: `Could not reach GitLab (${err?.name === "AbortError" ? "timed out listing files" : err?.cause?.code || err?.message}).` } });
   }
 }
 
-async function gitlabAll(token, apiPath, maxPages) {
+// Follow GitLab's x-next-page header. `deadlineMs` bounds the WHOLE walk so a
+// huge repo returns a partial (truncated) list instead of hanging the UI.
+async function gitlabAll(token, apiPath, maxPages, { deadlineMs = 0 } = {}) {
   let out = [];
   let page = 1;
+  const deadline = deadlineMs ? Date.now() + deadlineMs : 0;
   for (let i = 0; i < maxPages && page; i++) {
+    const left = deadline ? deadline - Date.now() : 25_000;
+    if (deadline && left < 500) break; // out of time → report "more"
     const sep = apiPath.includes("?") ? "&" : "?";
-    const r = await gitlabApi(token, "GET", `${apiPath}${sep}per_page=100&page=${page}`);
+    let r;
+    try {
+      r = await gitlabApi(token, "GET", `${apiPath}${sep}per_page=100&page=${page}`, null, { timeoutMs: Math.min(25_000, left) });
+    } catch (err) {
+      if (i === 0) throw err;
+      break; // later page timed out: keep what we have
+    }
     if (!r.ok) { if (i === 0) return { error: r }; break; }
     if (Array.isArray(r.json)) out = out.concat(r.json);
     page = Number(r.headers?.get?.("x-next-page")) || 0;
@@ -1753,8 +2031,11 @@ async function handleGitlabFile(req, res) {
     if (!r.ok) return glError(res, r, "Could not read the file.");
     const size = r.json?.size || 0;
     if (size > MAX_FILE_BYTES) return sendJson(res, 413, { error: { type: "too_large", message: `File is too large to load (limit ${Math.round(MAX_FILE_BYTES / 1024)} KB).` } });
-    const text = Buffer.from(r.json?.content || "", "base64").toString("utf8");
-    return sendJson(res, 200, { ok: true, path: filePath, size, content: text });
+    const buf = Buffer.from(r.json?.content || "", "base64");
+    if (looksBinary(buf)) {
+      return sendJson(res, 415, { error: { type: "unsupported", message: `${filePath} is a binary file (${Math.round(size / 1024)} KB) and can't be loaded as text.` } });
+    }
+    return sendJson(res, 200, { ok: true, path: filePath, size, sha: r.json?.blob_id || "", content: buf.toString("utf8") });
   } catch (err) {
     return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
   }
@@ -1774,20 +2055,58 @@ async function handleGitlabPush(req, res) {
   const message = String(payload.message || `Add ${filePath} via MAX`).slice(0, 500);
   const fileApi = `/projects/${glProjectPath(gl.projectId)}/repository/files/${encodeURIComponent(filePath)}`;
 
+  const meta = { repo: gl.projectId, branch: gl.branch, path: filePath };
+  const proj = `/projects/${glProjectPath(gl.projectId)}`;
   try {
-    // Does the file already exist on this branch?
-    const head = await gitlabApi(gl.token, "GET", `${fileApi}?ref=${encodeURIComponent(gl.branch)}`);
-    const exists = head.ok;
-    const body = { branch: gl.branch, content, commit_message: message, encoding: "text" };
-    const write = await gitlabApi(gl.token, exists ? "PUT" : "POST", fileApi, body);
-    if (!write.ok) return glError(res, write, "Push failed.");
+    // Missing branch → create it from the project's default branch (start_branch).
+    let startBranch = null;
+    const br = await gitlabApi(gl.token, "GET", `${proj}/repository/branches/${encodeURIComponent(gl.branch)}`);
+    if (br.status === 404) {
+      const p = await gitlabApi(gl.token, "GET", proj);
+      if (!p.ok) return glError(res, p, "Project not found or not accessible.");
+      if (p.json?.default_branch && p.json.default_branch !== gl.branch) startBranch = p.json.default_branch;
+    }
+    const { out, attempts } = await withWriteRetry("gitlab.push", meta, async () => {
+      // Re-check existence every attempt (create vs update can change under us).
+      const ref = startBranch && !(await gitlabApi(gl.token, "GET", `${proj}/repository/branches/${encodeURIComponent(gl.branch)}`)).ok ? startBranch : gl.branch;
+      if (ref === gl.branch) startBranch = null; // branch exists now (maybe from a lost earlier attempt)
+      const head = await gitlabApi(gl.token, "GET", `${fileApi}?ref=${encodeURIComponent(ref)}`);
+      retryable(head.status >= 500 ? head : { ok: true }, "read file");
+      const exists = head.ok;
+      // Identical already (e.g. an earlier attempt landed but its reply was lost).
+      if (exists && !startBranch && typeof head.json?.content === "string" &&
+          Buffer.from(head.json.content, "base64").equals(Buffer.from(content, "utf8"))) {
+        return { exists, unchanged: true };
+      }
+      const body = { branch: gl.branch, content, commit_message: message, encoding: "text", ...(startBranch ? { start_branch: startBranch } : {}) };
+      const write = glRetryable(await gitlabApi(gl.token, exists ? "PUT" : "POST", fileApi, body), "write file");
+      if (!write.ok) return { fail: write };
+      return { exists, branchCreated: Boolean(startBranch) };
+    });
+    if (out.fail) {
+      recordWrite("gitlab", { ok: false, kind: "push", ...meta, status: out.fail.status, attempts });
+      return glError(res, out.fail, "Push failed.");
+    }
+    recordWrite("gitlab", { ok: true, kind: "push", ...meta, attempts, unchanged: Boolean(out.unchanged), branchCreated: Boolean(out.branchCreated) });
     return sendJson(res, 200, {
-      ok: true, path: filePath, updated: exists,
-      message: `${exists ? "Updated" : "Created"} ${filePath} on ${gl.projectId}@${gl.branch}.`,
+      ok: true, path: filePath, updated: out.exists && !out.unchanged, unchanged: Boolean(out.unchanged), branchCreated: Boolean(out.branchCreated), attempts,
+      message: out.unchanged
+        ? `${filePath} on ${gl.projectId}@${gl.branch} is already up to date.`
+        : `${out.exists ? "Updated" : "Created"} ${filePath} on ${gl.projectId}@${gl.branch}${out.branchCreated ? " (new branch)" : ""}.`,
     });
   } catch (err) {
+    recordWrite("gitlab", { ok: false, kind: "push", ...meta, attempts: err.attempts, status: err.status, error: err.message });
+    if (err instanceof RetryableHttpError) return glError(res, err.resp, null, `Push failed after ${err.attempts} attempts.`);
     return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
   }
+}
+
+// GitLab answers a create/update race with 400 "already exists"/"doesn't exist";
+// re-deciding create vs update on the next attempt fixes it, so retry those too.
+function glRetryable(resp, what) {
+  const msg = String(resp?.json?.message || resp?.text || "");
+  if (resp && resp.status === 400 && /already exists|does ?n[o']t exist|not found/i.test(msg)) throw new RetryableHttpError(resp, what);
+  return retryable(resp, what);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1811,59 +2130,86 @@ async function handleGithubCommit(req, res) {
   const root = ghRepoRoot(gh);
   const refPath = (b) => `${root}/git/ref/heads/${b.split("/").map(encodeURIComponent).join("/")}`;
 
+  const meta = { repo: `${gh.owner}/${gh.repo}`, base, branch: target, files: files.length };
   try {
-    const baseRef = await githubApi(gh.token, "GET", refPath(base), null, { noCache: true });
-    if (!baseRef.ok) return ghError(res, baseRef, `Could not find base branch "${base}".`);
-    let parentSha = baseRef.json?.object?.sha;
-    let targetExists = target === base;
-    if (target !== base) {
-      const t = await githubApi(gh.token, "GET", refPath(target), null, { noCache: true });
-      if (t.ok) { targetExists = true; parentSha = t.json?.object?.sha || parentSha; }
-    }
-
-    const parent = await githubApi(gh.token, "GET", `${root}/git/commits/${parentSha}`);
-    if (!parent.ok) return ghError(res, parent, "Could not read the branch head commit.");
-    const baseTree = parent.json?.tree?.sha;
-
-    // Existing paths (for safe deletions + preserving executable modes).
-    const modes = new Map();
-    let treeTruncated = false;
-    const tree = await githubApi(gh.token, "GET", `${root}/git/trees/${baseTree}?recursive=1`);
-    if (tree.ok) {
-      treeTruncated = Boolean(tree.json?.truncated);
-      for (const t of tree.json?.tree || []) if (t.type === "blob") modes.set(t.path, t.mode);
-    }
-
-    const entries = [];
-    const committed = [];
-    for (const f of files) {
-      if (f.deleted) {
-        if (!modes.has(f.path) && !treeTruncated) { committed.push({ path: f.path, deleted: true, skipped: true }); continue; }
-        entries.push({ path: f.path, mode: modes.get(f.path) || "100644", type: "blob", sha: null });
-        committed.push({ path: f.path, deleted: true });
-      } else {
-        entries.push({ path: f.path, mode: modes.get(f.path) || "100644", type: "blob", content: f.content });
-        committed.push({ path: f.path, updated: modes.has(f.path) });
+    // Each attempt re-reads the branch heads, so if someone pushed in between
+    // (non-fast-forward → 422/409) the retry builds on the NEW head.
+    // The commit made by the previous attempt. If that attempt's ref update
+    // actually landed but its response was lost (timeout), the branch head now
+    // IS that commit — report success instead of stacking a duplicate commit.
+    let prevCommit = null;
+    const { out, attempts } = await withWriteRetry("github.commit", meta, async () => {
+      const baseRef = retryable(await githubApi(gh.token, "GET", refPath(base), null, { noCache: true }), "read base ref");
+      if (!baseRef.ok) return { fail: baseRef, message: `Could not find base branch "${base}".` };
+      let parentSha = baseRef.json?.object?.sha;
+      let targetExists = target === base;
+      if (target !== base) {
+        const t = await githubApi(gh.token, "GET", refPath(target), null, { noCache: true });
+        if (t.ok) { targetExists = true; parentSha = t.json?.object?.sha || parentSha; }
+        else retryable(t.status === 404 ? { ok: true } : t, "read target ref"); // 404 → we'll create it
       }
+      if (prevCommit && parentSha === prevCommit.commit.sha) {
+        log.info("github.commit.already_applied", { ...meta, commitSha: parentSha });
+        return prevCommit;
+      }
+
+      const parent = retryable(await githubApi(gh.token, "GET", `${root}/git/commits/${parentSha}`), "read head commit");
+      if (!parent.ok) return { fail: parent, message: "Could not read the branch head commit." };
+      const baseTree = parent.json?.tree?.sha;
+
+      // Existing paths (for safe deletions + preserving executable modes).
+      const modes = new Map();
+      let treeTruncated = false;
+      const tree = await githubApi(gh.token, "GET", `${root}/git/trees/${baseTree}?recursive=1`, null, { timeoutMs: TREE_TIMEOUT_MS });
+      if (tree.ok) {
+        treeTruncated = Boolean(tree.json?.truncated);
+        for (const t of tree.json?.tree || []) if (t.type === "blob") modes.set(t.path, t.mode);
+      } else treeTruncated = true; // unknown → don't skip deletions
+
+      const entries = [];
+      const committed = [];
+      for (const f of files) {
+        if (f.deleted) {
+          if (!modes.has(f.path) && !treeTruncated) { committed.push({ path: f.path, deleted: true, skipped: true }); continue; }
+          entries.push({ path: f.path, mode: modes.get(f.path) || "100644", type: "blob", sha: null });
+          committed.push({ path: f.path, deleted: true });
+        } else {
+          entries.push({ path: f.path, mode: modes.get(f.path) || "100644", type: "blob", content: f.content });
+          committed.push({ path: f.path, updated: modes.has(f.path) });
+        }
+      }
+      if (!entries.length) return { empty: true };
+
+      const newTree = retryable(await githubApi(gh.token, "POST", `${root}/git/trees`, { base_tree: baseTree, tree: entries }), "create tree");
+      if (!newTree.ok) return { fail: newTree, message: "Could not create the commit tree." };
+      const commit = retryable(await githubApi(gh.token, "POST", `${root}/git/commits`, { message, tree: newTree.json.sha, parents: [parentSha] }), "create commit");
+      if (!commit.ok) return { fail: commit, message: "Could not create the commit." };
+      prevCommit = { commit: commit.json, committed };
+
+      const upd = retryable(targetExists
+        ? await githubApi(gh.token, "PATCH", `${root}/git/refs/heads/${target.split("/").map(encodeURIComponent).join("/")}`, { sha: commit.json.sha, force: false })
+        : await githubApi(gh.token, "POST", `${root}/git/refs`, { ref: `refs/heads/${target}`, sha: commit.json.sha }), "update ref");
+      if (!upd.ok) return { fail: upd, message: targetExists ? `Could not push to "${target}".` : "Could not create the working branch." };
+      return { commit: commit.json, committed };
+    });
+
+    if (out.empty) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to commit (the files to delete don't exist)." } });
+    if (out.fail) {
+      recordWrite("github", { ok: false, kind: "commit", ...meta, status: out.fail.status, attempts });
+      return ghError(res, out.fail, out.message);
     }
-    if (!entries.length) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to commit (the files to delete don't exist)." } });
-
-    const newTree = await githubApi(gh.token, "POST", `${root}/git/trees`, { base_tree: baseTree, tree: entries });
-    if (!newTree.ok) return ghError(res, newTree, "Could not create the commit tree.");
-    const commit = await githubApi(gh.token, "POST", `${root}/git/commits`, { message, tree: newTree.json.sha, parents: [parentSha] });
-    if (!commit.ok) return ghError(res, commit, "Could not create the commit.");
-
-    const upd = targetExists
-      ? await githubApi(gh.token, "PATCH", `${root}/git/refs/heads/${target.split("/").map(encodeURIComponent).join("/")}`, { sha: commit.json.sha, force: false })
-      : await githubApi(gh.token, "POST", `${root}/git/refs`, { ref: `refs/heads/${target}`, sha: commit.json.sha });
-    if (!upd.ok) return ghError(res, upd, targetExists ? `Could not push to "${target}" (the branch may have moved — try again).` : "Could not create the working branch.");
-
+    const { commit, committed } = out;
+    recordWrite("github", { ok: true, kind: "commit", ...meta, attempts, commitSha: commit.sha });
     return sendJson(res, 200, {
-      ok: true, provider: "github", branch: target, base, files: committed,
-      commitSha: commit.json.sha, commitUrl: commit.json.html_url || `https://github.com/${gh.owner}/${gh.repo}/commit/${commit.json.sha}`,
-      message: `Committed ${committed.filter((c) => !c.skipped).length} file(s) to ${gh.owner}/${gh.repo}@${target} in one commit.`,
+      ok: true, provider: "github", branch: target, base, files: committed, attempts,
+      commitSha: commit.sha, commitUrl: commit.html_url || `https://github.com/${gh.owner}/${gh.repo}/commit/${commit.sha}`,
+      message: `Committed ${committed.filter((c) => !c.skipped).length} file(s) to ${gh.owner}/${gh.repo}@${target} in one commit${attempts > 1 ? ` (after ${attempts} attempts)` : ""}.`,
     });
   } catch (err) {
+    recordWrite("github", { ok: false, kind: "commit", ...meta, attempts: err.attempts, status: err.status, error: err.message });
+    if (err instanceof RetryableHttpError) {
+      return ghError(res, err.resp, null, `Could not push to "${target}" after ${err.attempts} attempts (GitHub answered HTTP ${err.status} — the branch may be moving or GitHub is busy). Try again shortly.`);
+    }
     return ghNetErr(res, err);
   }
 }
@@ -1904,25 +2250,53 @@ async function handleGitlabCommit(req, res) {
   const message = String(payload.message || `MAX edit: ${files.map((f) => f.path).join(", ")}`).slice(0, 500);
   const proj = `/projects/${glProjectPath(gl.projectId)}`;
 
+  const meta = { repo: gl.projectId, base, branch: newBranch, files: files.length };
+  let posted = null; // { headBefore } once a commit POST has been sent
   try {
-    // Decide create/update/delete for each file by checking existence on the base branch.
-    const actions = [];
-    for (const f of files) {
-      const head = await gitlabApi(gl.token, "GET", `${proj}/repository/files/${encodeURIComponent(f.path)}?ref=${encodeURIComponent(base)}`);
-      if (f.deleted) {
-        if (head.ok) actions.push({ action: "delete", file_path: f.path }); // skip if it doesn't exist
-        continue;
+    const { out, attempts } = await withWriteRetry("gitlab.commit", meta, async () => {
+      // If the working branch already exists, commit on top of it; otherwise
+      // GitLab creates it from start_branch.
+      const br = await gitlabApi(gl.token, "GET", `${proj}/repository/branches/${encodeURIComponent(newBranch)}`);
+      retryable(br.status >= 500 ? br : { ok: true }, "read branch");
+      // A previous POST whose reply was lost may have landed: the head moved and
+      // carries our message → success, don't commit twice.
+      const head = br.json?.commit;
+      if (posted && br.ok && head?.id && head.id !== posted.headBefore && String(head.message || "").trim() === message.trim()) {
+        log.info("gitlab.commit.already_applied", { ...meta, commitSha: head.id });
+        return { commit: head, count: files.length };
       }
-      actions.push({ action: head.ok ? "update" : "create", file_path: f.path, content: f.content });
-    }
-    if (!actions.length) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to commit (files may not exist on the base branch)." } });
-    const commit = await gitlabApi(gl.token, "POST", `${proj}/repository/commits`, {
-      branch: newBranch, start_branch: base, commit_message: message, actions,
+      const ref = br.ok ? newBranch : base;
+      // Decide create/update/delete for each file by checking existence on that ref.
+      const actions = [];
+      for (const f of files) {
+        const head = await gitlabApi(gl.token, "GET", `${proj}/repository/files/${encodeURIComponent(f.path)}?ref=${encodeURIComponent(ref)}`);
+        retryable(head.status >= 500 ? head : { ok: true }, "read file");
+        if (f.deleted) {
+          if (head.ok) actions.push({ action: "delete", file_path: f.path }); // skip if it doesn't exist
+          continue;
+        }
+        actions.push({ action: head.ok ? "update" : "create", file_path: f.path, content: f.content });
+      }
+      if (!actions.length) return { empty: true };
+      posted = { headBefore: br.ok ? head?.id || null : null };
+      const commit = glRetryable(await gitlabApi(gl.token, "POST", `${proj}/repository/commits`, {
+        branch: newBranch, ...(br.ok ? {} : { start_branch: base }), commit_message: message, actions,
+      }), "create commit");
+      if (!commit.ok) return { fail: commit };
+      return { commit: commit.json, count: actions.length };
     });
-    if (!commit.ok) return glError(res, commit, "Commit failed.");
-    return sendJson(res, 200, { ok: true, provider: "gitlab", branch: newBranch, base,
-      files: files.map((f) => ({ path: f.path })), message: `Committed ${files.length} file(s) to ${gl.projectId}@${newBranch}.` });
+    if (out.empty) return sendJson(res, 400, { error: { type: "bad_request", message: "Nothing to commit (files may not exist on the base branch)." } });
+    if (out.fail) {
+      recordWrite("gitlab", { ok: false, kind: "commit", ...meta, status: out.fail.status, attempts });
+      return glError(res, out.fail, "Commit failed.");
+    }
+    recordWrite("gitlab", { ok: true, kind: "commit", ...meta, attempts, commitSha: out.commit?.id });
+    return sendJson(res, 200, { ok: true, provider: "gitlab", branch: newBranch, base, attempts,
+      commitSha: out.commit?.id, commitUrl: out.commit?.web_url,
+      files: files.map((f) => ({ path: f.path })), message: `Committed ${out.count} file(s) to ${gl.projectId}@${newBranch}.` });
   } catch (err) {
+    recordWrite("gitlab", { ok: false, kind: "commit", ...meta, attempts: err.attempts, status: err.status, error: err.message });
+    if (err instanceof RetryableHttpError) return glError(res, err.resp, null, `Commit failed after ${err.attempts} attempts.`);
     return sendJson(res, 502, { error: { type: "network", message: `Could not reach GitLab (${err?.cause?.code || err?.message}).` } });
   }
 }
@@ -1955,24 +2329,6 @@ function handlePowers(req, res) {
   sendJson(res, 200, { ok: true, categories: POWER_CATEGORIES, powers: POWERS });
 }
 
-// Basic SSRF guard: only http/https, block obvious localhost/private/metadata hosts.
-function isBlockedHost(hostname) {
-  const h = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
-  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal") || h.endsWith(".local")) return true;
-  if (h === "::1" || h === "0.0.0.0") return true;
-  if (h === "169.254.169.254" || h.startsWith("169.254.")) return true; // cloud metadata + link-local
-  // IPv4 private ranges
-  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const [a, b] = [parseInt(m[1], 10), parseInt(m[2], 10)];
-    if (a === 10 || a === 127) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-  }
-  if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80")) return true; // IPv6 private
-  return false;
-}
-
 // Strip HTML to readable-ish text.
 function htmlToText(html) {
   return String(html)
@@ -1987,46 +2343,31 @@ function htmlToText(html) {
 
 async function handlePowerFetch(req, res) {
   let payload = {}; try { payload = JSON.parse((await readBody(req)) || "{}"); } catch {}
-  let url;
-  try { url = new URL(String(payload.url || "").trim()); } catch { return sendJson(res, 400, { error: { type: "bad_request", message: "Provide a valid URL." } }); }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return sendJson(res, 400, { error: { type: "bad_request", message: "Only http/https URLs are allowed." } });
-  if (isBlockedHost(url.hostname)) return sendJson(res, 403, { error: { type: "blocked", message: "That host is not allowed (local/private addresses are blocked)." } });
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
+  const target = String(payload.url || "").trim();
+  if (!target) return sendJson(res, 400, { error: { type: "bad_request", message: "Provide a valid URL." } });
   try {
-    const fetchOpts = { redirect: "manual", headers: { "User-Agent": "MAX-chat web-fetch", Accept: "text/html,text/plain,application/json,*/*" }, signal: controller.signal };
-    let r = await fetch(url.href, fetchOpts);
-    // Follow redirects manually, validating each hop against blocked hosts (max 5 redirects).
-    let redirectsLeft = 5;
-    while (redirectsLeft > 0 && [301, 302, 303, 307, 308].includes(r.status)) {
-      const location = r.headers.get("location");
-      if (!location) break;
-      let nextUrl;
-      try { nextUrl = new URL(location, url.href); } catch { break; }
-      if (nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") {
-        return sendJson(res, 403, { error: { type: "blocked", message: "Redirect to a disallowed protocol." } });
-      }
-      if (isBlockedHost(nextUrl.hostname)) {
-        return sendJson(res, 403, { error: { type: "blocked", message: "Redirect to a blocked host is not allowed." } });
-      }
-      r = await fetch(nextUrl.href, fetchOpts);
-      redirectsLeft--;
-    }
-    const type = r.headers.get("content-type") || "";
-    if (!r.ok && ![301, 302, 303, 307, 308].includes(r.status)) return sendJson(res, r.status, { error: { type: mapStatusType(r.status), status: r.status, message: `Fetch failed (HTTP ${r.status}).` } });
-    if ([301, 302, 303, 307, 308].includes(r.status)) return sendJson(res, 502, { error: { type: "network", message: "Too many redirects." } });
-    const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > MAX_FETCH_BYTES) return sendJson(res, 413, { error: { type: "too_large", message: "Page is too large to fetch." } });
-    let text = buf.toString("utf8");
+    // fetchPublic: DNS-resolves every hop (incl. redirects), blocks private /
+    // loopback / link-local / metadata IPs, re-checks the address at connect
+    // time (DNS-rebinding safe), caps the body at 2 MB while streaming.
+    const r = await fetchPublic(target, {
+      headers: { "User-Agent": "MAX-chat web-fetch", Accept: "text/html,text/plain,application/json,*/*" },
+      maxBytes: MAX_FETCH_BYTES, timeoutMs: 20_000, maxRedirects: 5,
+    });
+    const type = String(r.headers?.["content-type"] || "");
+    if (r.status < 200 || r.status >= 300) return sendJson(res, r.status >= 400 ? r.status : 502, { error: { type: mapStatusType(r.status), status: r.status, message: `Fetch failed (HTTP ${r.status}).` } });
+    let text = r.body.toString("utf8");
     if (/text\/html/i.test(type)) text = htmlToText(text);
     if (text.length > 100_000) text = text.slice(0, 100_000) + "\n… (truncated)";
-    return sendJson(res, 200, { ok: true, url: url.href, contentType: type, text });
+    else if (r.truncated) text += "\n… (truncated at 2 MB)";
+    return sendJson(res, 200, { ok: true, url: r.url, contentType: type, truncated: r.truncated, text });
   } catch (err) {
-    const cause = err?.cause?.code || err?.message || "unknown error";
+    if (err instanceof BlockedUrlError) {
+      const bad = err.code === "EINVALID" || err.code === "EPROTOCOL";
+      log.warn("powers.fetch.blocked", { url: target.slice(0, 300), code: err.code, reason: err.message });
+      return sendJson(res, bad ? 400 : 403, { error: { type: bad ? "bad_request" : "blocked", message: err.message } });
+    }
+    const cause = err?.code || err?.cause?.code || err?.message || "unknown error";
     return sendJson(res, 502, { error: { type: "network", message: `Could not fetch that page (${cause}).` } });
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -2092,8 +2433,8 @@ const server = http.createServer(async (req, res) => {
   // A client disconnecting mid-stream makes the socket emit an 'error' event
   // (ECONNRESET/EPIPE). Without listeners these become uncaught exceptions that
   // crash the whole server, making every later request fail with "Failed to fetch".
-  res.on("error", (err) => console.warn("[MAX] response stream error:", err?.code || err?.message));
-  req.on("error", (err) => console.warn("[MAX] request stream error:", err?.code || err?.message));
+  res.on("error", (err) => log.warn("http.response_stream_error", { code: err?.code || err?.message }));
+  req.on("error", (err) => log.warn("http.request_stream_error", { code: err?.code || err?.message }));
 
   const { pathname } = new URL(req.url, "http://x");
   applySecurityHeaders(res, pathname);
@@ -2162,6 +2503,12 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/github/test" && req.method === "POST") {
       return await handleGithubTest(req, res);
     }
+    if (pathname === "/api/github/status" && (req.method === "GET" || req.method === "POST")) {
+      return await handleGithubStatus(req, res);
+    }
+    if (pathname === "/api/verify" && req.method === "POST") {
+      return await handleVerify(req, res);
+    }
     if (pathname === "/api/github/repos" && req.method === "POST") {
       return await handleGithubRepos(req, res);
     }
@@ -2227,7 +2574,7 @@ const server = http.createServer(async (req, res) => {
     }
     return await serveStatic(req, res);
   } catch (err) {
-    console.error("[MAX] Unhandled error:", err);
+    log.error("http.unhandled", { method: req.method, path: pathname, error: err, stack: String(err?.stack || "").slice(0, 1500) });
     if (!res.headersSent) {
       sendJson(res, 500, { error: { type: "server", message: "Internal server error" } });
     } else {
@@ -2243,34 +2590,75 @@ server.on("clientError", (err, socket) => {
   }
 });
 
-// Last-resort safety net: log and keep serving instead of crashing.
-process.on("uncaughtException", (err) => {
-  console.error("[MAX] uncaughtException (kept alive):", err);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("[MAX] unhandledRejection (kept alive):", reason);
-});
-
-// Graceful shutdown: close active connections cleanly on SIGTERM/SIGINT.
-function gracefulShutdown(signal) {
-  console.log(`\n[MAX] ${signal} received — shutting down gracefully…`);
-  server.close(() => {
-    console.log("[MAX] All connections closed. Goodbye.");
+// Graceful shutdown: stop accepting, drain open requests, flush logs, exit.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.info("server.shutdown", { signal });
+  // Force-exit after 10s if long streams don't drain.
+  const force = setTimeout(async () => {
+    log.warn("server.shutdown.forced", { signal });
+    await log.close().catch(() => {});
+    process.exit(1);
+  }, 10_000);
+  force.unref?.();
+  server.close(async () => {
+    log.info("server.closed", { signal });
+    persistRevokedTokens();
+    await log.close().catch(() => {});
     process.exit(0);
   });
-  // Force-kill after 10s if connections don't drain
-  setTimeout(() => { console.log("[MAX] Forcing exit."); process.exit(1); }, 10_000).unref?.();
-}
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-
-// Initialise auth before accepting traffic.
-if (CONFIG.auth.enabled) {
-  loadSessionSecret();
-  ensureSuperAdmin();
+  server.closeIdleConnections?.(); // keep-alive sockets would otherwise hold close() open
 }
 
-server.listen(CONFIG.port, CONFIG.host, () => {
+/** Start listening (also used by tests with port 0). Resolves the bound address. */
+export function startServer({ port = CONFIG.port, host = CONFIG.host, banner = true } = {}) {
+  // Initialise auth before accepting traffic.
+  if (CONFIG.auth.enabled) {
+    loadSessionSecret();
+    ensureSuperAdmin();
+  }
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      log.info("server.listening", { host, port: server.address()?.port, auth: CONFIG.auth.enabled });
+      if (banner) printBanner();
+      resolve(server.address());
+    });
+  });
+}
+
+export { server, isValidMessage, findInvalidImage, normalizeFiles, pageFiles, CONFIG, MAX_IMAGE_BYTES };
+
+// Only bind the port / install process handlers when run directly
+// (`node server.js`), not when imported by tests.
+// Compare real paths (symlinked deploys) and allow `node server` without the
+// extension. MAX_NO_LISTEN=1 is the explicit opt-out used by importers/tests.
+function isMainModule() {
+  if (process.env.MAX_NO_LISTEN === "1" || !process.argv[1]) return false;
+  const self = realpathSync(fileURLToPath(import.meta.url));
+  const arg = path.resolve(process.argv[1]);
+  for (const cand of [arg, `${arg}.js`, path.join(arg, "server.js")]) {
+    try { if (realpathSync(cand) === self) return true; } catch {}
+  }
+  return false;
+}
+const IS_MAIN = isMainModule();
+if (IS_MAIN) {
+  // Last-resort safety net: log and keep serving instead of crashing.
+  process.on("uncaughtException", (err) => log.error("process.uncaught_exception", { error: err, stack: String(err?.stack || "").slice(0, 1500) }));
+  process.on("unhandledRejection", (reason) => log.error("process.unhandled_rejection", { error: reason instanceof Error ? reason : String(reason) }));
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+  startServer().catch((err) => {
+    log.error("server.listen_failed", { error: err, port: CONFIG.port, host: CONFIG.host });
+    process.exitCode = 1;
+  });
+}
+
+function printBanner() {
   const line = "─".repeat(52);
   console.log(`\n┌${line}┐`);
   console.log(`│  MAX is running`);
@@ -2289,5 +2677,6 @@ server.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`│`);
     for (const l of BOOTSTRAP_NOTICE.split("\n")) console.log(`│  ${l}`);
   }
+  console.log(`│  Logs           : ${log.path || "stdout only"}`);
   console.log(`└${line}┘\n`);
-});
+}
